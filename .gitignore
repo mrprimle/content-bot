@@ -1,0 +1,10 @@
+.env
+*.session
+*.session-journal
+repost.db
+repost.db-*
+bot.log
+nohup.out
+.venv/
+__pycache__/
+*.pyc

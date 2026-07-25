@@ -94,6 +94,8 @@ def main() -> None:
     p_back.add_argument("--limit", type=int, help="максимум постов с одного источника")
     sub.add_parser("sync", help="догрузить только новые сообщения")
     sub.add_parser("status", help="статистика базы")
+    p_clean = sub.add_parser("cleanup", help="удалить обработанные посты старше N дней")
+    p_clean.add_argument("--keep-days", type=int, default=120)
     args = ap.parse_args()
 
     if args.cmd == "login":
@@ -101,6 +103,10 @@ def main() -> None:
         return
     if args.cmd == "status":
         print(db.stats(db.connect()))
+        return
+    if args.cmd == "cleanup":
+        n = db.cleanup(db.connect(), args.keep_days)
+        print(f"Удалено {n} обработанных постов старше {args.keep_days} дн.")
         return
 
     if args.cmd == "backfill" and args.sources:

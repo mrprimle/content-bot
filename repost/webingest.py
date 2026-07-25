@@ -6,6 +6,7 @@
 
   python -m repost.webingest @dumik --days 3
   python -m repost.webingest @a @b @c --days 90
+  python -m repost.webingest --days 3  # источники из sources.txt
 """
 import argparse
 import html as htmllib
@@ -98,10 +99,13 @@ def run(channels: list[str], days: int) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Выгрузка публичных каналов через t.me/s")
-    ap.add_argument("channels", nargs="+", help="@username каналов")
+    ap.add_argument("channels", nargs="*", help="@username каналов; без аргументов — sources.txt")
     ap.add_argument("--days", type=int, default=3)
     args = ap.parse_args()
-    run(args.channels, args.days)
+    channels = args.channels or config.read_sources()
+    if not channels:
+        ap.error("нет источников: заполни sources.txt или передай @username")
+    run(channels, args.days)
 
 
 if __name__ == "__main__":

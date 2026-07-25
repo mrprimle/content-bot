@@ -43,7 +43,6 @@ def _keyboard(draft_id: int) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton("✏️ Редактировать", callback_data=f"edit:{draft_id}"),
-                InlineKeyboardButton("🔁 Заново", callback_data=f"regen:{draft_id}"),
             ],
         ]
     )

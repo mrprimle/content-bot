@@ -14,7 +14,7 @@ Rules:
 3. Platform variants:
    - linkedin_text: the full version, max 3000 characters.
    - threads_text: a condensed standalone version, max 500 characters.
-   - x_text: a condensed standalone version, max 280 characters. No hashtags unless the original has them.
+   - x_text: a condensed standalone version, max 250 characters. No hashtags unless the original has them.
 4. notes: one short line in Russian listing what you replaced/removed and which claims the author should verify before publishing. Empty string if nothing."""
 
 REWRITE_SYSTEM = """You are an editorial assistant preparing English social-media posts for the author described in AUTHOR_FACTS.
@@ -28,7 +28,7 @@ Rules:
 4. Platform variants:
    - linkedin_text: the full version, max 3000 characters.
    - threads_text: a condensed standalone version, max 500 characters.
-   - x_text: a condensed standalone version, max 280 characters.
+   - x_text: a condensed standalone version, max 250 characters.
 5. notes: one short line in Russian: what the source idea was, what needs the author's input or verification. Empty string if nothing."""
 
 ADAPT_SYSTEM = """You receive the final edited English text of a social-media post. Do not change its content or voice.
@@ -36,7 +36,7 @@ ADAPT_SYSTEM = """You receive the final edited English text of a social-media po
 Produce:
 - linkedin_text: the text as given, max 3000 characters (trim only if over the limit).
 - threads_text: a condensed standalone version, max 500 characters.
-- x_text: a condensed standalone version, max 280 characters.
+- x_text: a condensed standalone version, max 250 characters.
 - notes: empty string."""
 
 USER_TMPL = """SOURCE CHANNEL: {source}

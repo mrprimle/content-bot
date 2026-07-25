@@ -49,7 +49,7 @@ AUTHOR_FACTS = _get("AUTHOR_FACTS")
 
 SOURCES_FILE = ROOT / "sources.txt"
 
-LIMITS = {"linkedin": 3000, "twitter": 280, "threads": 500}
+LIMITS = {"linkedin": 3000, "twitter": 250, "threads": 500}
 
 
 def buffer_channels() -> dict[str, str]:

@@ -46,8 +46,11 @@ cp .env.example .env   # и заполнить
 # 2) Если ок — полная выгрузка по sources.txt (заполни его: @username на строку)
 .venv/bin/python -m repost.ingest backfill --days 90
 
-# 3) Догрузка новых постов (гонять руками или по cron раз в несколько часов)
+# 3) Догрузка новых постов через Telethon (если настроены API_ID/API_HASH)
 .venv/bin/python -m repost.ingest sync
+
+# Для публичных источников без Telegram API — через t.me/s и sources.txt
+.venv/bin/python -m repost.webingest --days 3
 
 # 4) Бот — постоянный процесс; предлагает черновики по POST_TIMES
 .venv/bin/python -m repost.bot
@@ -73,6 +76,13 @@ cp .env.example .env   # и заполнить
 ```bash
 cp scripts/com.repost.bot.plist ~/Library/LaunchAgents/
 launchctl load ~/Library/LaunchAgents/com.repost.bot.plist   # автозапуск + перезапуск при падении
+```
+
+Регулярный сбор публичных источников каждые 3 часа:
+
+```bash
+cp scripts/com.repost.sync.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.repost.sync.plist
 ```
 
 ## Передача проекта другому человеку

@@ -4,6 +4,8 @@
 repost.db
 repost.db-*
 bot.log
+bot-launchd.log
+sync.log
 nohup.out
 .venv/
 __pycache__/

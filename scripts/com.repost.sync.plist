@@ -3,23 +3,24 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.repost.bot</string>
+    <string>com.repost.sync</string>
     <key>ProgramArguments</key>
     <array>
         <string>/Users/gleb/Desktop/tg/.venv/bin/python</string>
-        <string>-u</string>
         <string>-m</string>
-        <string>repost.bot</string>
+        <string>repost.webingest</string>
+        <string>--days</string>
+        <string>3</string>
     </array>
     <key>WorkingDirectory</key>
     <string>/Users/gleb/Desktop/tg</string>
     <key>RunAtLoad</key>
     <true/>
-    <key>KeepAlive</key>
-    <true/>
+    <key>StartInterval</key>
+    <integer>10800</integer>
     <key>StandardOutPath</key>
-    <string>/Users/gleb/Desktop/tg/bot-launchd.log</string>
+    <string>/Users/gleb/Desktop/tg/sync.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/gleb/Desktop/tg/bot-launchd.log</string>
+    <string>/Users/gleb/Desktop/tg/sync.log</string>
 </dict>
 </plist>

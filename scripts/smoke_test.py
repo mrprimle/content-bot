@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from repost import db, prompts  # noqa: E402
+from repost import db, prompts, publisher  # noqa: E402
 
 
 def main() -> None:
@@ -50,6 +50,27 @@ def main() -> None:
     sysp = prompts.system_prompt()
     userp = prompts.user_message("@test_channel", "2026-07-20", "текст")
     assert "linkedin_text" in sysp and "текст" in userp
+    assert "max 250 characters" in sysp
+
+    captured: dict[str, str] = {}
+    original_channels = publisher.config.buffer_channels
+    original_create_post = publisher.create_post
+    try:
+        publisher.config.buffer_channels = lambda: {"twitter": "channel-id"}
+
+        def fake_create_post(channel_id: str, text: str) -> str:
+            captured["channel_id"] = channel_id
+            captured["text"] = text
+            return "post-id"
+
+        publisher.create_post = fake_create_post
+        result = publisher.publish_all({"twitter": "x" * 300})
+    finally:
+        publisher.config.buffer_channels = original_channels
+        publisher.create_post = original_create_post
+
+    assert result["twitter"] == (True, "post-id")
+    assert len(captured["text"]) == 250 and captured["text"].endswith("…")
 
     print("Смоук-тест пройден:", db.stats(conn))
     Path(tmp.name).unlink(missing_ok=True)

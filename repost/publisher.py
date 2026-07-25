@@ -1,8 +1,8 @@
 """Buffer GraphQL API client: https://api.buffer.com, Bearer-token auth.
 
-Публикация идёт через мутацию createPost (mode=addToQueue кладёт пост в очередь
-канала Buffer; слоты очереди настраиваются в Buffer). Каналы задаются в
-BUFFER_CHANNELS как platform:channelId.
+Публикация идёт через мутацию createPost. Режим задаётся в BUFFER_POST_MODE:
+shareNow публикует сразу, addToQueue кладёт пост в очередь канала Buffer.
+Каналы задаются в BUFFER_CHANNELS как platform:channelId.
 """
 import argparse
 import json
@@ -44,6 +44,14 @@ def create_post(channel_id: str, text: str) -> str:
     return res["post"]["id"]
 
 
+def _clip_for_platform(platform: str, text: str) -> str:
+    text = text.strip()
+    limit = config.LIMITS.get(platform)
+    if not limit or len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
 def publish_all(texts_by_platform: dict[str, str]) -> dict[str, tuple[bool, str]]:
     """{'linkedin': text, ...} -> {'linkedin': (ok, post_id | error), ...}"""
     results: dict[str, tuple[bool, str]] = {}
@@ -54,6 +62,7 @@ def publish_all(texts_by_platform: dict[str, str]) -> dict[str, tuple[bool, str]
         text = texts_by_platform.get(platform)
         if not text:
             continue
+        text = _clip_for_platform(platform, text)
         try:
             results[platform] = (True, create_post(channel_id, text))
         except Exception as e:  # noqa: BLE001 — репортим любую ошибку per-platform
@@ -62,19 +71,25 @@ def publish_all(texts_by_platform: dict[str, str]) -> dict[str, tuple[bool, str]
 
 
 def list_channels() -> list[dict]:
-    last: Exception | None = None
-    for query in (
-        "query { channels { id name service } }",
-        "query { account { channels { id name service } } }",
-    ):
-        try:
-            data = _gql(query)
-            channels = data.get("channels") or (data.get("account") or {}).get("channels")
-            if channels:
-                return channels
-        except Exception as e:  # noqa: BLE001 — пробуем следующий вариант схемы
-            last = e
-    raise last or RuntimeError("каналы не найдены")
+    account = _gql("query { account { organizations { id name } } }")["account"]
+    organizations = account.get("organizations") or []
+    if not organizations:
+        raise RuntimeError("в Buffer не найдено ни одной организации")
+
+    channels: list[dict] = []
+    seen: set[str] = set()
+    for organization in organizations:
+        organization_id = json.dumps(organization["id"])
+        data = _gql(
+            "query { channels(input: {"
+            f"organizationId: {organization_id}"
+            "}) { id name service } }"
+        )
+        for channel in data.get("channels") or []:
+            if channel["id"] not in seen:
+                seen.add(channel["id"])
+                channels.append(channel)
+    return channels
 
 
 def main() -> None:

@@ -185,6 +185,32 @@ def record_publication(conn, draft_id: int, platform: str, ok: bool, external_id
     conn.commit()
 
 
+def cleanup(conn, keep_days: int = 120) -> int:
+    """Удаляет обработанные посты старше keep_days (и их черновики/публикации).
+
+    Посты в статусе new не трогаем; свежие обработанные держим как защиту от
+    повторного добавления тем же синком (окно синка << keep_days).
+    """
+    ids = [
+        r["id"]
+        for r in conn.execute(
+            "SELECT id FROM post WHERE status != 'new' AND date(posted_at) < date('now', ?)",
+            (f"-{keep_days} days",),
+        )
+    ]
+    if not ids:
+        return 0
+    marks = ",".join("?" * len(ids))
+    conn.execute(
+        f"DELETE FROM publication WHERE draft_id IN (SELECT id FROM draft WHERE post_id IN ({marks}))", ids
+    )
+    conn.execute(f"DELETE FROM draft WHERE post_id IN ({marks})", ids)
+    conn.execute(f"DELETE FROM post WHERE id IN ({marks})", ids)
+    conn.commit()
+    conn.execute("VACUUM")
+    return len(ids)
+
+
 def stats(conn) -> dict:
     out = {}
     for row in conn.execute("SELECT status, COUNT(*) n FROM post GROUP BY status"):

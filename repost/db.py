@@ -56,7 +56,8 @@ CREATE TABLE IF NOT EXISTS publication(
 );
 """
 
-# post.status:  new -> drafted -> published | skipped   ('short' — не проходит MIN_POST_CHARS)
+# post.status:  new -> drafting -> drafted -> published | skipped
+#               ('short' — не проходит MIN_POST_CHARS)
 # draft.status: awaiting_review -> approved -> published | skipped | failed
 
 
@@ -119,6 +120,22 @@ def next_new_post(conn) -> sqlite3.Row | None:
         "SELECT p.*, s.username, s.title FROM post p JOIN source s ON s.id=p.source_id "
         "WHERE p.status='new' ORDER BY p.posted_at ASC LIMIT 1"
     ).fetchone()
+
+
+def claim_next_post(conn) -> sqlite3.Row | None:
+    """Самый старый пост из очереди, сразу помеченный 'drafting'.
+
+    Пометка ставится до обращения к LLM: иначе второй вызов (слот расписания
+    и /next одновременно) успевает взять тот же пост, и черновик создаётся дважды.
+    """
+    row = next_new_post(conn)
+    if row is not None:
+        set_post_status(conn, row["id"], "drafting")
+    return row
+
+
+def pending_drafts(conn) -> list[sqlite3.Row]:
+    return conn.execute("SELECT * FROM draft WHERE status='awaiting_review' ORDER BY id").fetchall()
 
 
 def get_post(conn, post_id: int) -> sqlite3.Row | None:

@@ -54,11 +54,32 @@ async def _send_draft(bot, conn, draft_id: int) -> None:
     db.set_draft_message(conn, draft_id, msg.message_id)
 
 
+async def expire_pending(bot, conn) -> int:
+    """Черновики без ответа скипаются: одновременно активен только один."""
+    rows = db.pending_drafts(conn)
+    for d in rows:
+        db.set_draft_status(conn, d["id"], "expired")
+        db.set_post_status(conn, d["post_id"], "skipped")
+        if not d["tg_message_id"]:
+            continue
+        try:
+            await bot.edit_message_reply_markup(config.OWNER_CHAT_ID, d["tg_message_id"], reply_markup=None)
+            await bot.send_message(
+                config.OWNER_CHAT_ID,
+                "⌛ Пропущено — не было ответа.",
+                reply_to_message_id=d["tg_message_id"],
+            )
+        except Exception:  # noqa: BLE001 — старое сообщение могло быть удалено вручную
+            pass
+    return len(rows)
+
+
 async def propose(bot) -> None:
     if not config.OWNER_CHAT_ID:
         return
     conn = db.connect()
-    post = db.next_new_post(conn)
+    await expire_pending(bot, conn)
+    post = db.claim_next_post(conn)
     if post is None:
         await bot.send_message(config.OWNER_CHAT_ID, "Очередь пуста — все посты обработаны.")
         return
@@ -66,7 +87,8 @@ async def propose(bot) -> None:
         out = await asyncio.to_thread(
             generator.generate, post["title"] or post["username"], post["posted_at"][:10], post["text"]
         )
-    except Exception as e:  # noqa: BLE001 — показываем ошибку в чат, пост остаётся в очереди
+    except Exception as e:  # noqa: BLE001 — показываем ошибку в чат, пост возвращаем в очередь
+        db.set_post_status(conn, post["id"], "new")
         await bot.send_message(config.OWNER_CHAT_ID, f"⚠️ Ошибка генерации: {e}")
         return
     draft_id = db.create_draft(
@@ -132,6 +154,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     conn = db.connect()
     draft = db.get_draft(conn, draft_id)
     if draft is None:
+        return
+    if draft["status"] in ("expired", "skipped", "published"):
+        await query.edit_message_reply_markup(None)
+        await context.bot.send_message(
+            config.OWNER_CHAT_ID, f"Черновик #{draft_id} уже неактуален ({draft['status']})."
+        )
         return
 
     if action == "skip":

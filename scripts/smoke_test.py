@@ -29,6 +29,15 @@ def main() -> None:
     post = db.next_new_post(conn)
     assert post["tg_message_id"] == 3, "очередь должна отдавать самый старый пост"
 
+    claimed = db.claim_next_post(conn)
+    assert claimed["id"] == post["id"], "claim должен взять тот же самый старый пост"
+    assert db.get_post(conn, claimed["id"])["status"] == "drafting", "claim помечает пост сразу"
+    second = db.claim_next_post(conn)
+    assert second["id"] != claimed["id"], "второй claim не должен брать тот же пост"
+    db.set_post_status(conn, claimed["id"], "new")
+    db.set_post_status(conn, second["id"], "new")
+
+    post = db.claim_next_post(conn)
     draft_id = db.create_draft(conn, post["id"], "test-model", "EN text", "x", "threads", "")
     assert db.get_post(conn, post["id"])["status"] == "drafted"
     db.set_draft_message(conn, draft_id, 777)
@@ -41,6 +50,14 @@ def main() -> None:
 
     nxt = db.next_new_post(conn)
     assert nxt["tg_message_id"] == 1, "после drafted следующим идёт пост #1"
+
+    pending_id = db.create_draft(conn, nxt["id"], "test-model", "pending", "x", "t", "")
+    pending = db.pending_drafts(conn)
+    assert [p["id"] for p in pending] == [pending_id], "в ожидании ровно один черновик"
+    db.set_draft_status(conn, pending_id, "expired")
+    db.set_post_status(conn, nxt["id"], "skipped")
+    assert db.pending_drafts(conn) == [], "просроченный черновик уходит из ожидания"
+    assert db.next_new_post(conn) is None, "пропущенный пост не возвращается в очередь"
 
     db.set_last_message_id(conn, sid, 3)
     db.set_last_message_id(conn, sid, 2)

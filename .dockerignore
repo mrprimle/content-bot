@@ -1,0 +1,12 @@
+.git
+.venv
+data/
+*.db
+*.db-*
+*.session
+*.session-journal
+*.log
+__pycache__/
+*.pyc
+.env
+RESEARCH.md

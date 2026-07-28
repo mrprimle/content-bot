@@ -1,4 +1,36 @@
 # Источники: один @username или ссылка t.me на строку. Строки с # игнорируются.
-# Эти каналы тянутся месячным синком (webingest) и командой backfill.
+# Telethon раз в три месяца обновляет окно последних трёх месяцев.
 @dumik
 @zamesin
+@matskevichwonder
+@s16_guide
+@aigency_ru
+@eugene_rid
+@whyaimatskevich
+@solokumi
+@kutergin_on_fire
+@dobry
+@gurinovich_shares
+@gptlovers
+@tasteofrain
+@aihappens
+@ruslanlearns
+@johngaltsgulch
+@inohodez
+@ventureStuff
+@fomichevkirill
+@Matskevich
+@itakblet
+@mister_sosister
+@kyrillic
+@ilyamutovin
+@Shmit16
+@pisarevich
+@hutzp
+@german_gavrilov
+@optimalexperience
+@buzko_hub
+@cryptoEssay
+@prod1337
+@mspiridonov
+@sistemno

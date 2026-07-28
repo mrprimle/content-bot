@@ -59,12 +59,33 @@ def publish_all(texts_by_platform: dict[str, str]) -> dict[str, tuple[bool, str]
     if not channels:
         return {"buffer": (False, "BUFFER_CHANNELS не настроен в .env")}
     for platform, channel_id in channels.items():
-        text = texts_by_platform.get(platform)
-        if not text:
+        if platform not in texts_by_platform:
+            continue
+        text = texts_by_platform[platform]
+        if not text or not text.strip():
+            results[platform] = (
+                False,
+                "Пустой текст для настроенной площадки; публикация не выполнена",
+            )
             continue
         text = _clip_for_platform(platform, text)
         try:
             results[platform] = (True, create_post(channel_id, text))
+        except (httpx.TimeoutException, httpx.TransportError) as e:
+            results[platform] = (
+                False,
+                "UNKNOWN: Buffer мог принять публикацию, но соединение оборвалось. "
+                f"Проверь Buffer перед повтором ({str(e)[:180]})",
+            )
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code >= 500:
+                results[platform] = (
+                    False,
+                    "UNKNOWN: Buffer вернул серверную ошибку; публикация могла быть создана. "
+                    f"Проверь Buffer перед повтором ({e.response.status_code})",
+                )
+            else:
+                results[platform] = (False, str(e)[:300])
         except Exception as e:  # noqa: BLE001 — репортим любую ошибку per-platform
             results[platform] = (False, str(e)[:300])
     return results

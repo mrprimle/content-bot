@@ -1,15 +1,33 @@
-# TG → EN Repost Pipeline
+# Telegram → social publishing assistant
 
-Пайплайн: посты из Telegram-каналов → SQLite → перевод/обезличивание (Claude) → согласование в Telegram-боте → публикация в LinkedIn / X / Threads через Buffer.
+Пайплайн для отбора идей из Telegram-каналов и публикации коротких английских
+постов через Buffer.
 
-Архитектура и обоснование решений: [RESEARCH.md](RESEARCH.md).
-
+```text
+34 источника → Telethon (последние 3 месяца) → SQLite
+                                                │
+                         10:00 и 18:00 Europe/London
+                                                │
+             пул: по 1 старейшему материалу из каждого источника
+                                                │
+                         по 2 материала за временной слот
+                                                │
+              Создать пост → LLM → Опубликовать / Редактировать / Пропустить
+              Пропустить    → без вызова LLM → следующий материал из пула
 ```
-sources.txt → ingest (Telethon) → repost.db → bot (3 раза в день предлагает черновик)
-                                                 │ кнопки: Опубликовать / Заново / Пропустить
-                                                 │ правка: reply на сообщение бота
-                                                 └→ publisher (Buffer GraphQL) → LinkedIn / X / Threads
-```
+
+Пул сохраняется между запусками и сортируется от старых дат к новым. В 10:00
+приходят первые два материала, в 18:00 — следующие два: всего четыре базовых
+материала в день. После пропуска бот сразу показывает замену, поэтому фактическое
+число сообщений в день может быть больше четырёх. Когда текущий круг закончился,
+бот формирует следующий — снова по одному старейшему необработанному материалу
+каждого источника.
+
+Для voice/video сохраняются метаданные, а само медиа передаётся в бот, когда
+доходит до выдачи. Локальное скачивание используется только как запасной путь
+или для расшифровки. Для voice есть отдельная кнопка «Расшифровать»;
+распознавание и краткое содержание создаются по запросу, чтобы не тратить токены
+на ненужные материалы.
 
 ## Установка
 
@@ -17,89 +35,99 @@ sources.txt → ingest (Telethon) → repost.db → bot (3 раза в день 
 cd ~/Desktop/tg
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-cp .env.example .env   # и заполнить
+cp .env.example .env
+chmod 600 .env
 ```
 
-## Что нужно заполнить в .env (по шагам)
+Для локальной расшифровки Telegram voice также нужен `ffmpeg`
+(`brew install ffmpeg` на macOS); Docker-образ уже устанавливает его сам.
 
-1. **Telegram API** — зайди на https://my.telegram.org → «API development tools» → создай приложение → скопируй `api_id` и `api_hash` в `TELEGRAM_API_ID` / `TELEGRAM_API_HASH`. Это делается один раз, под твоим аккаунтом.
-2. **Авторизация Telethon** — в терминале:
-   ```bash
-   .venv/bin/python -m repost.ingest login
-   ```
-   Спросит телефон и код из Telegram. Создаст файл `repost.session` — это ключ к твоему аккаунту, никому не передавать, в git не коммитить (уже в .gitignore).
-3. **Бот** — у @BotFather команда `/newbot` → токен в `BOT_TOKEN`. Потом напиши своему боту `/id` и впиши ответ в `OWNER_CHAT_ID`.
-4. **Anthropic** — ключ с https://console.anthropic.com → `ANTHROPIC_API_KEY`.
-5. **Buffer** — аккаунт на buffer.com, подключи LinkedIn, X и Threads (бесплатный план = ровно 3 канала). Токен: https://publish.buffer.com/settings/api → `BUFFER_ACCESS_TOKEN`. Потом:
-   ```bash
-   .venv/bin/python -m repost.publisher --channels
-   ```
-   и впиши id каналов в `BUFFER_CHANNELS` (формат `linkedin:id,twitter:id,threads:id`).
-6. **AUTHOR_FACTS** — пару строк о себе: имя, компания, чем занимаешься. Генератор подставляет это при обезличивании.
+Заполни `.env`:
 
-## Использование
+- `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` — приложение с
+  [my.telegram.org/apps](https://my.telegram.org/apps);
+- `BOT_TOKEN`, `OWNER_CHAT_ID` — бот-интерфейс и id владельца;
+- `OPENAI_API_KEY` — генерация и опциональная расшифровка;
+- `BUFFER_ACCESS_TOKEN`, `BUFFER_CHANNELS` — LinkedIn/X; Threads можно не добавлять;
+- `AUTHOR_FACTS` — только подтверждённые сведения об авторе.
+
+Авторизация пользовательской Telethon-сессии:
 
 ```bash
-# 1) Тестовая выгрузка: 3 дня из пары каналов
-.venv/bin/python -m repost.ingest backfill --days 3 --sources @channel1,@channel2
-
-# 2) Если ок — полная выгрузка по sources.txt (заполни его: @username на строку)
-.venv/bin/python -m repost.ingest backfill --days 90
-
-# 3) Догрузка новых постов через Telethon (если настроены API_ID/API_HASH)
-.venv/bin/python -m repost.ingest sync
-
-# Для публичных источников без Telegram API — через t.me/s и sources.txt
-.venv/bin/python -m repost.webingest --days 3
-
-# 4) Бот — постоянный процесс; предлагает черновики по POST_TIMES
-.venv/bin/python -m repost.bot
-
-# Статистика базы
-.venv/bin/python -m repost.ingest status
-
-# Смоук-тест без внешних сервисов
-.venv/bin/python scripts/smoke_test.py
+.venv/bin/python -m repost.ingest login
 ```
 
-В боте: `/next` — предложить черновик прямо сейчас, `/stats` — статистика. Правка черновика — ответь (reply) на сообщение с черновиком своим текстом: он станет LinkedIn-версией, а X/Threads пересоберутся автоматически.
+Файл `repost.session` равнозначен активному входу в аккаунт: он исключён из git,
+его нельзя пересылать или публиковать.
 
-## Режимы генератора
+## Сбор
 
-- `GENERATOR_MODE=translate` (по умолчанию) — перевод «как есть» + обезличивание: чужие имена → «a friend of mine», чужие компании → твои из AUTHOR_FACTS или нейтральные. Сомнительные утверждения (чужая выручка, награды) не подменяются, а помечаются в notes.
-- `GENERATOR_MODE=rewrite` — рекомендованный в RESEARCH.md безопасный режим: берётся идея поста и пишется новый текст, без переноса чужого личного опыта. Меньше рисков по авторским правам и «выдуманной биографии».
+Перед первым полным сбором сделай canary на одном источнике. Временно поставь
+`AUTO_SYNC=false` в `.env`, чтобы запуск бота через 10 секунд не начал сбор всех
+34 источников. Вместо `@channel` укажи один username уже из `sources.txt`:
 
-## Сбор из группы ботом (режим коллектора)
+```bash
+.venv/bin/python -m repost.ingest backfill --days 7 --sources @channel --limit 1
+.venv/bin/python -m repost.bot
+```
 
-Бот, добавленный в группу (privacy mode выключен через @BotFather → /setprivacy → Disable), автоматически сохраняет в базу каждое новое текстовое сообщение: кто написал, когда, текст. Историю ДО добавления бота Bot API не отдаёт — её догружаем через `repost.ingest` (Telethon). Чтобы бот работал всегда, есть launchd-агент:
+В Telegram вызови `/test @channel`. После проверки останови бота, выполни полный
+сбор ниже и верни `AUTO_SYNC=true`. Canary уменьшает нагрузку, но Telegram не
+обязан заранее предупреждать о `FloodWait` или ограничении аккаунта.
+
+Полный первоначальный сбор последних трёх календарных месяцев:
+
+```bash
+.venv/bin/python -m repost.ingest backfill --months 3
+```
+
+В production поставь `AUTO_SYNC=true`. Постоянный процесс проверяет сохранённую
+дату следующего запуска и повторяет полный трёхмесячный сбор через три
+календарных месяца. Повторная выгрузка идемпотентна по
+`source + Telegram message id`.
+
+## Бот
+
+```bash
+.venv/bin/python -m repost.bot
+```
+
+Команды:
+
+- `/test @channel` — показать один материал из указанного источника;
+- `/next` — вручную показать следующие два материала из общего пула;
+- `/stats` — статистика очереди.
+
+Сырой текст не отправляется в LLM до нажатия «Создать пост». Для voice/video
+эта кнопка просит написать собственный текст ответом. После генерации доступны
+только «Опубликовать», «Редактировать» и «Пропустить»; повторной генерации нет.
+Любая финальная версия жёстко ограничивается 250 символами.
+
+## Локальный автозапуск
 
 ```bash
 cp scripts/com.repost.bot.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.repost.bot.plist   # автозапуск + перезапуск при падении
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.repost.bot.plist
 ```
 
-Регулярный сбор публичных источников каждые 3 часа:
+Отдельный `com.repost.sync` не запускай: квартальное расписание уже находится
+внутри постоянного процесса бота. Если старая версия sync-агента уже была
+загружена, одного `Disabled=true` в обновлённом plist недостаточно — выгрузи её:
 
 ```bash
-cp scripts/com.repost.sync.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.repost.sync.plist
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.repost.sync.plist
 ```
 
-## Передача проекта другому человеку
+## Проверки
 
-Вся личная привязка живёт в `.env`. Чтобы систему использовал другой человек, меняются только:
+```bash
+.venv/bin/python scripts/smoke_test.py
+.venv/bin/python scripts/workflow_test.py
+.venv/bin/python scripts/scheduler_test.py
+.venv/bin/python scripts/publisher_test.py
+.venv/bin/python -m compileall -q repost scripts
+plutil -lint scripts/com.repost.bot.plist scripts/com.repost.sync.plist
+docker compose config --quiet
+```
 
-- `BOT_TOKEN` — он создаёт своего бота у @BotFather (или передаёте этого);
-- `OWNER_CHAT_ID` — его chat id (команда /id боту);
-- `ANTHROPIC_API_KEY` — его ключ;
-- `BUFFER_ACCESS_TOKEN` + `BUFFER_CHANNELS` — его Buffer с его LinkedIn/X/Threads;
-- `AUTHOR_FACTS` — его имя/компания для обезличивания;
-- `sources.txt` / группы, куда добавлен бот — его источники.
-
-Код не меняется вообще.
-
-## Заметки
-
-- Buffer `mode=addToQueue` кладёт пост в очередь канала — время выхода определяется слотами очереди в настройках Buffer. Прямой «опубликовать сейчас» можно получить, поставив в Buffer частые слоты.
-- Математика очереди (из RESEARCH.md): 25 источников дают ~7 новых постов в день, публикуется 3 — очередь будет расти. Кнопка «Пропустить» — твой фильтр; жми её чаще, чем «Опубликовать».
-- Секреты (`.env`, `repost.session`, `repost.db`) не коммитить и не пересылать.
+Инструкция по VPS и переносу сессии: [DEPLOY.md](DEPLOY.md).

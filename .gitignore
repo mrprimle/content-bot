@@ -1,8 +1,12 @@
 .env
+.DS_Store
 *.session
 *.session-journal
+*.session.lock
+*.bot.lock
 repost.db
 repost.db-*
+repost.db.backup-*
 bot.log
 bot-launchd.log
 sync.log

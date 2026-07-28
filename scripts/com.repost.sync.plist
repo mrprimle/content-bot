@@ -4,20 +4,20 @@
 <dict>
     <key>Label</key>
     <string>com.repost.sync</string>
+    <!-- Disabled: the persistent bot owns the quarterly schedule. -->
+    <key>Disabled</key>
+    <true/>
     <key>ProgramArguments</key>
     <array>
         <string>/Users/gleb/Desktop/tg/.venv/bin/python</string>
         <string>-m</string>
-        <string>repost.webingest</string>
-        <string>--days</string>
+        <string>repost.ingest</string>
+        <string>backfill</string>
+        <string>--months</string>
         <string>3</string>
     </array>
     <key>WorkingDirectory</key>
     <string>/Users/gleb/Desktop/tg</string>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>StartInterval</key>
-    <integer>10800</integer>
     <key>StandardOutPath</key>
     <string>/Users/gleb/Desktop/tg/sync.log</string>
     <key>StandardErrorPath</key>

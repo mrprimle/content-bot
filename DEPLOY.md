@@ -1,102 +1,150 @@
-# Деплой и передача заказчику
+# Деплой на VPS
 
-Приложение — один постоянный процесс (`python -m repost.bot`) плюс файл базы SQLite. Всё остальное — расписания, сбор постов, генерация, публикация — живёт внутри этого процесса.
+В production работает один постоянный процесс `python -m repost.bot`. Он:
 
-## Вариант 1. VPS + Docker (рекомендуемый, ~5 €/мес)
+- формирует общий пул: по одному старейшему необработанному материалу каждого
+  источника, с сортировкой от старых дат к новым;
+- в 10:00 и 18:00 `Europe/London` выдаёт по два материала — четыре базовых в
+  день; пропуск сразу выдаёт замену сверх этой четвёрки;
+- хранит очередь и состояние кнопок в SQLite;
+- проверяет дату квартального Telethon-сбора;
+- повторяет полный сбор последних трёх календарных месяцев раз в три месяца.
 
-Подходит для боевой эксплуатации: работает без твоего мака, переживает перезагрузки, логи ротируются.
+Отдельный системный cron не нужен.
 
-### 1. Сервер
+## Сервер
 
-Любой VPS с Ubuntu 24.04: Hetzner CX22 (~4,5 €/мес), DigitalOcean, Contabo. Минимума 1 vCPU / 2 GB хватает с большим запасом.
-
-```bash
-ssh root@IP_СЕРВЕРА
-apt update && apt install -y docker.io docker-compose-v2 git
-```
-
-### 2. Код
-
-```bash
-git clone <URL_РЕПОЗИТОРИЯ> /opt/repost && cd /opt/repost
-```
-
-### 3. Конфиг
+Подойдёт Ubuntu 24.04, 1 vCPU / 2 GB RAM:
 
 ```bash
+apt update
+apt install -y docker.io docker-compose-v2 git sqlite3
+systemctl enable --now docker
+git clone <URL_РЕПОЗИТОРИЯ> /opt/repost
+cd /opt/repost
+install -d -m 700 data
 cp .env.example .env
-nano .env    # заполнить: BOT_TOKEN, OWNER_CHAT_ID, OPENAI_API_KEY, BUFFER_*
-nano sources.txt   # список каналов: @username на строку
+nano .env
+chmod 600 .env
 ```
 
-### 4. Перенос накопленной базы (если нужно сохранить историю)
+Для сервера нужны:
 
-С мака:
+- `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`;
+- `BOT_TOKEN`, `OWNER_CHAT_ID`;
+- `OPENAI_API_KEY`;
+- `BUFFER_ACCESS_TOKEN`, `BUFFER_CHANNELS`;
+- `AUTHOR_FACTS`;
+- `AUTO_SYNC=true` после успешного canary.
 
-```bash
-scp ~/Desktop/tg/repost.db root@IP_СЕРВЕРА:/opt/repost/data/repost.db
+Compose уже задаёт:
+
+```text
+DB_PATH=/data/repost.db
+TELEGRAM_SESSION=/data/repost.session
 ```
 
-Если база не нужна — пропусти, соберётся заново первым синком.
+Поэтому база и пользовательская Telegram-сессия переживают пересборку
+контейнера.
 
-### 5. Запуск
+## Telethon-сессия
+
+Безопаснее авторизовать рабочий Telegram-аккаунт прямо на сервере:
 
 ```bash
+docker compose run --rm --build bot python -m repost.ingest login
+```
+
+Либо перенести уже созданную локальную сессию:
+
+```bash
+scp ~/Desktop/tg/repost.session root@IP_СЕРВЕРА:/opt/repost/data/repost.session
+```
+
+`repost.session` даёт доступ к Telegram-аккаунту. Права на сервере:
+
+```bash
+chmod 700 /opt/repost/data
+chmod 600 /opt/repost/data/repost.session
+```
+
+## Остановка старого локального запуска
+
+Если бот переносится с Mac на VPS, сначала останови на Mac оба старых
+launchd-задания. Иначе два процесса с одним `BOT_TOKEN` будут конфликтовать, а
+старый sync продолжит обращаться к Telegram:
+
+```bash
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.repost.bot.plist
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.repost.sync.plist
+```
+
+Изменение plist на `Disabled=true` не останавливает уже загруженное задание.
+
+## Canary и первый запуск
+
+Сначала поставь `AUTO_SYNC=false` в `.env` и загрузи один материал из одного
+источника в рабочую базу. Вместо `@channel` выбери один username из
+`sources.txt`, чтобы canary не добавил лишний источник:
+
+```bash
+docker compose run --rm --build bot \
+  python -m repost.ingest backfill --days 7 --sources @channel --limit 1
 docker compose up -d --build
-docker compose logs -f          # проверить, что стартовал
 ```
 
-Всё. Контейнер поднимается сам после перезагрузки сервера и после падения.
+В Telegram вызови `/test @channel`. Команда показывает сырой материал без LLM;
+LLM вызывается только после кнопки «Создать пост».
 
-### Обслуживание
+Если canary прошёл, останови бота, собери полное окно, верни `AUTO_SYNC=true` в
+`.env` и запусти production:
 
 ```bash
-docker compose logs --tail 100        # логи
-docker compose restart                # перезапуск
-git pull && docker compose up -d --build   # обновление кода
-docker compose exec bot python -m repost.webingest --days 90   # разовый сбор истории
-docker compose exec bot python -m repost.ingest status         # статистика
-docker compose exec bot python -m repost.ingest cleanup        # чистка старых постов
+docker compose down
+docker compose run --rm --build bot python -m repost.ingest backfill --months 3
+sed -i 's/^AUTO_SYNC=.*/AUTO_SYNC=true/' .env
+docker compose up -d --build
+docker compose logs --tail 100
 ```
 
-Бэкап базы (раз в неделю достаточно):
+Telegram может выдать `FloodWait` или ограничить аккаунт без отдельного
+предварительного предупреждения. Canary и отдельный рабочий аккаунт снижают
+последствия ошибки конфигурации, но не гарантируют отсутствие ограничений.
+
+После успешного полного сбора бот сохранит `next_full_sync_at` в базе.
+При перезапуске дата не теряется, и один и тот же квартальный запуск не
+планируется заново.
+
+## Проверка интерфейса
+
+В Telegram:
+
+```text
+/test @channel
+/stats
+```
+
+`/test` только показывает один материал и не обращается к LLM. LLM вызывается
+после кнопки «Создать пост», а Buffer — только после «Опубликовать».
+
+Перед передачей проверь offline workflow:
 
 ```bash
-cp /opt/repost/data/repost.db /opt/repost/data/backup-$(date +%F).db
+docker compose run --rm bot python scripts/smoke_test.py
+docker compose run --rm bot python scripts/workflow_test.py
+docker compose run --rm bot python scripts/scheduler_test.py
+docker compose run --rm bot python scripts/publisher_test.py
 ```
 
-## Вариант 2. Остаться на маке (только для теста)
-
-Автозапуск через launchd — процесс поднимается при входе в систему и перезапускается при падении:
+## Обслуживание
 
 ```bash
-cp ~/Desktop/tg/scripts/com.repost.bot.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.repost.bot.plist
+docker compose logs --tail 100
+docker compose restart
+git pull && docker compose up -d --build
+docker compose exec bot python -m repost.ingest status
+sqlite3 data/repost.db ".backup 'data/backup.db'"
 ```
 
-Минус: мак засыпает — расписание пропускается, публикации не уходят. Для боевой работы не годится.
-
-## Передача заказчику
-
-Код универсален, вся привязка к человеку — в `.env`. Заказчику нужно подготовить:
-
-| Что | Где взять |
-|---|---|
-| `BOT_TOKEN` | свой бот у @BotFather (`/newbot`, затем `/setprivacy` → Disable) |
-| `OWNER_CHAT_ID` | написать своему боту `/id` |
-| `OPENAI_API_KEY` | platform.openai.com → API keys |
-| `BUFFER_ACCESS_TOKEN` | publish.buffer.com/settings/api |
-| `BUFFER_CHANNELS` | `python -m repost.publisher --channels` после подключения соцсетей в Buffer |
-| `AUTHOR_FACTS` | имя, компания, чем занимается — для обезличивания |
-| `sources.txt` | его список Telegram-каналов |
-
-Порядок: заказчик заводит доступы → вписываются в `.env` на сервере → `docker compose up -d` → первый сбор истории (`webingest --days 90`) → проверка через `/next` в боте.
-
-Дальше система работает сама: 1-го числа собирает новые посты, три раза в день предлагает черновик, по кнопке публикует.
-
-## Что стоит сделать перед боевым запуском
-
-- **Ротировать OpenAI-ключ**, если он где-то засветился (чат, переписка): platform.openai.com → API keys → Revoke, создать новый, обновить `.env`.
-- **Лимит трат в OpenAI**: platform.openai.com → Billing → Limits, поставить месячный потолок (реальный расход ~$1–3/мес).
-- **Подключить Threads в Buffer** и дописать `threads:ID` в `BUFFER_CHANNELS` — сейчас работают LinkedIn и X.
-- **Проверить `GENERATOR_MODE`**: `translate` — близкий перевод с обезличиванием, `rewrite` — пересказ идеи своими словами (безопаснее с точки зрения авторских прав, см. RESEARCH.md).
+Не запускай `repost.ingest` одновременно в двух контейнерах: одна Telethon
+session не рассчитана на параллельную запись из нескольких процессов.

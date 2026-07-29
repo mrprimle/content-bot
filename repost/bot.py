@@ -358,7 +358,14 @@ async def _offer_replacement(bot, skipped_post_id: int) -> int:
     )
 
 
-async def _generate_from_post(bot, conn, post, source_text: str) -> bool:
+async def _generate_from_post(
+    bot,
+    conn,
+    post,
+    source_text: str,
+    *,
+    source_kind: str,
+) -> bool:
     existing = db.active_draft_for_post(conn, post["id"])
     if existing is not None:
         try:
@@ -374,8 +381,13 @@ async def _generate_from_post(bot, conn, post, source_text: str) -> bool:
                 pass
             return False
     try:
+        generate = (
+            generator.voice_idea
+            if source_kind == "voice"
+            else generator.translate_post
+        )
         out = await asyncio.to_thread(
-            generator.generate,
+            generate,
             post["title"] or post["username"],
             post["posted_at"][:10],
             source_text,
@@ -396,9 +408,13 @@ async def _generate_from_post(bot, conn, post, source_text: str) -> bool:
         except Exception:
             pass
         return False
-    if out.notes:
+    if source_kind == "voice" and out.notes:
         try:
-            await _send(bot.send_message, config.OWNER_CHAT_ID, f"ℹ️ {out.notes[:500]}")
+            await _send(
+                bot.send_message,
+                config.OWNER_CHAT_ID,
+                f"ℹ️ Идея: {out.notes[:500]}",
+            )
         except Exception:
             pass
     try:
@@ -625,7 +641,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 except Exception:
                     pass
             return
-        if action == "make" and post["media_kind"] != "text":
+        needs_manual_text = (
+            post["media_kind"] in {"voice", "audio", "video", "video_note"}
+            or not post["text"]
+        )
+        if action == "make" and needs_manual_text:
             await query.answer()
             if not db.transition_post(conn, post["id"], ("offered",), "awaiting_manual"):
                 return
@@ -658,14 +678,24 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             db.set_manual_prompt(conn, post["id"], prompt.message_id)
             await query.edit_message_reply_markup(None)
             return
-        source_text = post["transcript"] if action == "makeauto" else post["text"]
+        if action == "makeauto" and post["media_kind"] not in {"voice", "audio"}:
+            await query.answer("Идея доступна только для голосового сообщения", show_alert=True)
+            return
+        source_kind = "voice" if action == "makeauto" else "text"
+        source_text = post["transcript"] if source_kind == "voice" else post["text"]
         if not source_text:
             await query.answer("Нет текста для генерации", show_alert=True)
             return
         await query.answer("Создаю пост")
         if not db.transition_post(conn, post["id"], ("offered", "awaiting_manual"), "generating"):
             return
-        success = await _generate_from_post(context.bot, conn, post, source_text)
+        success = await _generate_from_post(
+            context.bot,
+            conn,
+            post,
+            source_text,
+            source_kind=source_kind,
+        )
         if success:
             await query.edit_message_reply_markup(None)
         else:

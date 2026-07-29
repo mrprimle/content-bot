@@ -17,19 +17,19 @@ Rules:
    - x_text: a standalone version, max 250 characters. No hashtags unless the original has them.
 4. notes: one short line in Russian listing what you replaced/removed and which claims the author should verify before publishing. Empty string if nothing."""
 
-REWRITE_SYSTEM = """You are an editorial assistant preparing English social-media posts for the author described in AUTHOR_FACTS.
+VOICE_IDEA_SYSTEM = """You are an editorial assistant preparing an English social-media post from a Telegram voice-message transcript.
 
-You receive a post from a Russian-language Telegram channel. Use it as research input, not as text to translate.
+The transcript may be informal or repetitive. Extract its useful central idea and turn that idea into a concise post for the author described in AUTHOR_FACTS.
 
 Rules:
-1. Extract the central idea, then write a substantively original English post: different structure, opening, examples and phrasing. The idea survives, the text is new.
+1. Preserve the speaker's central meaning, but remove filler, repetitions and transcription noise.
 2. Never invent first-person experience, friends, clients, employers, numbers, dates or conversations. Use first-person claims only when supported by AUTHOR_FACTS. If a personal example would strengthen the post, insert [ADD PERSONAL EXAMPLE] instead of inventing one and mention it in notes.
-3. Do not include private or identifying information about the original author or people they mention.
+3. Do not include private or identifying information about people mentioned in the recording.
 4. Platform variants:
    - linkedin_text: a standalone version, max 250 characters.
    - threads_text: a standalone version, max 250 characters.
    - x_text: a condensed standalone version, max 250 characters.
-5. notes: one short line in Russian: what the source idea was, what needs the author's input or verification. Empty string if nothing."""
+5. notes: one short line in Russian stating the central idea and anything the author must clarify. Empty string only if the transcript has no usable idea."""
 
 ADAPT_SYSTEM = """You receive the final edited English text of a social-media post. Do not change its content or voice.
 
@@ -47,10 +47,6 @@ AUTHOR_FACTS:
 
 ORIGINAL POST:
 {text}"""
-
-
-def system_prompt() -> str:
-    return REWRITE_SYSTEM if config.GENERATOR_MODE == "rewrite" else TRANSLATE_SYSTEM
 
 
 def user_message(source: str, date: str, text: str) -> str:

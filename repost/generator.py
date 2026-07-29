@@ -127,9 +127,25 @@ def _parse(system: str, user: str) -> DraftOut:
     return _finalize(_anthropic_parse(system, user))
 
 
+def translate_post(source: str, date: str, text: str) -> DraftOut:
+    """Ordinary Telegram text -> faithful English translation with replacements."""
+    return _parse(
+        prompts.TRANSLATE_SYSTEM,
+        prompts.user_message(source, date, text),
+    )
+
+
+def voice_idea(source: str, date: str, transcript: str) -> DraftOut:
+    """Voice transcript -> English post based on its central idea."""
+    return _parse(
+        prompts.VOICE_IDEA_SYSTEM,
+        prompts.user_message(source, date, transcript),
+    )
+
+
 def generate(source: str, date: str, text: str) -> DraftOut:
-    """Original Telegram post -> English draft in 3 platform variants."""
-    return _parse(prompts.system_prompt(), prompts.user_message(source, date, text))
+    """Backward-compatible alias: ordinary posts are always translated."""
+    return translate_post(source, date, text)
 
 
 def adapt(edited_text: str) -> DraftOut:

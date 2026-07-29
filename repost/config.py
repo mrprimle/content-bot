@@ -44,7 +44,6 @@ def llm_model() -> str:
 BUFFER_TOKEN = _get("BUFFER_ACCESS_TOKEN")
 BUFFER_POST_MODE = _get("BUFFER_POST_MODE") or "addToQueue"
 
-GENERATOR_MODE = (_get("GENERATOR_MODE") or "rewrite").split()[0].lower()
 MIN_POST_CHARS = int(_get("MIN_POST_CHARS") or 1)
 MAX_POST_CHARS = max(1, min(int(_get("MAX_POST_CHARS") or 250), 250))
 POST_TIMES = [t.strip() for t in (_get("POST_TIMES") or "10:00,18:00").split(",") if t.strip()]

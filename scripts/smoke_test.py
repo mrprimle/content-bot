@@ -683,9 +683,10 @@ def main() -> None:
     assert all(limit == 250 for limit in config.LIMITS.values())
     sources = config.read_sources()
     assert len(sources) == 34 and len(set(sources)) == 34, "ожидаются 34 уникальных источника"
-    system = prompts.system_prompt()
-    assert "max 250 characters" in system
-    assert "research input" in system, "режим rewrite должен быть включён"
+    assert "max 250 characters" in prompts.TRANSLATE_SYSTEM
+    assert "Do not add new ideas" in prompts.TRANSLATE_SYSTEM
+    assert "voice-message transcript" in prompts.VOICE_IDEA_SYSTEM
+    assert "central idea" in prompts.VOICE_IDEA_SYSTEM
     assert ingest.subtract_months(
         datetime(2026, 7, 31, tzinfo=timezone.utc), 3
     ) == datetime(2026, 4, 30, tzinfo=timezone.utc)

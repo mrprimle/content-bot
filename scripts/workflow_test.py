@@ -147,7 +147,8 @@ async def main() -> None:
     old_db_path = config.DB_PATH
     old_owner = config.OWNER_CHAT_ID
     old_delay = config.BOT_SEND_DELAY
-    original_generate = generator.generate
+    original_translate = generator.translate_post
+    original_voice_idea = generator.voice_idea
     original_publish = publisher.publish_all
     original_stage = ingest.stage_post_for_bot
     original_cleanup = ingest.delete_bot_staging_messages
@@ -176,7 +177,8 @@ async def main() -> None:
             calls["publish"] += 1
             raise AssertionError("Buffer был вызван до кнопки")
 
-        generator.generate = forbidden_generate
+        generator.translate_post = forbidden_generate
+        generator.voice_idea = forbidden_generate
         publisher.publish_all = forbidden_publish
         fake = FakeBot()
         sent = await bot.propose_batch(fake, slot_key="offline-test")
@@ -188,6 +190,83 @@ async def main() -> None:
         keyboard = fake.messages[0]["reply_markup"].inline_keyboard
         labels = [button.text for row in keyboard for button in row]
         assert labels == ["✨ Создать пост", "⏭ Пропустить"]
+
+        route_calls = {"translate": 0, "voice": 0}
+
+        def fake_translate(*args, **kwargs):
+            route_calls["translate"] += 1
+            return generator.DraftOut(
+                linkedin_text="Faithful English translation.",
+                x_text="Faithful English translation.",
+                threads_text="Faithful English translation.",
+                notes="Служебная заметка о заменах",
+            )
+
+        def fake_voice_idea(*args, **kwargs):
+            route_calls["voice"] += 1
+            return generator.DraftOut(
+                linkedin_text="English post from the voice idea.",
+                x_text="English post from the voice idea.",
+                threads_text="English post from the voice idea.",
+                notes="голосовое о проверке продуктовой гипотезы",
+            )
+
+        generator.translate_post = fake_translate
+        generator.voice_idea = fake_voice_idea
+
+        text_post_id = conn.execute(
+            "SELECT id FROM post WHERE tg_message_id=10"
+        ).fetchone()["id"]
+        text_query = FakeQuery(f"make:{text_post_id}")
+        text_update = SimpleNamespace(
+            callback_query=text_query,
+            effective_chat=SimpleNamespace(id=config.OWNER_CHAT_ID),
+        )
+        before_text_generation = len(fake.messages)
+        await bot.on_callback(text_update, SimpleNamespace(bot=fake))
+        text_generation_messages = fake.messages[before_text_generation:]
+        assert route_calls == {"translate": 1, "voice": 0}
+        assert len(text_generation_messages) == 1
+        assert text_generation_messages[0]["text"] == "Faithful English translation."
+        assert all(
+            "Идея:" not in message["text"]
+            for message in text_generation_messages
+        ), "обычный текст не должен получать отдельное сообщение с идеей"
+
+        voice_source = db.upsert_source(conn, "@voice-route", "Voice route")
+        assert db.insert_post(
+            conn,
+            voice_source,
+            12,
+            "2026-04-30T10:00:00+00:00",
+            "",
+            "https://t.me/voice-route/12",
+            status="offered",
+            media_kind="voice",
+            media_mime="audio/ogg",
+        )
+        voice_post_id = conn.execute(
+            "SELECT id FROM post WHERE source_id=? AND tg_message_id=12",
+            (voice_source,),
+        ).fetchone()["id"]
+        db.set_transcript(
+            conn,
+            voice_post_id,
+            "Подробная расшифровка голосового сообщения.",
+            "Краткое содержание.",
+        )
+        voice_query = FakeQuery(f"makeauto:{voice_post_id}")
+        voice_update = SimpleNamespace(
+            callback_query=voice_query,
+            effective_chat=SimpleNamespace(id=config.OWNER_CHAT_ID),
+        )
+        before_voice_generation = len(fake.messages)
+        await bot.on_callback(voice_update, SimpleNamespace(bot=fake))
+        voice_generation_messages = fake.messages[before_voice_generation:]
+        assert route_calls == {"translate": 1, "voice": 1}
+        assert len(voice_generation_messages) == 2
+        assert voice_generation_messages[0]["text"].startswith("ℹ️ Идея:")
+        assert voice_generation_messages[1]["text"] == "English post from the voice idea."
 
         long_text = "Полный исходный текст. " * 500
         long_source = db.upsert_source(conn, "@long", "Long")
@@ -276,7 +355,8 @@ async def main() -> None:
         assert len(cleanup_calls[1][1]) == 2
         print("Workflow-тест пройден: raw → выбор, без LLM и Buffer")
     finally:
-        generator.generate = original_generate
+        generator.translate_post = original_translate
+        generator.voice_idea = original_voice_idea
         publisher.publish_all = original_publish
         ingest.stage_post_for_bot = original_stage
         ingest.delete_bot_staging_messages = original_cleanup

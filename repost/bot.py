@@ -6,6 +6,7 @@ LLM generation starts only after the owner presses "Создать пост".
 import asyncio
 import fcntl
 import json
+import logging
 import secrets
 import shutil
 import subprocess
@@ -30,6 +31,7 @@ from telegram.ext import (
 
 from . import config, db, generator, ingest, publisher
 
+LOGGER = logging.getLogger("repost.bot")
 PLATFORM_LABELS = {"linkedin": "LinkedIn", "twitter": "X", "threads": "Threads"}
 _SEND_LOCK = asyncio.Lock()
 _SYNC_LOCK = asyncio.Lock()
@@ -43,7 +45,8 @@ _BOT_PROCESS_LOCK = None
 
 
 def _is_owner(update: Update) -> bool:
-    return bool(config.OWNER_CHAT_ID) and update.effective_chat.id == config.OWNER_CHAT_ID
+    chat_id = getattr(update.effective_chat, "id", None)
+    return bool(config.OWNER_CHAT_ID) and chat_id == config.OWNER_CHAT_ID
 
 
 async def _send(call, *args, **kwargs):
@@ -552,7 +555,19 @@ async def on_staging_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
+    chat_id = getattr(update.effective_chat, "id", None)
+    user_id = getattr(getattr(query, "from_user", None), "id", None)
+    LOGGER.info(
+        "callback received chat_id=%s user_id=%s data=%r",
+        chat_id,
+        user_id,
+        query.data,
+    )
     if not _is_owner(update):
+        LOGGER.warning(
+            "callback rejected: chat_id=%s does not match configured owner",
+            chat_id,
+        )
         await query.answer()
         return
     action, _, raw_id = query.data.partition(":")
@@ -573,7 +588,19 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 await query.answer()
             except Exception:
                 pass
-            if db.transition_post(conn, post["id"], ("offered", "awaiting_manual"), "skipped"):
+            transitioned = db.transition_post(
+                conn,
+                post["id"],
+                ("offered", "awaiting_manual"),
+                "skipped",
+            )
+            LOGGER.info(
+                "raw skip post_id=%s previous_status=%s transitioned=%s",
+                post["id"],
+                post["status"],
+                transitioned,
+            )
+            if transitioned:
                 try:
                     await query.edit_message_reply_markup(None)
                 except Exception:
@@ -586,7 +613,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     )
                 except Exception:
                     pass
-                await _offer_replacement(context.bot, post["id"])
+                replacement_count = await _offer_replacement(context.bot, post["id"])
+                LOGGER.info(
+                    "raw skip replacement post_id=%s sent=%s",
+                    post["id"],
+                    replacement_count,
+                )
+            else:
+                try:
+                    await query.edit_message_reply_markup(None)
+                except Exception:
+                    pass
             return
         if action == "make" and post["media_kind"] != "text":
             await query.answer()
@@ -903,6 +940,21 @@ async def startup_recovery_notice_job(context: ContextTypes.DEFAULT_TYPE) -> Non
         conn.close()
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log handler failures without logging message contents or credentials."""
+    error = context.error
+    update_id = getattr(update, "update_id", None)
+    if error is None:
+        LOGGER.error("Telegram update failed without an exception; update_id=%s", update_id)
+        return
+    LOGGER.error(
+        "Telegram update failed; update_id=%s error=%s",
+        update_id,
+        type(error).__name__,
+        exc_info=(type(error), error, error.__traceback__),
+    )
+
+
 _SYNC_RETRY_KEYS = (
     "sync_retry_sources",
     "sync_retry_window_start",
@@ -1060,6 +1112,11 @@ def _acquire_process_lock() -> None:
 def main() -> None:
     if not config.BOT_TOKEN:
         sys.exit("BOT_TOKEN не задан в .env — создай бота у @BotFather")
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    LOGGER.setLevel(logging.INFO)
     _acquire_process_lock()
     startup_conn = db.connect()
     source_state = db.reconcile_active_sources(startup_conn, config.read_sources())
@@ -1086,6 +1143,7 @@ def main() -> None:
     app.add_handler(CommandHandler("test", cmd_test, filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("stats", cmd_stats, filters.ChatType.PRIVATE))
     app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_error_handler(on_error)
     app.add_handler(
         MessageHandler(filters.ChatType.PRIVATE & filters.REPLY & filters.TEXT & ~filters.COMMAND, on_reply)
     )
@@ -1132,7 +1190,10 @@ def main() -> None:
         f"зависших генераций: {recovered_generation_count}; "
         f"неизвестных публикаций: {recovered_work['publishing_unknown']}."
     )
-    app.run_polling()
+    # Telegram keeps the previous allowed_updates filter when the parameter is
+    # omitted. Explicitly request every update type so inline button callbacks
+    # cannot remain disabled by an older bot deployment.
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":

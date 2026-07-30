@@ -176,6 +176,18 @@ async def _send_draft(bot, conn, draft_id: int) -> None:
     db.set_draft_status(conn, draft_id, "awaiting_review")
 
 
+async def _send_generation_note(bot, draft, *, source_kind: str) -> None:
+    notes = (draft["notes"] or "").strip()
+    if not notes:
+        return
+    prefix = "ℹ️ Идея:" if source_kind == "voice" else "⚠️ Заменено / проверить:"
+    await _send(
+        bot.send_message,
+        config.OWNER_CHAT_ID,
+        f"{prefix}\n{notes[:500]}",
+    )
+
+
 async def _send_media(bot, post, path: Path):
     markup = _raw_keyboard(post["id"], post["media_kind"], has_transcript=bool(post["transcript"]))
     with path.open("rb") as media:
@@ -369,6 +381,7 @@ async def _generate_from_post(
     existing = db.active_draft_for_post(conn, post["id"])
     if existing is not None:
         try:
+            await _send_generation_note(bot, existing, source_kind=source_kind)
             await _send_draft(bot, conn, existing["id"])
             db.set_post_status(conn, post["id"], "drafted")
             return True
@@ -408,16 +421,9 @@ async def _generate_from_post(
         except Exception:
             pass
         return False
-    if source_kind == "voice" and out.notes:
-        try:
-            await _send(
-                bot.send_message,
-                config.OWNER_CHAT_ID,
-                f"ℹ️ Идея: {out.notes[:500]}",
-            )
-        except Exception:
-            pass
     try:
+        draft = db.get_draft(conn, draft_id)
+        await _send_generation_note(bot, draft, source_kind=source_kind)
         await _send_draft(bot, conn, draft_id)
         return True
     except Exception as exc:  # noqa: BLE001

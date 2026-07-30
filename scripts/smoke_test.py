@@ -685,6 +685,10 @@ def main() -> None:
     assert len(sources) == 34 and len(set(sources)) == 34, "ожидаются 34 уникальных источника"
     assert "max 250 characters" in prompts.TRANSLATE_SYSTEM
     assert "Do not add new ideas" in prompts.TRANSLATE_SYSTEM
+    assert "one coherent, self-contained central message" in prompts.TRANSLATE_SYSTEM
+    assert "must not appear in the final post" in prompts.TRANSLATE_SYSTEM
+    assert 'do not use "I", "we", "my" or "our"' in prompts.TRANSLATE_SYSTEM
+    assert "Never claim that a name or brand was replaced" in prompts.TRANSLATE_SYSTEM
     assert "voice-message transcript" in prompts.VOICE_IDEA_SYSTEM
     assert "central idea" in prompts.VOICE_IDEA_SYSTEM
     assert ingest.subtract_months(

@@ -226,8 +226,12 @@ async def main() -> None:
         await bot.on_callback(text_update, SimpleNamespace(bot=fake))
         text_generation_messages = fake.messages[before_text_generation:]
         assert route_calls == {"translate": 1, "voice": 0}
-        assert len(text_generation_messages) == 1
-        assert text_generation_messages[0]["text"] == "Faithful English translation."
+        assert len(text_generation_messages) == 2
+        assert text_generation_messages[0]["text"].startswith(
+            "⚠️ Заменено / проверить:"
+        )
+        assert "Служебная заметка о заменах" in text_generation_messages[0]["text"]
+        assert text_generation_messages[1]["text"] == "Faithful English translation."
         assert all(
             "Идея:" not in message["text"]
             for message in text_generation_messages

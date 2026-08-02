@@ -6,20 +6,20 @@
     <string>com.repost.bot</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/gleb/Desktop/tg/.venv/bin/python</string>
+        <string>/Users/mykhailodoroshenko/Desktop/content-bot/.venv/bin/python</string>
         <string>-u</string>
         <string>-m</string>
         <string>repost.bot</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>/Users/gleb/Desktop/tg</string>
+    <string>/Users/mykhailodoroshenko/Desktop/content-bot</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/Users/gleb/Desktop/tg/bot-launchd.log</string>
+    <string>/Users/mykhailodoroshenko/Desktop/content-bot/bot-launchd.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/gleb/Desktop/tg/bot-launchd.log</string>
+    <string>/Users/mykhailodoroshenko/Desktop/content-bot/bot-launchd.log</string>
 </dict>
 </plist>

@@ -30,12 +30,23 @@ def _gql(query: str, variables: dict | None = None) -> dict:
     return data["data"]
 
 
-def create_post(channel_id: str, text: str) -> str:
+def create_post(
+    channel_id: str,
+    text: str,
+    *,
+    thread_platform: str | None = None,
+    thread: list[str] | None = None,
+) -> str:
+    metadata = ""
+    if thread_platform and thread:
+        items = ", ".join(f"{{ text: {json.dumps(item)} }}" for item in thread)
+        metadata = f", metadata: {{{thread_platform}: {{thread: [{items}]}}}}"
     query = (
         "mutation { createPost(input: {"
         f"text: {json.dumps(text)}, "
         f"channelId: {json.dumps(channel_id)}, "
         f"schedulingType: automatic, mode: {config.BUFFER_POST_MODE}"
+        f"{metadata}"
         "}) { ... on PostActionSuccess { post { id } } ... on MutationError { message } } }"
     )
     res = _gql(query)["createPost"]
@@ -44,12 +55,60 @@ def create_post(channel_id: str, text: str) -> str:
     return res["post"]["id"]
 
 
-def _clip_for_platform(platform: str, text: str) -> str:
+def split_for_thread(text: str, limit: int) -> list[str]:
+    """Split without dropping words or ideas; prefer paragraph/sentence boundaries."""
     text = text.strip()
+    if not text:
+        return []
+    chunks: list[str] = []
+    remaining = text
+    separators = ("\n\n", "\n", ". ", "! ", "? ", "; ", ": ", ", ", " ")
+    while len(remaining) > limit:
+        window = remaining[: limit + 1]
+        best_index = -1
+        best_separator = ""
+        minimum = max(1, limit // 2)
+        for separator in separators:
+            index = window.rfind(separator, minimum)
+            if index > best_index:
+                best_index = index
+                best_separator = separator
+        if best_index < 0:
+            cut = limit
+        else:
+            # Keep punctuation in the previous chunk; whitespace starts the next.
+            cut = best_index + len(best_separator.rstrip())
+            if cut <= 0:
+                cut = best_index
+        chunk = remaining[:cut].strip()
+        if not chunk:
+            chunk = remaining[:limit]
+            cut = limit
+        chunks.append(chunk)
+        remaining = remaining[cut:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+def _publication_payload(platform: str, text: str) -> tuple[str, str | None, list[str] | None]:
+    text = text.strip()
+    if platform == "twitter":
+        if len(text) <= config.LIMITS["twitter"]:
+            # X Basic/Premium/Premium+ accepts one long post (Show more).
+            return text, None, None
+        chunks = split_for_thread(text, 280)
+        return chunks[0], "twitter", chunks
+    if platform == "threads":
+        chunks = split_for_thread(text, config.LIMITS["threads"])
+        return chunks[0], "threads" if len(chunks) > 1 else None, chunks if len(chunks) > 1 else None
     limit = config.LIMITS.get(platform)
-    if not limit or len(text) <= limit:
-        return text
-    return text[: limit - 1].rstrip() + "…"
+    if limit and len(text) > limit:
+        raise ValueError(
+            f"Текст для {platform} содержит {len(text)} символов при лимите {limit}; "
+            "публикация остановлена без обрезания"
+        )
+    return text, None, None
 
 
 def publish_all(texts_by_platform: dict[str, str]) -> dict[str, tuple[bool, str]]:
@@ -68,9 +127,17 @@ def publish_all(texts_by_platform: dict[str, str]) -> dict[str, tuple[bool, str]
                 "Пустой текст для настроенной площадки; публикация не выполнена",
             )
             continue
-        text = _clip_for_platform(platform, text)
         try:
-            results[platform] = (True, create_post(channel_id, text))
+            first, thread_platform, thread = _publication_payload(platform, text)
+            results[platform] = (
+                True,
+                create_post(
+                    channel_id,
+                    first,
+                    thread_platform=thread_platform,
+                    thread=thread,
+                ),
+            )
         except (httpx.TimeoutException, httpx.TransportError) as e:
             results[platform] = (
                 False,

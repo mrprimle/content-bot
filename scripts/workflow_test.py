@@ -47,7 +47,7 @@ class FakeQuery:
 
 
 async def test_daily_schedule_and_skip(calls: dict[str, int]) -> None:
-    """Four scheduled items per day; a raw skip immediately adds one replacement."""
+    """Two daily iterations; a raw skip immediately adds one replacement."""
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     tmp.close()
     old_db_path = config.DB_PATH
@@ -77,9 +77,8 @@ async def test_daily_schedule_and_skip(calls: dict[str, int]) -> None:
         await bot.propose_job(
             SimpleNamespace(bot=fake, job=SimpleNamespace(data={"slot": "10:00"}))
         )
-        assert len(fake.messages) == 2, "утренний слот должен показать ровно два материала"
+        assert len(fake.messages) == 1, "утренний слот должен показать ровно один материал"
         assert "@skip-alpha" in fake.messages[0]["text"]
-        assert "@skip-bravo" in fake.messages[1]["text"]
 
         skipped_id = post_ids["@skip-alpha"]
         query = FakeQuery(f"drop:{skipped_id}")
@@ -93,7 +92,7 @@ async def test_daily_schedule_and_skip(calls: dict[str, int]) -> None:
         assert query.markup_edits == [None]
         assert len(fake.messages) == before_skip + 2
         assert "Показываю следующий" in fake.messages[-2]["text"]
-        assert "@skip-charlie" in fake.messages[-1]["text"]
+        assert "@skip-bravo" in fake.messages[-1]["text"]
         assert db.get_post(conn, skipped_id)["status"] == "skipped"
         assert calls == {"generate": 0, "publish": 0}, (
             "пропуск сырого материала не должен вызывать LLM или Buffer"
@@ -114,8 +113,7 @@ async def test_daily_schedule_and_skip(calls: dict[str, int]) -> None:
         await bot.propose_job(
             SimpleNamespace(bot=fake, job=SimpleNamespace(data={"slot": "18:00"}))
         )
-        assert "@skip-delta" in fake.messages[-2]["text"]
-        assert "@skip-echo" in fake.messages[-1]["text"]
+        assert "@skip-charlie" in fake.messages[-1]["text"]
 
         daily_counts = [
             row["n"]
@@ -130,13 +128,67 @@ async def test_daily_schedule_and_skip(calls: dict[str, int]) -> None:
             "JOIN delivery_batch b ON b.id=di.batch_id "
             "WHERE b.slot_key LIKE 'replacement:%'"
         ).fetchone()["n"]
-        assert daily_counts == [2, 2] and sum(daily_counts) == 4
+        assert daily_counts == [1, 1] and sum(daily_counts) == 2
         assert replacement_count == 1, (
-            "замена после пропуска идёт сверх четырёх базовых материалов дня"
+            "замена после пропуска идёт сверх двух базовых итераций дня"
         )
         assert calls == {"generate": 0, "publish": 0}
     finally:
         conn.close()
+        config.DB_PATH = old_db_path
+        Path(tmp.name).unlink(missing_ok=True)
+
+
+async def test_refetch_after_queue_exhaustion() -> None:
+    """An empty durable slot is retried after a pointer-based Telegram refetch."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    old_db_path = config.DB_PATH
+    original_run_fetch = ingest.run_fetch
+    calls = 0
+
+    async def fake_run_fetch(sources, *, window_start, window_end, incremental):
+        nonlocal calls
+        calls += 1
+        assert sources == ["@fresh"]
+        assert window_start is None and window_end is not None and incremental is True
+        fetch_conn = db.connect()
+        try:
+            source_id = db.upsert_source(fetch_conn, "@fresh", "Fresh")
+            assert db.insert_post(
+                fetch_conn,
+                source_id,
+                42,
+                "2026-08-01T10:00:00+00:00",
+                "Материал, появившийся после последнего указателя " * 10,
+                "https://t.me/fresh/42",
+            )
+            db.set_last_message_id(fetch_conn, source_id, 42)
+        finally:
+            fetch_conn.close()
+        return {"sources": 1, "seen": 1, "added": 1, "errors": {}}
+
+    try:
+        config.DB_PATH = tmp.name
+        conn = db.connect()
+        db.reconcile_active_sources(conn, ["@fresh"])
+        conn.close()
+        ingest.run_fetch = fake_run_fetch
+        fake = FakeBot()
+        assert await bot.propose_batch(fake, slot_key="empty-then-refetch") == 1
+        assert calls == 1
+        assert any("Материал, появившийся" in message["text"] for message in fake.messages)
+        verify = db.connect()
+        try:
+            source = verify.execute(
+                "SELECT last_message_id FROM source WHERE username='@fresh'"
+            ).fetchone()
+            assert source["last_message_id"] == 42
+            assert db.get_meta(verify, "last_incremental_refetch_added") == "1"
+        finally:
+            verify.close()
+    finally:
+        ingest.run_fetch = original_run_fetch
         config.DB_PATH = old_db_path
         Path(tmp.name).unlink(missing_ok=True)
 
@@ -148,7 +200,6 @@ async def main() -> None:
     old_owner = config.OWNER_CHAT_ID
     old_delay = config.BOT_SEND_DELAY
     original_translate = generator.translate_post
-    original_voice_idea = generator.voice_idea
     original_publish = publisher.publish_all
     original_stage = ingest.stage_post_for_bot
     original_cleanup = ingest.delete_bot_staging_messages
@@ -178,7 +229,6 @@ async def main() -> None:
             raise AssertionError("Buffer был вызван до кнопки")
 
         generator.translate_post = forbidden_generate
-        generator.voice_idea = forbidden_generate
         publisher.publish_all = forbidden_publish
         fake = FakeBot()
         sent = await bot.propose_batch(fake, slot_key="offline-test")
@@ -191,7 +241,7 @@ async def main() -> None:
         labels = [button.text for row in keyboard for button in row]
         assert labels == ["✨ Создать пост", "⏭ Пропустить"]
 
-        route_calls = {"translate": 0, "voice": 0}
+        route_calls = {"translate": 0}
 
         def fake_translate(*args, **kwargs):
             route_calls["translate"] += 1
@@ -202,17 +252,7 @@ async def main() -> None:
                 notes="Служебная заметка о заменах",
             )
 
-        def fake_voice_idea(*args, **kwargs):
-            route_calls["voice"] += 1
-            return generator.DraftOut(
-                linkedin_text="English post from the voice idea.",
-                x_text="English post from the voice idea.",
-                threads_text="English post from the voice idea.",
-                notes="голосовое о проверке продуктовой гипотезы",
-            )
-
         generator.translate_post = fake_translate
-        generator.voice_idea = fake_voice_idea
 
         text_post_id = conn.execute(
             "SELECT id FROM post WHERE tg_message_id=10"
@@ -225,52 +265,42 @@ async def main() -> None:
         before_text_generation = len(fake.messages)
         await bot.on_callback(text_update, SimpleNamespace(bot=fake))
         text_generation_messages = fake.messages[before_text_generation:]
-        assert route_calls == {"translate": 1, "voice": 0}
+        assert route_calls == {"translate": 1}
         assert len(text_generation_messages) == 2
         assert text_generation_messages[0]["text"].startswith(
             "⚠️ Заменено / проверить:"
         )
         assert "Служебная заметка о заменах" in text_generation_messages[0]["text"]
         assert text_generation_messages[1]["text"] == "Faithful English translation."
+        draft_keyboard = text_generation_messages[1]["reply_markup"].inline_keyboard
+        draft_labels = [button.text for row in draft_keyboard for button in row]
+        assert draft_labels == [
+            "✅ Опубликовать",
+            "⏹ Закончить итерацию",
+            "✏️ Редактировать",
+        ]
         assert all(
             "Идея:" not in message["text"]
             for message in text_generation_messages
         ), "обычный текст не должен получать отдельное сообщение с идеей"
 
-        voice_source = db.upsert_source(conn, "@voice-route", "Voice route")
-        assert db.insert_post(
-            conn,
-            voice_source,
-            12,
-            "2026-04-30T10:00:00+00:00",
-            "",
-            "https://t.me/voice-route/12",
-            status="offered",
-            media_kind="voice",
-            media_mime="audio/ogg",
-        )
-        voice_post_id = conn.execute(
-            "SELECT id FROM post WHERE source_id=? AND tg_message_id=12",
-            (voice_source,),
+        draft_id = conn.execute(
+            "SELECT id FROM draft WHERE post_id=?",
+            (text_post_id,),
         ).fetchone()["id"]
-        db.set_transcript(
-            conn,
-            voice_post_id,
-            "Подробная расшифровка голосового сообщения.",
-            "Краткое содержание.",
-        )
-        voice_query = FakeQuery(f"makeauto:{voice_post_id}")
-        voice_update = SimpleNamespace(
-            callback_query=voice_query,
+        finish_query = FakeQuery(f"draftskip:{draft_id}")
+        finish_update = SimpleNamespace(
+            callback_query=finish_query,
             effective_chat=SimpleNamespace(id=config.OWNER_CHAT_ID),
         )
-        before_voice_generation = len(fake.messages)
-        await bot.on_callback(voice_update, SimpleNamespace(bot=fake))
-        voice_generation_messages = fake.messages[before_voice_generation:]
-        assert route_calls == {"translate": 1, "voice": 1}
-        assert len(voice_generation_messages) == 2
-        assert voice_generation_messages[0]["text"].startswith("ℹ️ Идея:")
-        assert voice_generation_messages[1]["text"] == "English post from the voice idea."
+        before_finish = len(fake.messages)
+        await bot.on_callback(finish_update, SimpleNamespace(bot=fake))
+        assert len(fake.messages) == before_finish + 1, (
+            "завершение готового черновика не должно подбрасывать замену"
+        )
+        assert "Следующий материал придёт по расписанию" in fake.messages[-1]["text"]
+        assert db.get_draft(conn, draft_id)["status"] == "skipped"
+        assert db.get_post(conn, text_post_id)["status"] == "skipped"
 
         long_text = "Полный исходный текст. " * 500
         long_source = db.upsert_source(conn, "@long", "Long")
@@ -291,6 +321,7 @@ async def main() -> None:
         assert "reply_markup" in delivered[-1]
 
         await test_daily_schedule_and_skip(calls)
+        await test_refetch_after_queue_exhaustion()
 
         waiter = asyncio.get_running_loop().create_future()
         bot._STAGING_WAITERS["unit-token"] = waiter
@@ -360,7 +391,6 @@ async def main() -> None:
         print("Workflow-тест пройден: raw → выбор, без LLM и Buffer")
     finally:
         generator.translate_post = original_translate
-        generator.voice_idea = original_voice_idea
         publisher.publish_all = original_publish
         ingest.stage_post_for_bot = original_stage
         ingest.delete_bot_staging_messages = original_cleanup

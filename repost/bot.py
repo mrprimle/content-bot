@@ -1,6 +1,6 @@
 """Telegram bot for raw review, on-demand LLM drafting and Buffer publishing.
 
-The bot sends two globally oldest unreviewed materials at each London slot.
+The bot starts one review iteration at each London slot and sends one candidate.
 LLM generation starts only after the owner presses "Создать пост".
 """
 import asyncio
@@ -8,8 +8,6 @@ import fcntl
 import json
 import logging
 import secrets
-import shutil
-import subprocess
 import sys
 import tempfile
 import time
@@ -78,7 +76,7 @@ async def _send(call, *args, **kwargs):
 
 
 def _draft_body(draft) -> str:
-    return (draft["edited_text"] or draft["linkedin_text"] or "").strip()[: config.MAX_POST_CHARS]
+    return (draft["edited_text"] or draft["linkedin_text"] or "").strip()
 
 
 def _draft_keyboard(draft_id: int) -> InlineKeyboardMarkup:
@@ -86,28 +84,25 @@ def _draft_keyboard(draft_id: int) -> InlineKeyboardMarkup:
         [
             [
                 InlineKeyboardButton("✅ Опубликовать", callback_data=f"pub:{draft_id}"),
-                InlineKeyboardButton("⏭ Пропустить", callback_data=f"draftskip:{draft_id}"),
+                InlineKeyboardButton(
+                    "⏹ Закончить итерацию",
+                    callback_data=f"draftskip:{draft_id}",
+                ),
             ],
             [InlineKeyboardButton("✏️ Редактировать", callback_data=f"edit:{draft_id}")],
         ]
     )
 
 
-def _raw_keyboard(post_id: int, media_kind: str, *, has_transcript: bool = False) -> InlineKeyboardMarkup:
-    rows = [
+def _raw_keyboard(post_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton("✨ Создать пост", callback_data=f"make:{post_id}"),
-            InlineKeyboardButton("⏭ Пропустить", callback_data=f"drop:{post_id}"),
+            [
+                InlineKeyboardButton("✨ Создать пост", callback_data=f"make:{post_id}"),
+                InlineKeyboardButton("⏭ Пропустить", callback_data=f"drop:{post_id}"),
+            ]
         ]
-    ]
-    if media_kind in {"voice", "audio"}:
-        if has_transcript:
-            rows.append(
-                [InlineKeyboardButton("✨ Создать из расшифровки", callback_data=f"makeauto:{post_id}")]
-            )
-        else:
-            rows.append([InlineKeyboardButton("📝 Расшифровать", callback_data=f"transcribe:{post_id}")])
-    return InlineKeyboardMarkup(rows)
+    )
 
 
 def _raw_body(post, *, include_text: bool = True) -> str:
@@ -154,11 +149,7 @@ async def _send_raw_parts(bot, post, *, keyboard_on_last: bool) -> int:
     for index, text in enumerate(messages):
         kwargs = {"disable_web_page_preview": True}
         if keyboard_on_last and index == len(messages) - 1:
-            kwargs["reply_markup"] = _raw_keyboard(
-                post["id"],
-                post["media_kind"],
-                has_transcript=bool(post["transcript"]),
-            )
+            kwargs["reply_markup"] = _raw_keyboard(post["id"])
         sent = await _send(bot.send_message, config.OWNER_CHAT_ID, text, **kwargs)
         last_message_id = sent.message_id
     return last_message_id
@@ -176,20 +167,19 @@ async def _send_draft(bot, conn, draft_id: int) -> None:
     db.set_draft_status(conn, draft_id, "awaiting_review")
 
 
-async def _send_generation_note(bot, draft, *, source_kind: str) -> None:
+async def _send_generation_note(bot, draft) -> None:
     notes = (draft["notes"] or "").strip()
     if not notes:
         return
-    prefix = "ℹ️ Идея:" if source_kind == "voice" else "⚠️ Заменено / проверить:"
     await _send(
         bot.send_message,
         config.OWNER_CHAT_ID,
-        f"{prefix}\n{notes[:500]}",
+        f"⚠️ Заменено / проверить:\n{notes[:500]}",
     )
 
 
 async def _send_media(bot, post, path: Path):
-    markup = _raw_keyboard(post["id"], post["media_kind"], has_transcript=bool(post["transcript"]))
+    markup = _raw_keyboard(post["id"])
     with path.open("rb") as media:
         common = {
             "chat_id": config.OWNER_CHAT_ID,
@@ -304,7 +294,7 @@ async def _send_raw(bot, conn, post) -> None:
             bot.send_message,
             config.OWNER_CHAT_ID,
             f"⚠️ Медиа не удалось переслать: {str(exc)[:300]}\nОткрыть оригинал: {post['url']}",
-            reply_markup=_raw_keyboard(post["id"], post["media_kind"], has_transcript=bool(post["transcript"])),
+            reply_markup=_raw_keyboard(post["id"]),
             disable_web_page_preview=True,
         )
     _finish_delivery(conn, post, msg.message_id)
@@ -323,7 +313,8 @@ async def propose_batch(
     async with _DELIVERY_LOCK:
         conn = db.connect()
         try:
-            # Do not form a source round from a half-finished quarterly sync.
+            refetch_result = None
+            # Do not form a source round from a half-finished Telegram sync.
             async with _SYNC_LOCK:
                 posts = db.claim_oldest_posts(
                     conn,
@@ -331,12 +322,26 @@ async def propose_batch(
                     source_username=source_username,
                     max_items=config.ITEMS_PER_SLOT if max_items is None else max_items,
                 )
+                if not posts and source_username is None:
+                    refetch_result = await _incremental_refetch_on_exhaustion()
+                    posts = db.claim_oldest_posts(
+                        conn,
+                        slot_key,
+                        source_username=source_username,
+                        max_items=config.ITEMS_PER_SLOT if max_items is None else max_items,
+                    )
             if not posts:
                 if announce_empty:
+                    detail = ""
+                    if refetch_result is not None:
+                        detail = (
+                            f" После обновления добавлено {refetch_result['added']};"
+                            f" ошибок источников: {len(refetch_result['errors'])}."
+                        )
                     await _send(
                         bot.send_message,
                         config.OWNER_CHAT_ID,
-                        "Очередь пуста — новых материалов нет.",
+                        "Очередь пуста — новых материалов нет." + detail,
                     )
                 return 0
             sent = 0
@@ -360,6 +365,37 @@ async def propose_batch(
             conn.close()
 
 
+async def _incremental_refetch_on_exhaustion() -> dict | None:
+    """Fetch every Telegram message after each source's durable last_message_id."""
+    lease_conn = db.connect()
+    if not db.claim_incremental_refetch(lease_conn):
+        lease_conn.close()
+        return None
+    result = None
+    queue_lock_acquired = False
+    try:
+        await asyncio.to_thread(db.acquire_queue_sync_lock, lease_conn)
+        queue_lock_acquired = True
+        rows = lease_conn.execute(
+            "SELECT username FROM source WHERE active=1 ORDER BY lower(username)"
+        ).fetchall()
+        sources = [row["username"] for row in rows]
+        if not sources:
+            sources = config.read_sources()
+        result = await ingest.run_fetch(
+            sources,
+            window_start=None,
+            window_end=datetime.now(timezone.utc),
+            incremental=True,
+        )
+        return result
+    finally:
+        db.finish_incremental_refetch(lease_conn, result)
+        if queue_lock_acquired:
+            await asyncio.to_thread(db.release_queue_sync_lock, lease_conn)
+        lease_conn.close()
+
+
 async def _offer_replacement(bot, skipped_post_id: int) -> int:
     """Immediately replace a skipped material with the next queue item."""
     return await propose_batch(
@@ -375,13 +411,11 @@ async def _generate_from_post(
     conn,
     post,
     source_text: str,
-    *,
-    source_kind: str,
 ) -> bool:
     existing = db.active_draft_for_post(conn, post["id"])
     if existing is not None:
         try:
-            await _send_generation_note(bot, existing, source_kind=source_kind)
+            await _send_generation_note(bot, existing)
             await _send_draft(bot, conn, existing["id"])
             db.set_post_status(conn, post["id"], "drafted")
             return True
@@ -394,13 +428,8 @@ async def _generate_from_post(
                 pass
             return False
     try:
-        generate = (
-            generator.voice_idea
-            if source_kind == "voice"
-            else generator.translate_post
-        )
         out = await asyncio.to_thread(
-            generate,
+            generator.translate_post,
             post["title"] or post["username"],
             post["posted_at"][:10],
             source_text,
@@ -423,7 +452,7 @@ async def _generate_from_post(
         return False
     try:
         draft = db.get_draft(conn, draft_id)
-        await _send_generation_note(bot, draft, source_kind=source_kind)
+        await _send_generation_note(bot, draft)
         await _send_draft(bot, conn, draft_id)
         return True
     except Exception as exc:  # noqa: BLE001
@@ -434,61 +463,6 @@ async def _generate_from_post(
         except Exception:
             pass
         return False
-
-
-def _prepare_transcription_file(path: Path, directory: Path) -> Path:
-    supported = {".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm"}
-    if path.suffix.lower() in supported:
-        return path
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
-        raise RuntimeError("Для Telegram voice в формате OGG нужен ffmpeg")
-    target = directory / "voice.mp3"
-    subprocess.run(
-        [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(path), "-vn", "-b:a", "64k", str(target)],
-        check=True,
-        timeout=180,
-    )
-    return target
-
-
-async def _transcribe_post(bot, conn, post, query) -> None:
-    if post["transcript"]:
-        summary = post["summary"] or ""
-        if not summary:
-            try:
-                summary = await asyncio.to_thread(generator.summarize_transcript, post["transcript"])
-                db.set_transcript(conn, post["id"], post["transcript"], summary)
-            except Exception:
-                summary = "Расшифровка готова, но краткое содержание создать не удалось."
-        await _send(bot.send_message, config.OWNER_CHAT_ID, f"📝 Кратко:\n{summary}")
-        await query.edit_message_reply_markup(
-            _raw_keyboard(post["id"], post["media_kind"], has_transcript=True)
-        )
-        return
-    await _send(bot.send_message, config.OWNER_CHAT_ID, "⏳ Скачиваю и расшифровываю голосовое…")
-    try:
-        with tempfile.TemporaryDirectory(prefix="repost-transcribe-") as tmp:
-            tmp_path = Path(tmp)
-            downloaded = await ingest.download_post_media(post, tmp_path)
-            prepared = await asyncio.to_thread(_prepare_transcription_file, downloaded, tmp_path)
-            transcript = await asyncio.to_thread(generator.transcribe, prepared)
-        db.set_transcript(conn, post["id"], transcript, "")
-        try:
-            summary = await asyncio.to_thread(generator.summarize_transcript, transcript)
-            db.set_transcript(conn, post["id"], transcript, summary)
-        except Exception as exc:  # noqa: BLE001
-            summary = f"Расшифровка готова, но краткое содержание создать не удалось: {str(exc)[:200]}"
-        await _send(
-            bot.send_message,
-            config.OWNER_CHAT_ID,
-            f"📝 Кратко:\n{summary}\n\nНачало расшифровки:\n{transcript[:1200]}",
-        )
-        await query.edit_message_reply_markup(
-            _raw_keyboard(post["id"], post["media_kind"], has_transcript=True)
-        )
-    except Exception as exc:  # noqa: BLE001
-        await _send(bot.send_message, config.OWNER_CHAT_ID, f"⚠️ Ошибка расшифровки: {str(exc)[:500]}")
 
 
 def _texts_for_publish(draft) -> dict[str, str]:
@@ -596,14 +570,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     object_id = int(raw_id)
     conn = db.connect()
 
-    if action in {"make", "makeauto", "drop", "transcribe"}:
+    if action in {"make", "drop"}:
         post = db.get_post(conn, object_id)
         if post is None:
             await query.answer("Материал не найден", show_alert=True)
-            return
-        if action == "transcribe":
-            await query.answer("Запускаю расшифровку")
-            await _transcribe_post(context.bot, conn, post, query)
             return
         if action == "drop":
             try:
@@ -660,19 +630,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     context.bot.send_message,
                     config.OWNER_CHAT_ID,
                     "✍️ Напиши свой текст поста ответом на это сообщение. "
-                    "Финальная версия будет не длиннее 250 символов.",
+                    f"Финальная версия будет не длиннее {config.MAX_POST_CHARS} символов.",
                     reply_markup=ForceReply(selective=True),
                 )
             except Exception as exc:
                 db.set_post_status(conn, post["id"], "offered")
                 try:
-                    await query.edit_message_reply_markup(
-                        _raw_keyboard(
-                            post["id"],
-                            post["media_kind"],
-                            has_transcript=bool(post["transcript"]),
-                        )
-                    )
+                    await query.edit_message_reply_markup(_raw_keyboard(post["id"]))
                 except Exception:
                     pass
                 await _send(
@@ -684,11 +648,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             db.set_manual_prompt(conn, post["id"], prompt.message_id)
             await query.edit_message_reply_markup(None)
             return
-        if action == "makeauto" and post["media_kind"] not in {"voice", "audio"}:
-            await query.answer("Идея доступна только для голосового сообщения", show_alert=True)
-            return
-        source_kind = "voice" if action == "makeauto" else "text"
-        source_text = post["transcript"] if source_kind == "voice" else post["text"]
+        source_text = post["text"]
         if not source_text:
             await query.answer("Нет текста для генерации", show_alert=True)
             return
@@ -700,18 +660,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             conn,
             post,
             source_text,
-            source_kind=source_kind,
         )
         if success:
             await query.edit_message_reply_markup(None)
         else:
             refreshed = db.get_post(conn, post["id"])
             await query.edit_message_reply_markup(
-                _raw_keyboard(
-                    post["id"],
-                    post["media_kind"],
-                    has_transcript=bool(refreshed["transcript"]),
-                )
+                _raw_keyboard(refreshed["id"])
             )
         return
 
@@ -759,16 +714,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await _send(
                 context.bot.send_message,
                 config.OWNER_CHAT_ID,
-                f"⏭ Черновик #{object_id} пропущен. Показываю следующий материал.",
+                f"⏹ Итерация с черновиком #{object_id} завершена. "
+                "Следующий материал придёт по расписанию.",
             )
         except Exception:
             pass
-        await _offer_replacement(context.bot, draft["post_id"])
     elif action == "edit":
         prompt = await _send(
             context.bot.send_message,
             config.OWNER_CHAT_ID,
-            f"✏️ Пришли новый текст поста #{object_id} ответом на это сообщение (до 250 символов).",
+            f"✏️ Пришли новый текст поста #{object_id} ответом на это сообщение "
+            f"(до {config.MAX_POST_CHARS} символов).",
             reply_markup=ForceReply(selective=True),
         )
         db.set_edit_msg(conn, object_id, prompt.message_id)
@@ -783,6 +739,12 @@ async def on_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     reply_to = update.message.reply_to_message.message_id
     text = (update.message.text or "").strip()
     if not text:
+        return
+    if len(text) > config.MAX_POST_CHARS:
+        await update.message.reply_text(
+            f"Текст содержит {len(text)} символов; максимум — {config.MAX_POST_CHARS}. "
+            "Я ничего не обрезал: сократи текст и пришли ещё раз."
+        )
         return
 
     post = db.post_by_manual_prompt(conn, reply_to)
@@ -839,7 +801,7 @@ async def on_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as exc:  # noqa: BLE001
         await update.message.reply_text(f"⚠️ Ошибка адаптации: {str(exc)[:500]}")
         return
-    db.update_draft_texts(conn, draft["id"], out.linkedin_text, out.x_text, out.threads_text, text[:250])
+    db.update_draft_texts(conn, draft["id"], out.linkedin_text, out.x_text, out.threads_text, text)
     db.set_draft_status(conn, draft["id"], "awaiting_review")
     await _send_draft(context.bot, conn, draft["id"])
 
@@ -1145,6 +1107,26 @@ def _acquire_process_lock() -> None:
     _BOT_PROCESS_LOCK = lock_file
 
 
+def create_application() -> Application:
+    """Build the Telegram update router for polling locally or webhooks on Vercel."""
+    app = Application.builder().token(config.BOT_TOKEN).concurrent_updates(8).build()
+    app.add_handler(
+        MessageHandler(filters.ChatType.PRIVATE & filters.ATTACHMENT, on_staging_media),
+        group=-1,
+    )
+    app.add_handler(CommandHandler(["start", "id"], cmd_id, filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("chatid", cmd_chatid))
+    app.add_handler(CommandHandler("next", cmd_next, filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("test", cmd_test, filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("stats", cmd_stats, filters.ChatType.PRIVATE))
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_error_handler(on_error)
+    app.add_handler(
+        MessageHandler(filters.ChatType.PRIVATE & filters.REPLY & filters.TEXT & ~filters.COMMAND, on_reply)
+    )
+    return app
+
+
 def main() -> None:
     if not config.BOT_TOKEN:
         sys.exit("BOT_TOKEN не задан в .env — создай бота у @BotFather")
@@ -1168,21 +1150,7 @@ def main() -> None:
         )
         db.set_meta(startup_conn, _STARTUP_RECOVERY_NOTICE_KEY, recovery_notice)
     startup_conn.close()
-    app = Application.builder().token(config.BOT_TOKEN).concurrent_updates(8).build()
-    app.add_handler(
-        MessageHandler(filters.ChatType.PRIVATE & filters.ATTACHMENT, on_staging_media),
-        group=-1,
-    )
-    app.add_handler(CommandHandler(["start", "id"], cmd_id, filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("chatid", cmd_chatid))
-    app.add_handler(CommandHandler("next", cmd_next, filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("test", cmd_test, filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("stats", cmd_stats, filters.ChatType.PRIVATE))
-    app.add_handler(CallbackQueryHandler(on_callback))
-    app.add_error_handler(on_error)
-    app.add_handler(
-        MessageHandler(filters.ChatType.PRIVATE & filters.REPLY & filters.TEXT & ~filters.COMMAND, on_reply)
-    )
+    app = create_application()
 
     tz = ZoneInfo(config.TIMEZONE)
     for slot in config.POST_TIMES:

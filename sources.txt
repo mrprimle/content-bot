@@ -1,7 +1,5 @@
-# Источники: один @username или ссылка t.me на строку. Строки с # игнорируются.
-# Telethon раз в три месяца обновляет окно последних трёх месяцев.
-@dumik
-@zamesin
+# Актуальный Founders Pack: https://t.me/addlist/efNe-fsXVp1lYWZi
+# Снимок состава на 2026-08-02. Один @username на строку.
 @matskevichwonder
 @s16_guide
 @aigency_ru
@@ -31,6 +29,23 @@
 @optimalexperience
 @buzko_hub
 @cryptoEssay
+@dumik
 @prod1337
 @mspiridonov
+@zamesin
 @sistemno
+@shamenkov
+@markesdaily
+@naiznankuo
+@Alena_Pavlenko_IFS
+@lenadeg
+@Igorfresh
+@productshit
+@telomoydom
+@vsevolodustinovchannel
+@ponchiknews
+@karpushin_k
+@aleks_shamis
+@davidovssharing
+@davydenkomoney
+@ddrazbor

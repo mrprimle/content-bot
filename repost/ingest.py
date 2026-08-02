@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from telethon import TelegramClient
+from telethon.sessions import StringSession
 
 from . import config, db
 
@@ -27,7 +28,12 @@ _CLIENT_LOCK = asyncio.Lock()
 def make_client() -> TelegramClient:
     if not config.API_ID or not config.API_HASH:
         sys.exit("Заполни TELEGRAM_API_ID и TELEGRAM_API_HASH в .env (my.telegram.org → API development tools)")
-    client = TelegramClient(config.SESSION, int(config.API_ID), config.API_HASH)
+    session = (
+        StringSession(config.TELEGRAM_SESSION_STRING)
+        if config.TELEGRAM_SESSION_STRING
+        else config.SESSION
+    )
+    client = TelegramClient(session, int(config.API_ID), config.API_HASH)
     client.flood_sleep_threshold = 120
     return client
 
@@ -36,17 +42,27 @@ def make_client() -> TelegramClient:
 async def client_session():
     """Serialize Telethon session use across async tasks and local processes."""
     async with _CLIENT_LOCK:
-        lock_path = Path(f"{config.SESSION}.lock")
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        lock_file = lock_path.open("a+")
-        await asyncio.to_thread(fcntl.flock, lock_file.fileno(), fcntl.LOCK_EX)
+        lock_conn = None
+        lock_file = None
+        if config.DATABASE_URL:
+            lock_conn = db.connect()
+            await asyncio.to_thread(db.acquire_telegram_session_lock, lock_conn)
+        else:
+            lock_path = Path(f"{config.SESSION}.lock")
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            lock_file = lock_path.open("a+")
+            await asyncio.to_thread(fcntl.flock, lock_file.fileno(), fcntl.LOCK_EX)
         try:
             client = make_client()
             async with client:
                 yield client
         finally:
-            await asyncio.to_thread(fcntl.flock, lock_file.fileno(), fcntl.LOCK_UN)
-            lock_file.close()
+            if lock_conn is not None:
+                await asyncio.to_thread(db.release_telegram_session_lock, lock_conn)
+                lock_conn.close()
+            if lock_file is not None:
+                await asyncio.to_thread(fcntl.flock, lock_file.fileno(), fcntl.LOCK_UN)
+                lock_file.close()
 
 
 def subtract_months(value: datetime, months: int) -> datetime:

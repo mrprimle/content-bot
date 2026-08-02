@@ -4,12 +4,12 @@
 <dict>
     <key>Label</key>
     <string>com.repost.sync</string>
-    <!-- Disabled: the persistent bot owns the quarterly schedule. -->
+    <!-- Disabled: this project uses a one-time manual backfill. -->
     <key>Disabled</key>
     <true/>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/gleb/Desktop/tg/.venv/bin/python</string>
+        <string>/Users/mykhailodoroshenko/Desktop/content-bot/.venv/bin/python</string>
         <string>-m</string>
         <string>repost.ingest</string>
         <string>backfill</string>
@@ -17,10 +17,10 @@
         <string>3</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>/Users/gleb/Desktop/tg</string>
+    <string>/Users/mykhailodoroshenko/Desktop/content-bot</string>
     <key>StandardOutPath</key>
-    <string>/Users/gleb/Desktop/tg/sync.log</string>
+    <string>/Users/mykhailodoroshenko/Desktop/content-bot/sync.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/gleb/Desktop/tg/sync.log</string>
+    <string>/Users/mykhailodoroshenko/Desktop/content-bot/sync.log</string>
 </dict>
 </plist>

@@ -562,9 +562,14 @@ def main() -> None:
     assert not db.insert_post(
         conn, s1, 1, "2026-04-28T10:00:00+00:00", "другой", "https://t.me/one/1"
     ), "дубликат Telegram message id должен отсекаться"
-    assert db.insert_post(
-        conn, s2, 1, "2026-04-29T10:00:00+00:00", "Одинаковый текст " * 20, "https://t.me/two/1"
-    ), "одинаковые тексты в разных источниках являются разными материалами"
+    assert not db.insert_post(
+        conn,
+        s2,
+        1,
+        "2026-04-29T10:00:00+00:00",
+        "одинаковый   текст\n" * 20,
+        "https://t.me/two/1",
+    ), "одинаковые нормализованные тексты из разных источников должны схлопываться"
     assert db.insert_post(
         conn,
         s3,
@@ -591,7 +596,12 @@ def main() -> None:
         conn, s1, 2, "2026-05-02T10:00:00+00:00", "Следующий пост " * 20, "https://t.me/one/2"
     )
     assert db.insert_post(
-        conn, s2, 2, "2026-05-03T10:00:00+00:00", "Следующий пост " * 20, "https://t.me/two/2"
+        conn,
+        s2,
+        2,
+        "2026-05-03T10:00:00+00:00",
+        "Следующий пост второго источника " * 20,
+        "https://t.me/two/2",
     )
 
     first = db.claim_oldest_posts(
@@ -613,7 +623,7 @@ def main() -> None:
         max_items=1,
     )
     assert [(row["username"], row["tg_message_id"]) for row in first] == [("@one", 1)]
-    assert [(row["username"], row["tg_message_id"]) for row in second] == [("@two", 1)]
+    assert [(row["username"], row["tg_message_id"]) for row in second] == [("@two", 2)]
     assert [(row["username"], row["tg_message_id"]) for row in voice] == [("@three", 1)]
     for row in first + second + voice:
         assert row["claim_token"]
@@ -678,49 +688,53 @@ def main() -> None:
     assert media["transcript"] == "Расшифровка" and media["summary"] == "Краткое содержание"
 
     assert config.POST_TIMES == ["10:00", "18:00"]
-    assert config.ITEMS_PER_SLOT == 2
+    assert config.ITEMS_PER_SLOT == 1
     assert config.TIMEZONE == "Europe/London"
-    assert all(limit == 250 for limit in config.LIMITS.values())
+    assert config.OPENAI_MODEL == "gpt-5.6-terra"
+    assert config.LIMITS == {"linkedin": 1500, "twitter": 25000, "threads": 500}
+    assert config.X_PREMIUM is True
     sources = config.read_sources()
-    assert len(sources) == 34 and len(set(sources)) == 34, "ожидаются 34 уникальных источника"
-    assert "max 250 characters" in prompts.TRANSLATE_SYSTEM
-    assert "Do not add new ideas" in prompts.TRANSLATE_SYSTEM
-    assert "one coherent, self-contained central message" in prompts.TRANSLATE_SYSTEM
-    assert "must not appear in the final post" in prompts.TRANSLATE_SYSTEM
-    assert 'do not use "I", "we", "my" or "our"' in prompts.TRANSLATE_SYSTEM
-    assert "Never claim that a name or brand was replaced" in prompts.TRANSLATE_SYSTEM
-    assert "voice-message transcript" in prompts.VOICE_IDEA_SYSTEM
-    assert "central idea" in prompts.VOICE_IDEA_SYSTEM
+    assert sources and len(sources) == len(set(sources)), "источники должны быть уникальными"
+    assert "Do NOT summarize" in prompts.TRANSLATE_SYSTEM
+    assert "Preserve book titles" in prompts.TRANSLATE_SYSTEM
+    assert "must not be replaced" in prompts.TRANSLATE_SYSTEM
+    assert "no longer than 1500" in prompts.TRANSLATE_SYSTEM
+    assert "hard API acceptance limit" in prompts.TRANSLATE_SYSTEM
+    assert "Preserve the original first-person perspective" in prompts.TRANSLATE_SYSTEM
+    assert "company is Vahue" in prompts.TRANSLATE_SYSTEM
+    assert "third-party fact is content" in prompts.TRANSLATE_SYSTEM
     assert ingest.subtract_months(
         datetime(2026, 7, 31, tzinfo=timezone.utc), 3
     ) == datetime(2026, 4, 30, tzinfo=timezone.utc)
     assert ingest.add_months(
         datetime(2026, 11, 30, tzinfo=timezone.utc), 3
     ) == datetime(2027, 2, 28, tzinfo=timezone.utc)
-    assert generator._normalize_summary(
-        "Обсуждаются результаты проекта, планы команды и следующие шаги"
-    ).count(".") == 2
-    assert generator._normalize_summary("Раз. Два. Три. Четыре. Пять.") == "Раз. Два. Три. Четыре."
-
     captured: dict[str, str] = {}
     original_channels = publisher.config.buffer_channels
     original_create_post = publisher.create_post
     try:
         publisher.config.buffer_channels = lambda: {"linkedin": "channel-id"}
 
-        def fake_create_post(channel_id: str, text: str) -> str:
+        def fake_create_post(
+            channel_id: str,
+            text: str,
+            *,
+            thread_platform: str | None = None,
+            thread: list[str] | None = None,
+        ) -> str:
             captured["channel_id"] = channel_id
             captured["text"] = text
             return "post-id"
 
         publisher.create_post = fake_create_post
-        result = publisher.publish_all({"linkedin": "x" * 300})
+        result = publisher.publish_all({"linkedin": "x" * 3001})
     finally:
         publisher.config.buffer_channels = original_channels
         publisher.create_post = original_create_post
 
-    assert result["linkedin"] == (True, "post-id")
-    assert len(captured["text"]) == 250 and captured["text"].endswith("…")
+    assert result["linkedin"][0] is False
+    assert "без обрезания" in result["linkedin"][1]
+    assert not captured
 
     db.set_meta(conn, "next_full_sync_at", "2026-10-28T00:00:00+00:00")
     assert db.get_meta(conn, "next_full_sync_at") == "2026-10-28T00:00:00+00:00"
@@ -820,8 +834,11 @@ def main() -> None:
     ]
     configured_sources = config.read_sources()
     production_reconciliation = db.reconcile_active_sources(conn, configured_sources)
-    assert production_reconciliation["configured"] == 34
-    assert conn.execute("SELECT COUNT(*) FROM source WHERE active=1").fetchone()[0] == 34
+    assert production_reconciliation["configured"] == len(configured_sources)
+    assert (
+        conn.execute("SELECT COUNT(*) FROM source WHERE active=1").fetchone()[0]
+        == len(configured_sources)
+    )
     assert {
         row["username"]
         for row in conn.execute("SELECT username FROM source WHERE active=1")

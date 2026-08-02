@@ -91,12 +91,202 @@ CREATE TABLE IF NOT EXISTS app_meta(
 );
 """
 
+POSTGRES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS source(
+  id BIGSERIAL PRIMARY KEY,
+  username TEXT UNIQUE NOT NULL,
+  title TEXT,
+  last_message_id BIGINT NOT NULL DEFAULT 0,
+  last_synced_at TEXT,
+  active INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS post(
+  id BIGSERIAL PRIMARY KEY,
+  source_id BIGINT NOT NULL REFERENCES source(id),
+  tg_message_id BIGINT NOT NULL,
+  posted_at TEXT NOT NULL,
+  author TEXT,
+  text TEXT NOT NULL,
+  text_hash TEXT NOT NULL,
+  url TEXT,
+  media_kind TEXT NOT NULL DEFAULT 'text',
+  media_mime TEXT,
+  media_size BIGINT,
+  media_name TEXT,
+  no_forwards INTEGER NOT NULL DEFAULT 0,
+  transcript TEXT,
+  summary TEXT,
+  offered_at TEXT,
+  raw_message_id BIGINT,
+  manual_prompt_id BIGINT,
+  status TEXT NOT NULL DEFAULT 'new',
+  created_at TEXT NOT NULL DEFAULT ((CURRENT_TIMESTAMP AT TIME ZONE 'UTC')::text),
+  UNIQUE(source_id, tg_message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_post_status_date ON post(status, posted_at);
+CREATE INDEX IF NOT EXISTS idx_post_hash ON post(text_hash);
+CREATE INDEX IF NOT EXISTS idx_post_manual_prompt ON post(manual_prompt_id);
+
+CREATE TABLE IF NOT EXISTS draft(
+  id BIGSERIAL PRIMARY KEY,
+  post_id BIGINT NOT NULL REFERENCES post(id),
+  model TEXT,
+  linkedin_text TEXT,
+  x_text TEXT,
+  threads_text TEXT,
+  edited_text TEXT,
+  notes TEXT,
+  status TEXT NOT NULL DEFAULT 'awaiting_review',
+  tg_message_id BIGINT,
+  edit_msg_id BIGINT,
+  created_at TEXT NOT NULL DEFAULT ((CURRENT_TIMESTAMP AT TIME ZONE 'UTC')::text)
+);
+CREATE INDEX IF NOT EXISTS idx_draft_tg ON draft(tg_message_id);
+
+CREATE TABLE IF NOT EXISTS publication(
+  id BIGSERIAL PRIMARY KEY,
+  draft_id BIGINT NOT NULL REFERENCES draft(id),
+  platform TEXT NOT NULL,
+  status TEXT NOT NULL,
+  external_id TEXT,
+  error TEXT,
+  published_at TEXT NOT NULL DEFAULT ((CURRENT_TIMESTAMP AT TIME ZONE 'UTC')::text)
+);
+
+CREATE TABLE IF NOT EXISTS delivery_batch(
+  id BIGSERIAL PRIMARY KEY,
+  slot_key TEXT UNIQUE NOT NULL,
+  created_at TEXT NOT NULL DEFAULT ((CURRENT_TIMESTAMP AT TIME ZONE 'UTC')::text)
+);
+
+CREATE TABLE IF NOT EXISTS delivery_item(
+  id BIGSERIAL PRIMARY KEY,
+  batch_id BIGINT NOT NULL REFERENCES delivery_batch(id),
+  source_id BIGINT NOT NULL REFERENCES source(id),
+  post_id BIGINT UNIQUE NOT NULL REFERENCES post(id),
+  status TEXT NOT NULL DEFAULT 'claimed',
+  claim_token TEXT,
+  claimed_at TEXT,
+  bot_message_id BIGINT,
+  sent_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS app_meta(
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+"""
+
+_PG_SCHEMA_READY = False
+
+
+class PostgresConnection:
+    """Small DB-API compatibility layer for the existing SQLite-oriented queries."""
+
+    backend = "postgres"
+
+    def __init__(self, raw):
+        self.raw = raw
+
+    @staticmethod
+    def _sql(sql: str) -> str:
+        normalized = sql.replace("?", "%s")
+        normalized = normalized.replace(
+            "datetime('now')",
+            "((CURRENT_TIMESTAMP AT TIME ZONE 'UTC')::text)",
+        )
+        normalized = normalized.replace(
+            "MAX(last_message_id, %s)",
+            "GREATEST(last_message_id, %s)",
+        )
+        normalized = normalized.replace(
+            "MAX(no_forwards, %s)",
+            "GREATEST(no_forwards, %s)",
+        )
+        if "INSERT OR IGNORE INTO" in normalized:
+            normalized = normalized.replace("INSERT OR IGNORE INTO", "INSERT INTO")
+            normalized = normalized.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
+        return normalized
+
+    def execute(self, sql: str, params=()):
+        return self.raw.execute(self._sql(sql), params)
+
+    def commit(self) -> None:
+        self.raw.commit()
+
+    def rollback(self) -> None:
+        self.raw.rollback()
+
+    def close(self) -> None:
+        self.raw.close()
+
+
+def is_postgres(conn) -> bool:
+    return getattr(conn, "backend", None) == "postgres"
+
+
+def acquire_telegram_session_lock(conn) -> None:
+    if is_postgres(conn):
+        conn.execute("SELECT pg_advisory_lock(781342992)")
+
+
+def release_telegram_session_lock(conn) -> None:
+    if is_postgres(conn):
+        conn.execute("SELECT pg_advisory_unlock(781342992)")
+        conn.commit()
+
+
+def acquire_queue_sync_lock(conn) -> None:
+    """Block queue claims while a PostgreSQL refetch is forming the next pool."""
+    if is_postgres(conn):
+        conn.execute("SELECT pg_advisory_lock(781342991)")
+
+
+def release_queue_sync_lock(conn) -> None:
+    if is_postgres(conn):
+        conn.execute("SELECT pg_advisory_unlock(781342991)")
+        conn.commit()
+
+
+def _begin_write(conn) -> None:
+    if is_postgres(conn):
+        # Serialize queue/source reconciliation exactly like SQLite BEGIN IMMEDIATE.
+        conn.execute("SELECT pg_advisory_xact_lock(781342991)")
+    else:
+        conn.execute("BEGIN IMMEDIATE")
+
+
+def _is_integrity_error(exc: BaseException) -> bool:
+    if isinstance(exc, sqlite3.IntegrityError):
+        return True
+    try:
+        import psycopg
+
+        return isinstance(exc, psycopg.IntegrityError)
+    except ImportError:
+        return False
+
 # post.status:  new -> queued -> offered -> generating/awaiting_manual -> drafted -> published | skipped
 #               ('short' — не проходит MIN_POST_CHARS)
 # draft.status: awaiting_review -> approved -> published | skipped | failed
 
 
-def connect(path: str | None = None) -> sqlite3.Connection:
+def connect(path: str | None = None):
+    global _PG_SCHEMA_READY
+    if config.DATABASE_URL and path is None:
+        import psycopg
+        from psycopg.rows import dict_row
+
+        raw = psycopg.connect(config.DATABASE_URL, row_factory=dict_row)
+        conn = PostgresConnection(raw)
+        if not _PG_SCHEMA_READY:
+            for statement in POSTGRES_SCHEMA.split(";"):
+                if statement.strip():
+                    conn.execute(statement)
+            conn.commit()
+            _PG_SCHEMA_READY = True
+        return conn
     conn = sqlite3.connect(path or config.DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=5000")
@@ -155,7 +345,7 @@ def _remove_delivery_source_uniqueness(conn: sqlite3.Connection) -> None:
     normalized = re.sub(r"\s+", "", row["sql"]).casefold()
     if "unique(batch_id,source_id)" not in normalized:
         return
-    conn.execute("BEGIN IMMEDIATE")
+    _begin_write(conn)
     try:
         conn.execute(
             """
@@ -229,7 +419,7 @@ def reconcile_active_sources(conn: sqlite3.Connection, usernames: list[str]) -> 
 
     created = renamed = 0
     active_ids: list[int] = []
-    conn.execute("BEGIN IMMEDIATE")
+    _begin_write(conn)
     try:
         for username in configured:
             matches = conn.execute(
@@ -245,18 +435,18 @@ def reconcile_active_sources(conn: sqlite3.Connection, usernames: list[str]) -> 
                     renamed += 1
             else:
                 cur = conn.execute(
-                    "INSERT INTO source(username, active) VALUES(?, 1)",
+                    "INSERT INTO source(username, active) VALUES(?, 1) RETURNING id",
                     (username,),
                 )
-                source_id = cur.lastrowid
+                source_id = cur.fetchone()["id"]
                 created += 1
             active_ids.append(source_id)
 
         marks = ",".join("?" for _ in active_ids)
         previously_active = conn.execute(
-            f"SELECT COUNT(*) FROM source WHERE active=1 AND id NOT IN ({marks})",
+            f"SELECT COUNT(*) n FROM source WHERE active=1 AND id NOT IN ({marks})",
             active_ids,
-        ).fetchone()[0]
+        ).fetchone()["n"]
         conn.execute(
             f"UPDATE source SET active=CASE WHEN id IN ({marks}) THEN 1 ELSE 0 END",
             active_ids,
@@ -289,9 +479,24 @@ def insert_post(
     media_name: str | None = None,
     no_forwards: bool = False,
 ) -> bool:
-    """Returns True if inserted, False if this Telegram message is already stored."""
+    """Insert one source item, suppressing message and cross-source text duplicates.
+
+    Empty-text media use a source/message-specific hash, so unrelated voice or
+    video posts are never collapsed merely because they have no caption.
+    """
     text = text or ""
     h = text_hash(text) if text.strip() else text_hash(f"media:{source_id}:{tg_message_id}")
+    exact_message = conn.execute(
+        "SELECT id FROM post WHERE source_id=? AND tg_message_id=?",
+        (source_id, tg_message_id),
+    ).fetchone()
+    if exact_message is None and text.strip():
+        duplicate_text = conn.execute(
+            "SELECT id FROM post WHERE text_hash=? AND trim(text)<>'' LIMIT 1",
+            (h,),
+        ).fetchone()
+        if duplicate_text is not None:
+            return False
     try:
         conn.execute(
             "INSERT INTO post(source_id, tg_message_id, posted_at, text, text_hash, url, author, status, "
@@ -315,7 +520,9 @@ def insert_post(
         )
         conn.commit()
         return True
-    except sqlite3.IntegrityError:
+    except Exception as exc:
+        if not _is_integrity_error(exc):
+            raise
         conn.rollback()
         conn.execute(
             "UPDATE post SET "
@@ -410,12 +617,22 @@ def claim_oldest_posts(
     """
     if max_items < 1:
         return []
-    conn.execute("BEGIN IMMEDIATE")
+    _begin_write(conn)
     try:
         existing = conn.execute("SELECT id FROM delivery_batch WHERE slot_key=?", (slot_key,)).fetchone()
         if existing is None:
-            cur = conn.execute("INSERT INTO delivery_batch(slot_key) VALUES(?)", (slot_key,))
-            batch_id = cur.lastrowid
+            cur = conn.execute(
+                "INSERT INTO delivery_batch(slot_key) VALUES(?) RETURNING id",
+                (slot_key,),
+            )
+            batch_id = cur.fetchone()["id"]
+        else:
+            batch_id = existing["id"]
+        existing_count = conn.execute(
+            "SELECT COUNT(*) n FROM delivery_item WHERE batch_id=?",
+            (batch_id,),
+        ).fetchone()["n"]
+        if existing_count == 0:
             params: list[object] = []
             source_filter = ""
             if source_username:
@@ -460,8 +677,6 @@ def claim_oldest_posts(
                         )
                 if reserved == reserved_before:
                     break
-        else:
-            batch_id = existing["id"]
         token = uuid.uuid4().hex
         conn.execute(
             "UPDATE delivery_item SET status='sending', claim_token=?, claimed_at=datetime('now') "
@@ -533,7 +748,7 @@ def release_delivery(conn: sqlite3.Connection, post_id: int, claim_token: str) -
 
 def recover_incomplete_deliveries(conn: sqlite3.Connection) -> int:
     """Requeue items reserved by a process that stopped before sending them."""
-    conn.execute("BEGIN IMMEDIATE")
+    _begin_write(conn)
     try:
         ids = [
             row["post_id"]
@@ -572,7 +787,7 @@ def recover_stranded_work(conn: sqlite3.Connection) -> dict[str, int]:
         "manual_without_prompt_reoffered": 0,
         "publishing_unknown": 0,
     }
-    conn.execute("BEGIN IMMEDIATE")
+    _begin_write(conn)
     try:
         publishing = conn.execute(
             "UPDATE draft SET status='publish_unknown' WHERE status='publishing'"
@@ -721,12 +936,14 @@ def create_draft(conn, post_id: int, model: str, linkedin: str, x: str, threads:
     if existing:
         return existing["id"]
     cur = conn.execute(
-        "INSERT INTO draft(post_id, model, linkedin_text, x_text, threads_text, notes) VALUES(?,?,?,?,?,?)",
+        "INSERT INTO draft(post_id, model, linkedin_text, x_text, threads_text, notes) "
+        "VALUES(?,?,?,?,?,?) RETURNING id",
         (post_id, model, linkedin, x, threads, notes),
     )
+    draft_id = cur.fetchone()["id"]
     conn.execute("UPDATE post SET status='drafted' WHERE id=?", (post_id,))
     conn.commit()
-    return cur.lastrowid
+    return draft_id
 
 
 def active_draft_for_post(conn: sqlite3.Connection, post_id: int) -> sqlite3.Row | None:
@@ -820,6 +1037,38 @@ def delete_meta(conn: sqlite3.Connection, *keys: str) -> None:
     marks = ",".join("?" for _ in keys)
     conn.execute(f"DELETE FROM app_meta WHERE key IN ({marks})", keys)
     conn.commit()
+
+
+def claim_incremental_refetch(conn, lease_seconds: int = 600) -> bool:
+    """Acquire a cross-process lease so queue exhaustion triggers one Telegram sync."""
+    now = datetime.now(timezone.utc)
+    _begin_write(conn)
+    try:
+        raw = get_meta(conn, "incremental_refetch_lease_until")
+        if raw:
+            try:
+                if datetime.fromisoformat(raw) > now:
+                    conn.rollback()
+                    return False
+            except ValueError:
+                pass
+        lease_until = now.timestamp() + lease_seconds
+        set_meta(
+            conn,
+            "incremental_refetch_lease_until",
+            datetime.fromtimestamp(lease_until, timezone.utc).isoformat(),
+        )
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def finish_incremental_refetch(conn, result: dict | None = None) -> None:
+    delete_meta(conn, "incremental_refetch_lease_until")
+    if result is not None:
+        set_meta(conn, "last_incremental_refetch_at", datetime.now(timezone.utc).isoformat())
+        set_meta(conn, "last_incremental_refetch_added", str(result.get("added", 0)))
 
 
 def record_publication(conn, draft_id: int, platform: str, ok: bool, external_id: str | None, error: str | None) -> None:

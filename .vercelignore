@@ -1,0 +1,14 @@
+.env
+.git
+.venv
+__pycache__
+*.pyc
+*.session
+*.session-journal
+*.session.lock
+*.bot.lock
+repost.db
+repost.db-*
+bot-launchd.log
+data
+RESEARCH.md

@@ -59,7 +59,7 @@ async def main() -> None:
 
         await bot.sync_due_job(context)
         conn = db.connect()
-        assert len(calls) == 1 and len(calls[0]["sources"]) == 34
+        assert len(calls) == 1 and len(calls[0]["sources"]) == len(config.read_sources())
         assert calls[0]["window_start"] == ingest.subtract_months(calls[0]["window_end"], 3)
         failed = json.loads(db.get_meta(conn, "sync_retry_sources"))
         assert failed == [calls[0]["sources"][0]]

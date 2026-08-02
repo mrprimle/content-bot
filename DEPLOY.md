@@ -1,150 +1,114 @@
-# Деплой на VPS
+# Production на Vercel + Neon
 
-В production работает один постоянный процесс `python -m repost.bot`. Он:
+Production состоит из трёх частей:
 
-- формирует общий пул: по одному старейшему необработанному материалу каждого
-  источника, с сортировкой от старых дат к новым;
-- в 10:00 и 18:00 `Europe/London` выдаёт по два материала — четыре базовых в
-  день; пропуск сразу выдаёт замену сверх этой четвёрки;
-- хранит очередь и состояние кнопок в SQLite;
-- проверяет дату квартального Telethon-сбора;
-- повторяет полный сбор последних трёх календарных месяцев раз в три месяца.
+- Vercel Python Function с FastAPI принимает Telegram webhook;
+- Vercel Cron открывает две итерации в 10:00 и 18:00 `Europe/London`;
+- Neon PostgreSQL хранит 49 источников, все материалы, очередь, черновики,
+  публикации, idempotency-слоты и `last_message_id` каждого канала.
 
-Отдельный системный cron не нужен.
+В `vercel.json` четыре ежедневных UTC-триггера покрывают переход London между
+GMT и BST. Endpoint сверяет фактический лондонский час, а уникальный `slot_key`
+не даёт одному слоту выполниться дважды.
 
-## Сервер
+## Переменные окружения
 
-Подойдёт Ubuntu 24.04, 1 vCPU / 2 GB RAM:
-
-```bash
-apt update
-apt install -y docker.io docker-compose-v2 git sqlite3
-systemctl enable --now docker
-git clone <URL_РЕПОЗИТОРИЯ> /opt/repost
-cd /opt/repost
-install -d -m 700 data
-cp .env.example .env
-nano .env
-chmod 600 .env
-```
-
-Для сервера нужны:
-
-- `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`;
-- `BOT_TOKEN`, `OWNER_CHAT_ID`;
-- `OPENAI_API_KEY`;
-- `BUFFER_ACCESS_TOKEN`, `BUFFER_CHANNELS`;
-- `AUTHOR_FACTS`;
-- `AUTO_SYNC=true` после успешного canary.
-
-Compose уже задаёт:
+В production нужны:
 
 ```text
-DB_PATH=/data/repost.db
-TELEGRAM_SESSION=/data/repost.session
+DATABASE_URL
+TELEGRAM_API_ID
+TELEGRAM_API_HASH
+TELEGRAM_SESSION_STRING
+BOT_TOKEN
+OWNER_CHAT_ID
+OPENAI_API_KEY
+OPENAI_MODEL=gpt-5.6-terra
+LLM_PROVIDER=openai
+BUFFER_ACCESS_TOKEN
+BUFFER_CHANNELS
+BUFFER_POST_MODE=shareNow
+AUTHOR_FACTS
+MAX_POST_CHARS=1500
+X_PREMIUM=true
+POST_TIMES=10:00,18:00
+ITEMS_PER_SLOT=1
+TIMEZONE=Europe/London
+WEBHOOK_SECRET
+CRON_SECRET
+PUBLIC_BASE_URL
 ```
 
-Поэтому база и пользовательская Telegram-сессия переживают пересборку
-контейнера.
+`TELEGRAM_SESSION_STRING`, bot token и API-ключи являются секретами. Их нельзя
+добавлять в git или показывать в логах. `DATABASE_URL` создаётся интеграцией Neon.
 
-## Telethon-сессия
-
-Безопаснее авторизовать рабочий Telegram-аккаунт прямо на сервере:
+## Создание инфраструктуры
 
 ```bash
-docker compose run --rm --build bot python -m repost.ingest login
+vercel link --yes
+vercel integration add neon --name content-bot-db --plan free_v3 \
+  -m region=lhr1 -m auth=false \
+  -e production -e preview -e development
 ```
 
-Либо перенести уже созданную локальную сессию:
+После принятия Marketplace terms Vercel добавит `DATABASE_URL`. Остальные
+переменные добавляются через `vercel env add`. `CRON_SECRET` Vercel автоматически
+передаёт cron-запросам как `Authorization: Bearer ...`.
 
-```bash
-scp ~/Desktop/tg/repost.session root@IP_СЕРВЕРА:/opt/repost/data/repost.session
-```
+## Миграция локального состояния
 
-`repost.session` даёт доступ к Telegram-аккаунту. Права на сервере:
-
-```bash
-chmod 700 /opt/repost/data
-chmod 600 /opt/repost/data/repost.session
-```
-
-## Остановка старого локального запуска
-
-Если бот переносится с Mac на VPS, сначала останови на Mac оба старых
-launchd-задания. Иначе два процесса с одним `BOT_TOKEN` будут конфликтовать, а
-старый sync продолжит обращаться к Telegram:
+Перед финальной миграцией останови локальный polling, чтобы SQLite больше не
+менялась:
 
 ```bash
 launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.repost.bot.plist
-launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.repost.sync.plist
 ```
 
-Изменение plist на `Disabled=true` не останавливает уже загруженное задание.
-
-## Canary и первый запуск
-
-Сначала поставь `AUTO_SYNC=false` в `.env` и загрузи один материал из одного
-источника в рабочую базу. Вместо `@channel` выбери один username из
-`sources.txt`, чтобы canary не добавил лишний источник:
+Затем перенеси и проверь все таблицы:
 
 ```bash
-docker compose run --rm --build bot \
-  python -m repost.ingest backfill --days 7 --sources @channel --limit 1
-docker compose up -d --build
+DATABASE_URL='postgresql://...' .venv/bin/python \
+  scripts/migrate_sqlite_to_postgres.py --sqlite repost.db
 ```
 
-В Telegram вызови `/test @channel`. Команда показывает сырой материал без LLM;
-LLM вызывается только после кнопки «Создать пост».
+Скрипт сохраняет первичные ключи, обновляет PostgreSQL sequences и сравнивает
+количество строк в каждой таблице. Если миграция или deploy не прошли, сначала
+верни локальный процесс; webhook не переключай.
 
-Если canary прошёл, останови бота, собери полное окно, верни `AUTO_SYNC=true` в
-`.env` и запусти production:
+## Deploy и переключение webhook
 
 ```bash
-docker compose down
-docker compose run --rm --build bot python -m repost.ingest backfill --months 3
-sed -i 's/^AUTO_SYNC=.*/AUTO_SYNC=true/' .env
-docker compose up -d --build
-docker compose logs --tail 100
+vercel --prod
+curl -fsS "$PUBLIC_BASE_URL/api/health"
+curl -fsS -X POST -H "Authorization: Bearer $CRON_SECRET" \
+  "$PUBLIC_BASE_URL/api/setup-webhook"
 ```
 
-Telegram может выдать `FloodWait` или ограничить аккаунт без отдельного
-предварительного предупреждения. Canary и отдельный рабочий аккаунт снижают
-последствия ошибки конфигурации, но не гарантируют отсутствие ограничений.
+После `setup-webhook` Telegram перестаёт отдавать updates локальному polling.
+Проверь `/stats`, один безопасный `/next`, создание draft и Buffer-публикацию.
 
-После успешного полного сбора бот сохранит `next_full_sync_at` в базе.
-При перезапуске дата не теряется, и один и тот же квартальный запуск не
-планируется заново.
+## Incremental refetch
 
-## Проверка интерфейса
+Первоначальные три месяца уже находятся в PostgreSQL. Когда `status='new'` и
+кандидатный пул заканчиваются, бот получает durable lease, блокирует формирование
+нового пула и по каждому активному источнику вызывает Telegram с
+`min_id=source.last_message_id`. Новые сообщения добавляются в базу, указатель
+двигается только вперёд, после чего тот же пустой delivery slot перечитывается.
 
-В Telegram:
+## Публикация
 
-```text
-/test @channel
-/stats
-```
+- один master-text до 1500 Unicode-символов создаётся через `gpt-5.6-terra`;
+- LinkedIn получает его одним постом;
+- X Premium получает его одним long post без Buffer thread metadata;
+- Threads получает тот же текст, разбитый Buffer на сообщения до 500 символов.
 
-`/test` только показывает один материал и не обращается к LLM. LLM вызывается
-после кнопки «Создать пост», а Buffer — только после «Опубликовать».
-
-Перед передачей проверь offline workflow:
+## Проверки
 
 ```bash
-docker compose run --rm bot python scripts/smoke_test.py
-docker compose run --rm bot python scripts/workflow_test.py
-docker compose run --rm bot python scripts/scheduler_test.py
-docker compose run --rm bot python scripts/publisher_test.py
+.venv/bin/python scripts/smoke_test.py
+.venv/bin/python scripts/workflow_test.py
+.venv/bin/python scripts/scheduler_test.py
+.venv/bin/python scripts/publisher_test.py
+.venv/bin/python -m compileall -q repost api scripts
+git diff --check
 ```
-
-## Обслуживание
-
-```bash
-docker compose logs --tail 100
-docker compose restart
-git pull && docker compose up -d --build
-docker compose exec bot python -m repost.ingest status
-sqlite3 data/repost.db ".backup 'data/backup.db'"
-```
-
-Не запускай `repost.ingest` одновременно в двух контейнерах: одна Telethon
-session не рассчитана на параллельную запись из нескольких процессов.

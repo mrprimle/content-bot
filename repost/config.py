@@ -27,7 +27,7 @@ OWNER_CHAT_ID = int(_get("OWNER_CHAT_ID") or 0)
 
 ANTHROPIC_MODEL = _get("ANTHROPIC_MODEL") or "claude-opus-5"
 OPENAI_API_KEY = _get("OPENAI_API_KEY")
-OPENAI_MODEL = _get("OPENAI_MODEL") or "gpt-5-mini"
+OPENAI_MODEL = _get("OPENAI_MODEL") or "gpt-5.6-terra"
 
 
 def llm_provider() -> str:
@@ -45,24 +45,31 @@ BUFFER_TOKEN = _get("BUFFER_ACCESS_TOKEN")
 BUFFER_POST_MODE = _get("BUFFER_POST_MODE") or "addToQueue"
 
 MIN_POST_CHARS = int(_get("MIN_POST_CHARS") or 1)
-MAX_POST_CHARS = max(1, min(int(_get("MAX_POST_CHARS") or 250), 250))
+MAX_POST_CHARS = max(1, min(int(_get("MAX_POST_CHARS") or 1500), 1500))
+X_PREMIUM = _bool("X_PREMIUM", False)
 POST_TIMES = [t.strip() for t in (_get("POST_TIMES") or "10:00,18:00").split(",") if t.strip()]
-ITEMS_PER_SLOT = max(1, int(_get("ITEMS_PER_SLOT") or 2))
+ITEMS_PER_SLOT = max(1, int(_get("ITEMS_PER_SLOT") or 1))
 SYNC_TIME = _get("SYNC_TIME") or "08:00"
 SYNC_MONTHS = int(_get("SYNC_MONTHS") or 3)
 AUTO_SYNC = _bool("AUTO_SYNC", False)
 TIMEZONE = _get("TIMEZONE") or "Europe/London"
 DB_PATH = str(ROOT / (_get("DB_PATH") or "repost.db"))
+DATABASE_URL = _get("DATABASE_URL")
+TELEGRAM_SESSION_STRING = _get("TELEGRAM_SESSION_STRING")
+WEBHOOK_SECRET = _get("WEBHOOK_SECRET")
+CRON_SECRET = _get("CRON_SECRET")
+PUBLIC_BASE_URL = _get("PUBLIC_BASE_URL")
 AUTHOR_FACTS = _get("AUTHOR_FACTS")
 BOT_SEND_DELAY = float(_get("BOT_SEND_DELAY") or 1.1)
 BOT_MEDIA_MAX_BYTES = int(_get("BOT_MEDIA_MAX_BYTES") or 49_000_000)
 MEDIA_STAGE_TIMEOUT = float(_get("MEDIA_STAGE_TIMEOUT") or 90)
-TRANSCRIPTION_MODEL = _get("TRANSCRIPTION_MODEL") or "gpt-transcribe"
-TRANSCRIPTION_MAX_BYTES = int(_get("TRANSCRIPTION_MAX_BYTES") or 25_000_000)
-
 SOURCES_FILE = ROOT / "sources.txt"
 
-LIMITS = {"linkedin": MAX_POST_CHARS, "twitter": MAX_POST_CHARS, "threads": MAX_POST_CHARS}
+LIMITS = {
+    "linkedin": MAX_POST_CHARS,
+    "twitter": 25_000 if X_PREMIUM else 280,
+    "threads": 500,
+}
 
 
 def buffer_channels() -> dict[str, str]:

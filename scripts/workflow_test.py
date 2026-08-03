@@ -15,6 +15,18 @@ class FakeMessage:
         self.message_id = message_id
 
 
+class FakeIncomingMessage:
+    def __init__(self, text: str, reply_to_id: int, first_response_id: int = 9_000):
+        self.text = text
+        self.reply_to_message = SimpleNamespace(message_id=reply_to_id)
+        self.first_response_id = first_response_id
+        self.responses: list[dict] = []
+
+    async def reply_text(self, text: str, **kwargs):
+        self.responses.append({"text": text, **kwargs})
+        return FakeMessage(self.first_response_id + len(self.responses))
+
+
 class FakeBot:
     def __init__(self):
         self.messages: list[dict] = []
@@ -193,6 +205,162 @@ async def test_refetch_after_queue_exhaustion() -> None:
         Path(tmp.name).unlink(missing_ok=True)
 
 
+async def test_edit_retry_loop() -> None:
+    """An over-limit edit must create a new durable ForceReply target."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    old_db_path = config.DB_PATH
+    old_owner = config.OWNER_CHAT_ID
+    old_delay = config.BOT_SEND_DELAY
+    try:
+        config.DB_PATH = tmp.name
+        config.OWNER_CHAT_ID = 123
+        config.BOT_SEND_DELAY = 0
+        conn = db.connect()
+        source_id = db.upsert_source(conn, "@edit-loop", "Edit loop")
+        assert db.insert_post(
+            conn,
+            source_id,
+            1,
+            "2026-08-03T12:00:00+00:00",
+            "Исходный текст",
+            "https://t.me/edit-loop/1",
+        )
+        claimed = db.claim_oldest_posts(conn, "edit-loop", max_items=1)[0]
+        assert db.mark_delivery_sent(conn, claimed["id"], 100, claimed["claim_token"])
+        assert db.transition_post(conn, claimed["id"], ("offered",), "generating")
+        draft_id = db.create_draft(
+            conn,
+            claimed["id"],
+            "test-model",
+            "Generated text",
+            "Generated text",
+            "Generated text",
+            "",
+        )
+        db.set_draft_message(conn, draft_id, 101)
+        db.set_edit_msg(conn, draft_id, 200)
+        db.set_draft_status(conn, draft_id, "awaiting_review")
+        conn.close()
+
+        too_long = FakeIncomingMessage("x" * (config.MANUAL_MAX_POST_CHARS + 1), 200)
+        await bot.on_reply(
+            SimpleNamespace(message=too_long, effective_chat=SimpleNamespace(id=123)),
+            SimpleNamespace(bot=FakeBot()),
+        )
+        assert len(too_long.responses) == 1
+        assert "ответь прямо на это сообщение" in too_long.responses[0]["text"]
+        assert too_long.responses[0]["reply_markup"].force_reply is True
+        retry_prompt_id = too_long.first_response_id + 1
+        verify = db.connect()
+        assert db.get_draft(verify, draft_id)["edit_msg_id"] == retry_prompt_id
+        assert db.get_draft(verify, draft_id)["edited_text"] is None
+        verify.close()
+
+        valid_text = "Final edited text that is safely under the limit."
+        valid = FakeIncomingMessage(valid_text, retry_prompt_id, first_response_id=9_100)
+        fake_bot = FakeBot()
+        await bot.on_reply(
+            SimpleNamespace(message=valid, effective_chat=SimpleNamespace(id=123)),
+            SimpleNamespace(bot=fake_bot),
+        )
+        assert valid.responses[0]["text"].startswith("⏳ Текст принят:")
+        assert fake_bot.messages[-1]["text"] == valid_text
+        verify = db.connect()
+        assert db.get_draft(verify, draft_id)["edited_text"] == valid_text
+        assert db.get_draft(verify, draft_id)["status"] == "awaiting_review"
+        verify.close()
+
+        unknown = FakeIncomingMessage("Orphan reply", 999_999)
+        await bot.on_reply(
+            SimpleNamespace(message=unknown, effective_chat=SimpleNamespace(id=123)),
+            SimpleNamespace(bot=FakeBot()),
+        )
+        assert "не нашёл активное редактирование" in unknown.responses[0]["text"]
+    finally:
+        config.DB_PATH = old_db_path
+        config.OWNER_CHAT_ID = old_owner
+        config.BOT_SEND_DELAY = old_delay
+        Path(tmp.name).unlink(missing_ok=True)
+
+
+async def test_anytime_owner_post() -> None:
+    """The persistent menu can create and later expand an AI-prepared post."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    old_db_path = config.DB_PATH
+    old_owner = config.OWNER_CHAT_ID
+    old_delay = config.BOT_SEND_DELAY
+    original_translate = generator.translate_post
+    translate_calls: list[tuple[str, str]] = []
+
+    def fake_translate(source: str, date: str, text: str):
+        translate_calls.append((source, text))
+        return generator.DraftOut(
+            linkedin_text="Prepared English owner post.",
+            x_text="Prepared English owner post.",
+            threads_text="Prepared English owner post.",
+            notes="",
+        )
+
+    try:
+        config.DB_PATH = tmp.name
+        config.OWNER_CHAT_ID = 123
+        config.BOT_SEND_DELAY = 0
+        generator.translate_post = fake_translate
+
+        start_message = FakeIncomingMessage(bot.NEW_POST_BUTTON, 0)
+        await bot.cmd_new_post(
+            SimpleNamespace(message=start_message, effective_chat=SimpleNamespace(id=123)),
+            SimpleNamespace(),
+        )
+        assert "Можно на русском или английском" in start_message.responses[0]["text"]
+        assert start_message.responses[0]["reply_markup"].force_reply is True
+        prompt_id = start_message.first_response_id + 1
+        verify = db.connect()
+        pending = db.pending_owner_post(verify, 123)
+        assert pending is not None
+        assert pending["manual_prompt_id"] == prompt_id
+        assert pending["media_kind"] == "manual"
+        verify.close()
+
+        source_text = "Моя новая идея для собственного поста."
+        submission = FakeIncomingMessage(source_text, prompt_id, first_response_id=9_100)
+        fake_bot = FakeBot()
+        await bot.on_reply(
+            SimpleNamespace(message=submission, effective_chat=SimpleNamespace(id=123)),
+            SimpleNamespace(bot=fake_bot),
+        )
+        assert "Запускаю Terra" in submission.responses[0]["text"]
+        assert translate_calls == [("Собственный пост", source_text)]
+        assert fake_bot.messages[-1]["text"] == "Prepared English owner post."
+        verify = db.connect()
+        draft = verify.execute("SELECT * FROM draft ORDER BY id DESC LIMIT 1").fetchone()
+        assert draft["status"] == "awaiting_review"
+        draft_message_id = draft["tg_message_id"]
+        verify.close()
+
+        expanded = "E" * 2_000
+        edit = FakeIncomingMessage(expanded, draft_message_id, first_response_id=9_200)
+        second_bot = FakeBot()
+        await bot.on_reply(
+            SimpleNamespace(message=edit, effective_chat=SimpleNamespace(id=123)),
+            SimpleNamespace(bot=second_bot),
+        )
+        assert "2000/3000" in edit.responses[0]["text"]
+        assert second_bot.messages[-1]["text"] == expanded
+        assert len(translate_calls) == 1, "ручная версия после AI не должна снова вызывать Terra"
+        verify = db.connect()
+        assert len(db.get_draft(verify, draft["id"])["edited_text"]) == 2_000
+        verify.close()
+    finally:
+        generator.translate_post = original_translate
+        config.DB_PATH = old_db_path
+        config.OWNER_CHAT_ID = old_owner
+        config.BOT_SEND_DELAY = old_delay
+        Path(tmp.name).unlink(missing_ok=True)
+
+
 async def main() -> None:
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     tmp.close()
@@ -266,18 +434,20 @@ async def main() -> None:
         await bot.on_callback(text_update, SimpleNamespace(bot=fake))
         text_generation_messages = fake.messages[before_text_generation:]
         assert route_calls == {"translate": 1}
-        assert len(text_generation_messages) == 2
-        assert text_generation_messages[0]["text"].startswith(
+        assert len(text_generation_messages) == 3
+        assert text_generation_messages[0]["text"].startswith("⏳ Пост #")
+        assert "10–30 секунд" in text_generation_messages[0]["text"]
+        assert text_generation_messages[1]["text"].startswith(
             "⚠️ Заменено / проверить:"
         )
-        assert "Служебная заметка о заменах" in text_generation_messages[0]["text"]
-        assert text_generation_messages[1]["text"] == "Faithful English translation."
-        draft_keyboard = text_generation_messages[1]["reply_markup"].inline_keyboard
+        assert "Служебная заметка о заменах" in text_generation_messages[1]["text"]
+        assert text_generation_messages[2]["text"] == "Faithful English translation."
+        draft_keyboard = text_generation_messages[2]["reply_markup"].inline_keyboard
         draft_labels = [button.text for row in draft_keyboard for button in row]
         assert draft_labels == [
             "✅ Опубликовать",
             "⏹ Закончить итерацию",
-            "✏️ Редактировать",
+            "✏️ Редактировать без AI-лимита",
         ]
         assert all(
             "Идея:" not in message["text"]
@@ -322,6 +492,8 @@ async def main() -> None:
 
         await test_daily_schedule_and_skip(calls)
         await test_refetch_after_queue_exhaustion()
+        await test_edit_retry_loop()
+        await test_anytime_owner_post()
 
         waiter = asyncio.get_running_loop().create_future()
         bot._STAGING_WAITERS["unit-token"] = waiter

@@ -7,6 +7,7 @@ import asyncio
 import fcntl
 import json
 import logging
+import re
 import secrets
 import sys
 import tempfile
@@ -16,7 +17,14 @@ from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from telegram import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    ForceReply,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.error import RetryAfter
 from telegram.ext import (
     Application,
@@ -40,11 +48,32 @@ _STAGING_WAITERS: dict[str, asyncio.Future] = {}
 _STAGING_PREFIX = "repost-staging:"
 _STARTUP_RECOVERY_NOTICE_KEY = "startup_recovery_notice_pending"
 _BOT_PROCESS_LOCK = None
+NEW_POST_BUTTON = "✍️ Создать свой пост"
+STATS_BUTTON = "📊 Статус"
 
 
 def _is_owner(update: Update) -> bool:
     chat_id = getattr(update.effective_chat, "id", None)
     return bool(config.OWNER_CHAT_ID) and chat_id == config.OWNER_CHAT_ID
+
+
+def _public_error_text(error: BaseException) -> str:
+    """Return a useful error without leaking credentials or token-bearing URLs."""
+    message = str(error).strip() or type(error).__name__
+    for secret in (
+        config.BOT_TOKEN,
+        config.OPENAI_API_KEY,
+        config.BUFFER_TOKEN,
+        config.TELEGRAM_SESSION_STRING,
+    ):
+        if secret:
+            message = message.replace(secret, "[secret]")
+    message = re.sub(
+        r"https://api\.telegram\.org/bot[^/\s]+",
+        "https://api.telegram.org/bot[secret]",
+        message,
+    )
+    return message[:350]
 
 
 async def _send(call, *args, **kwargs):
@@ -89,8 +118,21 @@ def _draft_keyboard(draft_id: int) -> InlineKeyboardMarkup:
                     callback_data=f"draftskip:{draft_id}",
                 ),
             ],
-            [InlineKeyboardButton("✏️ Редактировать", callback_data=f"edit:{draft_id}")],
+            [
+                InlineKeyboardButton(
+                    "✏️ Редактировать без AI-лимита",
+                    callback_data=f"edit:{draft_id}",
+                )
+            ],
         ]
+    )
+
+
+def _main_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(NEW_POST_BUTTON), KeyboardButton(STATS_BUTTON)]],
+        resize_keyboard=True,
+        is_persistent=True,
     )
 
 
@@ -310,6 +352,12 @@ async def propose_batch(
 ) -> int:
     if not config.OWNER_CHAT_ID:
         return 0
+    LOGGER.info(
+        "delivery started slot=%s source=%s max_items=%s",
+        slot_key,
+        source_username or "all",
+        config.ITEMS_PER_SLOT if max_items is None else max_items,
+    )
     async with _DELIVERY_LOCK:
         conn = db.connect()
         try:
@@ -331,6 +379,7 @@ async def propose_batch(
                         max_items=config.ITEMS_PER_SLOT if max_items is None else max_items,
                     )
             if not posts:
+                LOGGER.info("delivery empty slot=%s refetch=%s", slot_key, refetch_result is not None)
                 if announce_empty:
                     detail = ""
                     if refetch_result is not None:
@@ -344,12 +393,19 @@ async def propose_batch(
                         "Очередь пуста — новых материалов нет." + detail,
                     )
                 return 0
+            LOGGER.info(
+                "delivery claimed slot=%s post_ids=%s",
+                slot_key,
+                ",".join(str(post["id"]) for post in posts),
+            )
             sent = 0
             for post in posts:
                 try:
                     await _send_raw(bot, conn, post)
                     sent += 1
+                    LOGGER.info("delivery sent slot=%s post_id=%s", slot_key, post["id"])
                 except Exception as exc:  # noqa: BLE001
+                    LOGGER.exception("delivery failed slot=%s post_id=%s", slot_key, post["id"])
                     db.release_delivery(conn, post["id"], post["claim_token"])
                     try:
                         await _send(
@@ -412,6 +468,14 @@ async def _generate_from_post(
     post,
     source_text: str,
 ) -> bool:
+    started_at = time.monotonic()
+    LOGGER.info(
+        "generation started post_id=%s source=%s chars=%s model=%s",
+        post["id"],
+        post["username"],
+        len(source_text),
+        config.llm_model(),
+    )
     existing = db.active_draft_for_post(conn, post["id"])
     if existing is not None:
         try:
@@ -444,6 +508,7 @@ async def _generate_from_post(
             out.notes,
         )
     except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("generation failed post_id=%s", post["id"])
         db.set_post_status(conn, post["id"], "offered")
         try:
             await _send(bot.send_message, config.OWNER_CHAT_ID, f"⚠️ Ошибка генерации: {str(exc)[:500]}")
@@ -454,8 +519,16 @@ async def _generate_from_post(
         draft = db.get_draft(conn, draft_id)
         await _send_generation_note(bot, draft)
         await _send_draft(bot, conn, draft_id)
+        LOGGER.info(
+            "generation completed post_id=%s draft_id=%s chars=%s duration_ms=%s",
+            post["id"],
+            draft_id,
+            len(_draft_body(draft)),
+            round((time.monotonic() - started_at) * 1000),
+        )
         return True
     except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("draft delivery failed post_id=%s draft_id=%s", post["id"], draft_id)
         db.set_draft_status(conn, draft_id, "delivery_failed")
         db.set_post_status(conn, post["id"], "offered")
         try:
@@ -486,9 +559,22 @@ async def _publish(bot, conn, draft_id: int) -> None:
     texts = _texts_for_publish(draft)
     done = _ok_platforms(conn, draft_id)
     todo = {platform: text for platform, text in texts.items() if platform not in done}
+    await _send(
+        bot.send_message,
+        config.OWNER_CHAT_ID,
+        "⏳ Отправляю пост в Buffer: "
+        + ", ".join(PLATFORM_LABELS.get(platform, platform) for platform in todo)
+        + ". Обычно это занимает несколько секунд.",
+    )
+    LOGGER.info(
+        "publication started draft_id=%s platforms=%s",
+        draft_id,
+        ",".join(todo),
+    )
     try:
         results = await asyncio.to_thread(publisher.publish_all, todo)
     except BaseException as exc:
+        LOGGER.exception("publication result unknown draft_id=%s", draft_id)
         db.set_draft_status(conn, draft_id, "publish_unknown")
         if isinstance(exc, asyncio.CancelledError):
             raise
@@ -511,6 +597,11 @@ async def _publish(bot, conn, draft_id: int) -> None:
         db.record_publication(conn, draft_id, platform, ok, info if ok else None, None if ok else info)
         label = PLATFORM_LABELS.get(platform, platform)
         lines.append(f"{'✅' if ok else '❌'} {label}" + ("" if ok else f": {info}"))
+    LOGGER.info(
+        "publication completed draft_id=%s results=%s",
+        draft_id,
+        ",".join(f"{platform}:{'ok' if ok else 'error'}" for platform, (ok, _) in results.items()),
+    )
     failed = [platform for platform, (ok, _) in results.items() if not ok]
     unknown = [platform for platform, (ok, info) in results.items() if not ok and info.startswith("UNKNOWN:")]
     if unknown:
@@ -655,6 +746,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await query.answer("Создаю пост")
         if not db.transition_post(conn, post["id"], ("offered", "awaiting_manual"), "generating"):
             return
+        await _send(
+            context.bot.send_message,
+            config.OWNER_CHAT_ID,
+            f"⏳ Пост #{post['id']}: перевожу на английский, проверяю факты и "
+            f"укладываю текст в {config.MAX_POST_CHARS} символов. Обычно это занимает 10–30 секунд.",
+        )
         success = await _generate_from_post(
             context.bot,
             conn,
@@ -723,8 +820,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         prompt = await _send(
             context.bot.send_message,
             config.OWNER_CHAT_ID,
-            f"✏️ Пришли новый текст поста #{object_id} ответом на это сообщение "
-            f"(до {config.MAX_POST_CHARS} символов).",
+            f"✏️ Пришли полный новый текст поста #{object_id} ответом на это сообщение. "
+            f"AI-лимит {config.MAX_POST_CHARS} уже не применяется; вручную можно до "
+            f"{config.MANUAL_MAX_POST_CHARS} символов.",
             reply_markup=ForceReply(selective=True),
         )
         db.set_edit_msg(conn, object_id, prompt.message_id)
@@ -736,74 +834,158 @@ async def on_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_owner(update) or update.message.reply_to_message is None:
         return
     conn = db.connect()
-    reply_to = update.message.reply_to_message.message_id
-    text = (update.message.text or "").strip()
-    if not text:
-        return
-    if len(text) > config.MAX_POST_CHARS:
-        await update.message.reply_text(
-            f"Текст содержит {len(text)} символов; максимум — {config.MAX_POST_CHARS}. "
-            "Я ничего не обрезал: сократи текст и пришли ещё раз."
-        )
-        return
-
-    post = db.post_by_manual_prompt(conn, reply_to)
-    if post is not None and post["status"] == "awaiting_manual":
-        if not db.transition_post(conn, post["id"], ("awaiting_manual",), "generating"):
+    try:
+        reply_to = update.message.reply_to_message.message_id
+        text = (update.message.text or "").strip()
+        if not text:
             return
-        existing = db.active_draft_for_post(conn, post["id"])
-        if existing is not None:
+
+        post = db.post_by_manual_prompt(conn, reply_to)
+        if post is not None and post["status"] != "awaiting_manual":
+            post = None
+        draft = None if post is not None else db.draft_by_message(conn, reply_to)
+        LOGGER.info(
+            "reply received reply_to=%s chars=%s target=%s target_id=%s",
+            reply_to,
+            len(text),
+            "manual" if post is not None else "draft" if draft is not None else "none",
+            post["id"] if post is not None else draft["id"] if draft is not None else "none",
+        )
+
+        if post is None and draft is None:
+            await update.message.reply_text(
+                "⚠️ Я получил сообщение, но не нашёл активное редактирование для этого reply. "
+                "Нажми «✏️ Редактировать» под актуальным черновиком и ответь на новый prompt."
+            )
+            return
+
+        target_limit = (
+            None
+            if post is not None and post["media_kind"] == "manual"
+            else config.MANUAL_MAX_POST_CHARS
+        )
+        if target_limit is not None and len(text) > target_limit:
+            retry_prompt = await update.message.reply_text(
+                f"⚠️ Текст содержит {len(text)} символов; максимум для публикации во все "
+                f"площадки — {target_limit}. "
+                "Я ничего не обрезал. Сократи текст и ответь прямо на это сообщение — "
+                "я продолжу тот же процесс.",
+                reply_markup=ForceReply(selective=True),
+            )
+            if post is not None:
+                db.set_manual_prompt(conn, post["id"], retry_prompt.message_id)
+            else:
+                db.set_edit_msg(conn, draft["id"], retry_prompt.message_id)
+            LOGGER.info(
+                "reply rejected over limit target=%s target_id=%s chars=%s retry_prompt=%s",
+                "manual" if post is not None else "draft",
+                post["id"] if post is not None else draft["id"],
+                len(text),
+                retry_prompt.message_id,
+            )
+            return
+
+        if post is not None and post["media_kind"] == "manual":
+            await update.message.reply_text(
+                f"⏳ Текст принят: {len(text)} символов. Запускаю Terra: "
+                f"1) English → 2) факты Mike/Vahue → 3) смысловое сжатие до "
+                f"{config.MAX_POST_CHARS}. Обычно это занимает 10–30 секунд."
+            )
+        else:
+            await update.message.reply_text(
+                f"⏳ Текст принят: {len(text)}/{config.MANUAL_MAX_POST_CHARS}. "
+                "Обновляю черновик без повторного AI-сжатия…"
+            )
+
+        if post is not None:
+            if not db.transition_post(conn, post["id"], ("awaiting_manual",), "generating"):
+                await update.message.reply_text("⚠️ Этот материал уже обрабатывается или закрыт.")
+                return
+            existing = db.active_draft_for_post(conn, post["id"])
+            if existing is not None:
+                try:
+                    await _send_draft(context.bot, conn, existing["id"])
+                    db.set_draft_status(conn, existing["id"], "awaiting_review")
+                    db.set_post_status(conn, post["id"], "drafted")
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.exception("manual draft delivery failed post_id=%s", post["id"])
+                    db.set_draft_status(conn, existing["id"], "delivery_failed")
+                    db.set_post_status(conn, post["id"], "awaiting_manual")
+                    await update.message.reply_text(
+                        f"⚠️ Не удалось отправить черновик: {_public_error_text(exc)}"
+                    )
+                return
             try:
-                await _send_draft(context.bot, conn, existing["id"])
-                db.set_draft_status(conn, existing["id"], "awaiting_review")
-                db.set_post_status(conn, post["id"], "drafted")
+                if post["media_kind"] == "manual":
+                    out = await asyncio.to_thread(
+                        generator.translate_post,
+                        "Собственный пост",
+                        datetime.now(ZoneInfo(config.TIMEZONE)).date().isoformat(),
+                        text,
+                    )
+                else:
+                    out = await asyncio.to_thread(generator.adapt, text)
+                draft_id = db.create_draft(
+                    conn,
+                    post["id"],
+                    config.llm_model(),
+                    out.linkedin_text,
+                    out.x_text,
+                    out.threads_text,
+                    out.notes,
+                )
             except Exception as exc:  # noqa: BLE001
-                db.set_draft_status(conn, existing["id"], "delivery_failed")
+                LOGGER.exception("manual draft preparation failed post_id=%s", post["id"])
                 db.set_post_status(conn, post["id"], "awaiting_manual")
-                await update.message.reply_text(f"⚠️ Не удалось отправить черновик: {str(exc)[:500]}")
+                retry_prompt = await update.message.reply_text(
+                    f"⚠️ Ошибка подготовки: {_public_error_text(exc)}\n\n"
+                    "Состояние сохранено. Ответь на это сообщение исходным текстом, "
+                    "чтобы повторить попытку.",
+                    reply_markup=ForceReply(selective=True),
+                )
+                db.set_manual_prompt(conn, post["id"], retry_prompt.message_id)
+                return
+            try:
+                await _send_draft(context.bot, conn, draft_id)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.exception("manual draft send failed post_id=%s draft_id=%s", post["id"], draft_id)
+                db.set_draft_status(conn, draft_id, "delivery_failed")
+                db.set_post_status(conn, post["id"], "awaiting_manual")
+                retry_prompt = await update.message.reply_text(
+                    f"⚠️ Не удалось отправить черновик: {_public_error_text(exc)}\n\n"
+                    "Состояние сохранено. Ответь на это сообщение исходным текстом, "
+                    "чтобы повторить попытку.",
+                    reply_markup=ForceReply(selective=True),
+                )
+                db.set_manual_prompt(conn, post["id"], retry_prompt.message_id)
+            return
+
+        if draft["status"] not in ("awaiting_review", "approved"):
+            await update.message.reply_text(f"Черновик уже нельзя редактировать ({draft['status']}).")
+            return
+        if _ok_platforms(conn, draft["id"]):
+            await update.message.reply_text(
+                "Часть площадок уже опубликована — менять текст нельзя, чтобы версии не разошлись."
+            )
             return
         try:
             out = await asyncio.to_thread(generator.adapt, text)
-            draft_id = db.create_draft(
+            db.update_draft_texts(
                 conn,
-                post["id"],
-                config.llm_model(),
+                draft["id"],
                 out.linkedin_text,
                 out.x_text,
                 out.threads_text,
-                out.notes,
+                text,
             )
+            db.set_draft_status(conn, draft["id"], "awaiting_review")
+            await _send_draft(context.bot, conn, draft["id"])
+            LOGGER.info("draft edited draft_id=%s chars=%s", draft["id"], len(text))
         except Exception as exc:  # noqa: BLE001
-            db.set_post_status(conn, post["id"], "awaiting_manual")
-            await update.message.reply_text(f"⚠️ Ошибка подготовки: {str(exc)[:500]}")
-            return
-        try:
-            await _send_draft(context.bot, conn, draft_id)
-        except Exception as exc:  # noqa: BLE001
-            db.set_draft_status(conn, draft_id, "delivery_failed")
-            db.set_post_status(conn, post["id"], "awaiting_manual")
-            await update.message.reply_text(f"⚠️ Не удалось отправить черновик: {str(exc)[:500]}")
-        return
-
-    draft = db.draft_by_message(conn, reply_to)
-    if draft is None:
-        return
-    if draft["status"] not in ("awaiting_review", "approved"):
-        await update.message.reply_text(f"Черновик уже нельзя редактировать ({draft['status']}).")
-        return
-    if _ok_platforms(conn, draft["id"]):
-        await update.message.reply_text(
-            "Часть площадок уже опубликована — менять текст нельзя, чтобы версии не разошлись."
-        )
-        return
-    try:
-        out = await asyncio.to_thread(generator.adapt, text)
-    except Exception as exc:  # noqa: BLE001
-        await update.message.reply_text(f"⚠️ Ошибка адаптации: {str(exc)[:500]}")
-        return
-    db.update_draft_texts(conn, draft["id"], out.linkedin_text, out.x_text, out.threads_text, text)
-    db.set_draft_status(conn, draft["id"], "awaiting_review")
-    await _send_draft(context.bot, conn, draft["id"])
+            LOGGER.exception("draft edit failed draft_id=%s", draft["id"])
+            await update.message.reply_text(f"⚠️ Ошибка обновления: {_public_error_text(exc)}")
+    finally:
+        conn.close()
 
 
 async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -841,6 +1023,63 @@ async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_owner(update):
+        await cmd_id(update, context)
+        return
+    await update.message.reply_text(
+        "Бот готов. Можно дождаться идеи из Telegram-очереди или в любой момент "
+        "создать собственный пост кнопкой ниже.",
+        reply_markup=_main_keyboard(),
+    )
+
+
+async def cmd_new_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_owner(update):
+        return
+    conn = db.connect()
+    try:
+        existing = db.pending_owner_post(conn, config.OWNER_CHAT_ID)
+        prompt = await update.message.reply_text(
+            "✍️ Пришли исходный текст ответом на это сообщение. Можно на русском или "
+            "английском и длиннее 1500 символов: Terra переведёт, исправит факты и "
+            f"смыслово сожмёт результат до {config.MAX_POST_CHARS}.",
+            reply_markup=ForceReply(selective=True),
+        )
+        if existing is not None:
+            db.set_manual_prompt(conn, existing["id"], prompt.message_id)
+            LOGGER.info("owner post input reopened post_id=%s prompt=%s", existing["id"], prompt.message_id)
+            return
+        source_id = db.upsert_source(
+            conn,
+            f"manual:{config.OWNER_CHAT_ID}",
+            "Собственные посты",
+        )
+        if not db.insert_post(
+            conn,
+            source_id,
+            prompt.message_id,
+            datetime.now(timezone.utc).isoformat(),
+            "",
+            None,
+            author="Mike Doroshenko",
+            status="awaiting_manual",
+            media_kind="manual",
+        ):
+            raise RuntimeError("Не удалось создать durable manual-post session")
+        row = conn.execute(
+            "SELECT id FROM post WHERE source_id=? AND tg_message_id=?",
+            (source_id, prompt.message_id),
+        ).fetchone()
+        db.set_manual_prompt(conn, row["id"], prompt.message_id)
+        LOGGER.info("owner post input created post_id=%s prompt=%s", row["id"], prompt.message_id)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("failed to start owner post input")
+        await update.message.reply_text(f"⚠️ Не удалось начать новый пост: {_public_error_text(exc)}")
+    finally:
+        conn.close()
+
+
 async def cmd_next(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if _is_owner(update):
         context.application.create_task(
@@ -875,8 +1114,15 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if _is_owner(update):
-        stats = db.stats(db.connect())
-        await update.message.reply_text("\n".join(f"{key}: {value}" for key, value in stats.items()) or "База пуста")
+        conn = db.connect()
+        try:
+            stats = db.stats(conn)
+        finally:
+            conn.close()
+        await update.message.reply_text(
+            "\n".join(f"{key}: {value}" for key, value in stats.items()) or "База пуста",
+            reply_markup=_main_keyboard(),
+        )
 
 
 async def propose_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -951,6 +1197,17 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         type(error).__name__,
         exc_info=(type(error), error, error.__traceback__),
     )
+    effective_chat = getattr(update, "effective_chat", None)
+    if getattr(effective_chat, "id", None) == config.OWNER_CHAT_ID:
+        try:
+            await _send(
+                context.bot.send_message,
+                config.OWNER_CHAT_ID,
+                f"⚠️ Процесс завершился ошибкой ({type(error).__name__}): "
+                f"{_public_error_text(error)}. Состояние сохранено; действие можно повторить.",
+            )
+        except Exception:
+            LOGGER.exception("failed to report Telegram handler error to owner")
 
 
 _SYNC_RETRY_KEYS = (
@@ -1114,11 +1371,24 @@ def create_application() -> Application:
         MessageHandler(filters.ChatType.PRIVATE & filters.ATTACHMENT, on_staging_media),
         group=-1,
     )
-    app.add_handler(CommandHandler(["start", "id"], cmd_id, filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("start", cmd_start, filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("id", cmd_id, filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("chatid", cmd_chatid))
     app.add_handler(CommandHandler("next", cmd_next, filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("test", cmd_test, filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("stats", cmd_stats, filters.ChatType.PRIVATE))
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE & filters.Regex(f"^{re.escape(NEW_POST_BUTTON)}$"),
+            cmd_new_post,
+        )
+    )
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE & filters.Regex(f"^{re.escape(STATS_BUTTON)}$"),
+            cmd_stats,
+        )
+    )
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_error_handler(on_error)
     app.add_handler(

@@ -55,7 +55,8 @@ Telethon user session ───────────────┐
 7. The ready draft has three actions:
    `✅ Опубликовать`, `✏️ Редактировать`, and `⏹ Закончить итерацию`.
 8. Editing means replying with the complete replacement text. It is authoritative
-   and is **not** sent through AI again.
+   and is **not** sent through AI again. The 1500-character AI target no longer
+   applies; manual edits may use up to 3000 characters so LinkedIn remains valid.
 9. Publishing sends the draft through Buffer to LinkedIn, X, and Threads. Successful
    platforms are recorded individually, so a retry targets only failed platforms.
 10. Publishing or `Закончить итерацию` ends the current chain. The next automatic
@@ -165,7 +166,11 @@ Current author facts:
 
 ```text
 Name: Mike Doroshenko
+Gender: man
 Company: Vahue
+Lives in London
+Currently building SMM automation
+Current projects deploy AI agents for people and businesses
 Previously worked at Meta in Applied AI
 Vahue has more than 7 companies and 30 employees
 Trained more than 50 people in AI
@@ -282,6 +287,7 @@ Copy [`.env.example`](.env.example) to `.env` for local use. Never commit `.env`
 | `BUFFER_CHANNELS` | yes | `linkedin:id,twitter:id,threads:id`. |
 | `BUFFER_POST_MODE` | yes | `shareNow` or `addToQueue`. |
 | `MAX_POST_CHARS` | yes | Master draft limit; clamped to a maximum of 1500. |
+| `MANUAL_MAX_POST_CHARS` | yes | Owner-edited final text limit; 3000 for LinkedIn compatibility. |
 | `X_PREMIUM` | yes | Allows one X post up to 25,000 characters; master limit still applies. |
 | `POST_TIMES` | yes | London product slots, currently `10:00,18:00`. |
 | `ITEMS_PER_SLOT` | yes | Initial cards per slot, currently `1`; skips can request replacements. |
@@ -347,6 +353,13 @@ without discarding successful sources, and a failed full backfill exits non-zero
 | `/next` | Start an additional manual iteration from the global pool. |
 | `/stats` | Show queue/database counters. |
 
+`/start` installs a persistent `✍️ Создать свой пост` button. It opens a durable
+manual input session at any time, independently of the 10:00/18:00 source queue.
+The submitted Russian, English, or mixed text goes through the same three-stage
+Terra pipeline and returns as a normal reviewable draft. The draft's
+`✏️ Редактировать без AI-лимита` button accepts a complete owner-written replacement
+up to 3000 characters without calling or compressing through AI again.
+
 ## Production deployment
 
 Production is:
@@ -411,6 +424,23 @@ Coverage includes:
 - OpenAI Platform → Usage → Responses and Chat Completions → Models shows
   `gpt-5_6-terra` token usage.
 - Buffer should be checked manually before retrying a `publish_unknown` draft.
+
+### User-visible progress and runtime logs
+
+Long-running owner actions acknowledge themselves before work starts. Translation
+shows that Terra is translating/checking/compressing, accepted edits show their
+character count, and publishing lists the Buffer destinations. Validation and
+handler failures always return a Telegram message; an invalid reply is never
+silently ignored. If an edit exceeds the limit, the validation message becomes the
+new ForceReply prompt, so the owner can shorten the text and continue the same
+draft repeatedly.
+
+Production logs contain only high-level ids, states, lengths, durations, and
+per-platform results—never post bodies or credentials. Inspect them with:
+
+```bash
+vercel logs --environment production --since 1h --expand --no-branch
+```
 
 ## Non-goals and intentional limitations
 

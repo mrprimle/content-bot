@@ -691,7 +691,9 @@ def main() -> None:
     assert config.ITEMS_PER_SLOT == 1
     assert config.TIMEZONE == "Europe/London"
     assert config.OPENAI_MODEL == "gpt-5.6-terra"
-    assert config.LIMITS == {"linkedin": 1500, "twitter": 25000, "threads": 500}
+    assert config.MAX_POST_CHARS == 1500
+    assert config.MANUAL_MAX_POST_CHARS == 3000
+    assert config.LIMITS == {"linkedin": 3000, "twitter": 25000, "threads": 500}
     assert config.X_PREMIUM is True
     sources = config.read_sources()
     assert sources and len(sources) == len(set(sources)), "источники должны быть уникальными"
@@ -702,6 +704,12 @@ def main() -> None:
     assert "hard API acceptance limit" in prompts.TRANSLATE_SYSTEM
     assert "Preserve the original first-person perspective" in prompts.TRANSLATE_SYSTEM
     assert "company is Vahue" in prompts.TRANSLATE_SYSTEM
+    assert "STAGE 1 — ENGLISH" in prompts.TRANSLATE_SYSTEM
+    assert "STAGE 2 — TRUTH" in prompts.TRANSLATE_SYSTEM
+    assert "STAGE 3 — COMPRESSION" in prompts.TRANSLATE_SYSTEM
+    assert "Mike lives in London" in prompts.TRANSLATE_SYSTEM
+    assert "Mike is a man" in prompts.TRANSLATE_SYSTEM
+    assert "building SMM automation" in prompts.TRANSLATE_SYSTEM
     assert "third-party fact is content" in prompts.TRANSLATE_SYSTEM
     assert ingest.subtract_months(
         datetime(2026, 7, 31, tzinfo=timezone.utc), 3

@@ -122,4 +122,17 @@ def generate(source: str, date: str, text: str) -> DraftOut:
 
 def adapt(edited_text: str) -> DraftOut:
     """An owner's English edit is authoritative and needs no second AI call."""
-    return _draft(edited_text)
+    text = edited_text.strip()
+    if not text:
+        raise RuntimeError("Пустой текст нельзя опубликовать")
+    if len(text) > config.MANUAL_MAX_POST_CHARS:
+        raise RuntimeError(
+            f"Ручной текст содержит {len(text)} символов при лимите "
+            f"{config.MANUAL_MAX_POST_CHARS} для публикации во все площадки"
+        )
+    return DraftOut(
+        linkedin_text=text,
+        x_text=text,
+        threads_text=text,
+        notes="",
+    )

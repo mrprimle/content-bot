@@ -46,6 +46,10 @@ BUFFER_POST_MODE = _get("BUFFER_POST_MODE") or "addToQueue"
 
 MIN_POST_CHARS = int(_get("MIN_POST_CHARS") or 1)
 MAX_POST_CHARS = max(1, min(int(_get("MAX_POST_CHARS") or 1500), 1500))
+MANUAL_MAX_POST_CHARS = max(
+    MAX_POST_CHARS,
+    min(int(_get("MANUAL_MAX_POST_CHARS") or 3000), 3000),
+)
 X_PREMIUM = _bool("X_PREMIUM", False)
 POST_TIMES = [t.strip() for t in (_get("POST_TIMES") or "10:00,18:00").split(",") if t.strip()]
 ITEMS_PER_SLOT = max(1, int(_get("ITEMS_PER_SLOT") or 1))
@@ -66,7 +70,7 @@ MEDIA_STAGE_TIMEOUT = float(_get("MEDIA_STAGE_TIMEOUT") or 90)
 SOURCES_FILE = ROOT / "sources.txt"
 
 LIMITS = {
-    "linkedin": MAX_POST_CHARS,
+    "linkedin": MANUAL_MAX_POST_CHARS,
     "twitter": 25_000 if X_PREMIUM else 280,
     "threads": 500,
 }

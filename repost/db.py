@@ -986,6 +986,15 @@ def post_by_manual_prompt(conn: sqlite3.Connection, tg_message_id: int) -> sqlit
     ).fetchone()
 
 
+def pending_owner_post(conn, chat_id: int) -> sqlite3.Row | None:
+    """Return the owner's unfinished anytime/manual post input, if one exists."""
+    return conn.execute(
+        "SELECT p.*, s.username, s.title FROM post p JOIN source s ON s.id=p.source_id "
+        "WHERE s.username=? AND p.status='awaiting_manual' ORDER BY p.id DESC LIMIT 1",
+        (f"manual:{chat_id}",),
+    ).fetchone()
+
+
 def set_draft_message(conn, draft_id: int, tg_message_id: int) -> None:
     conn.execute("UPDATE draft SET tg_message_id=? WHERE id=?", (tg_message_id, draft_id))
     conn.commit()

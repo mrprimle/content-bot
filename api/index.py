@@ -17,6 +17,7 @@ logging.basicConfig(
 # so production must never emit those records.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+LOGGER = logging.getLogger("repost.api")
 
 app = FastAPI(title="Vahue Content Bot", docs_url=None, redoc_url=None)
 _telegram_app = repost_bot.create_application()
@@ -77,7 +78,13 @@ async def telegram_webhook(
     update = Update.de_json(await request.json(), _telegram_app.bot)
     if update is None:
         raise HTTPException(400, "Invalid Telegram update")
+    LOGGER.info(
+        "webhook update received update_id=%s kind=%s",
+        update.update_id,
+        "callback" if update.callback_query else "message" if update.effective_message else "other",
+    )
     await _telegram_app.process_update(update)
+    LOGGER.info("webhook update completed update_id=%s", update.update_id)
     return {"ok": True}
 
 
@@ -98,6 +105,7 @@ async def cron_delivery(
         None,
     )
     if slot is None:
+        LOGGER.info("cron no-op trigger=%s london_hour=%s", trigger_utc_hour, now.hour)
         return {
             "ok": True,
             "trigger": trigger_utc_hour,
@@ -108,6 +116,7 @@ async def cron_delivery(
         slot_key=f"schedule:{now.date().isoformat()}:{slot}",
         max_items=config.ITEMS_PER_SLOT,
     )
+    LOGGER.info("cron completed trigger=%s slot=%s sent=%s", trigger_utc_hour, slot, sent)
     return {"ok": True, "trigger": trigger_utc_hour, "slot": slot, "sent": sent}
 
 

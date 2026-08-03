@@ -352,6 +352,7 @@ without discarding successful sources, and a failed full backfill exits non-zero
 | `/test @channel` | Deliver one candidate from a specific source without calling AI. |
 | `/next` | Start an additional manual iteration from the global pool. |
 | `/stats` | Show queue/database counters. |
+| `/resend <draft_id>` | Re-deliver a saved, unpublished draft after a Telegram/UI delivery failure. |
 
 `/start` installs a persistent `✍️ Создать свой пост` button. It opens a durable
 manual input session at any time, independently of the 10:00/18:00 source queue.

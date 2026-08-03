@@ -1112,6 +1112,37 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def cmd_resend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Re-deliver a saved draft after a Telegram delivery/UI failure."""
+    if not _is_owner(update):
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Использование: /resend <draft_id>")
+        return
+    draft_id = int(context.args[0])
+    conn = db.connect()
+    try:
+        draft = db.get_draft(conn, draft_id)
+        if draft is None:
+            await update.message.reply_text(f"⚠️ Черновик #{draft_id} не найден.")
+            return
+        if draft["status"] in ("publishing", "published"):
+            await update.message.reply_text(
+                f"⚠️ Черновик #{draft_id} уже {draft['status']}; повторно не отправляю."
+            )
+            return
+        await update.message.reply_text(f"⏳ Повторно отправляю сохранённый черновик #{draft_id}…")
+        await _send_draft(context.bot, conn, draft_id)
+        LOGGER.info("draft redelivered draft_id=%s chars=%s", draft_id, len(_draft_body(draft)))
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("draft redelivery failed draft_id=%s", draft_id)
+        await update.message.reply_text(
+            f"⚠️ Не удалось повторно отправить черновик #{draft_id}: {_public_error_text(exc)}"
+        )
+    finally:
+        conn.close()
+
+
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if _is_owner(update):
         conn = db.connect()
@@ -1376,6 +1407,7 @@ def create_application() -> Application:
     app.add_handler(CommandHandler("chatid", cmd_chatid))
     app.add_handler(CommandHandler("next", cmd_next, filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("test", cmd_test, filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("resend", cmd_resend, filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("stats", cmd_stats, filters.ChatType.PRIVATE))
     app.add_handler(
         MessageHandler(

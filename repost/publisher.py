@@ -40,10 +40,18 @@ def create_post(
 ) -> str:
     metadata = ""
     if thread_platform and thread:
-        items = ", ".join(f"{{ text: {json.dumps(item)} }}" for item in thread)
+        entries = []
+        for index, item in enumerate(thread):
+            item_assets = ""
+            if index == 0 and image_url:
+                item_assets = (
+                    f", assets: [{{ image: {{ url: {json.dumps(image_url)} }} }}]"
+                )
+            entries.append(f"{{ text: {json.dumps(item)}{item_assets} }}")
+        items = ", ".join(entries)
         metadata = f", metadata: {{{thread_platform}: {{thread: [{items}]}}}}"
     assets = ""
-    if image_url:
+    if image_url and not (thread_platform and thread):
         assets = f", assets: [{{ image: {{ url: {json.dumps(image_url)} }} }}]"
     query = (
         "mutation { createPost(input: {"
@@ -95,7 +103,30 @@ def split_for_thread(text: str, limit: int) -> list[str]:
     return chunks
 
 
-def _publication_payload(platform: str, text: str) -> tuple[str, str | None, list[str] | None]:
+def _publication_payload(
+    platform: str,
+    text: str | list[str],
+) -> tuple[str, str | None, list[str] | None]:
+    if isinstance(text, list):
+        if platform != "threads":
+            raise ValueError(f"Список thread-items нельзя отправить в {platform}")
+        chunks = [item.strip() for item in text if item and item.strip()]
+        if not chunks:
+            raise ValueError("Threads-план пуст")
+        too_long = [
+            index
+            for index, item in enumerate(chunks, start=1)
+            if len(item) > config.THREAD_ITEM_CHARS
+        ]
+        if too_long:
+            raise ValueError(
+                f"Threads-карточки {too_long} длиннее {config.THREAD_ITEM_CHARS} символов"
+            )
+        return (
+            chunks[0],
+            "threads" if len(chunks) > 1 else None,
+            chunks if len(chunks) > 1 else None,
+        )
     text = text.strip()
     if platform == "twitter":
         if len(text) <= config.LIMITS["twitter"]:
@@ -104,7 +135,7 @@ def _publication_payload(platform: str, text: str) -> tuple[str, str | None, lis
         chunks = split_for_thread(text, 280)
         return chunks[0], "twitter", chunks
     if platform == "threads":
-        chunks = split_for_thread(text, config.LIMITS["threads"])
+        chunks = split_for_thread(text, config.THREAD_ITEM_CHARS)
         return chunks[0], "threads" if len(chunks) > 1 else None, chunks if len(chunks) > 1 else None
     limit = config.LIMITS.get(platform)
     if limit and len(text) > limit:
@@ -116,10 +147,10 @@ def _publication_payload(platform: str, text: str) -> tuple[str, str | None, lis
 
 
 def publish_all(
-    texts_by_platform: dict[str, str],
+    texts_by_platform: dict[str, str | list[str]],
     image_url: str | None = None,
 ) -> dict[str, tuple[bool, str]]:
-    """{'linkedin': text, ...} -> {'linkedin': (ok, post_id | error), ...}"""
+    """Publish master strings plus an optional explicit Threads item list."""
     results: dict[str, tuple[bool, str]] = {}
     channels = config.buffer_channels()
     if not channels:
@@ -128,7 +159,7 @@ def publish_all(
         if platform not in texts_by_platform:
             continue
         text = texts_by_platform[platform]
-        if not text or not text.strip():
+        if not text or (isinstance(text, str) and not text.strip()):
             results[platform] = (
                 False,
                 "Пустой текст для настроенной площадки; публикация не выполнена",

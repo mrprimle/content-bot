@@ -5,7 +5,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from repost import config, publisher  # noqa: E402
+from repost import config, generator, publisher  # noqa: E402
 
 
 def main() -> None:
@@ -73,6 +73,42 @@ def main() -> None:
     assert len(calls) == 3
     assert all(call[-1] == image_url for call in calls)
 
+    calls.clear()
+    thread_items = [
+        "A strong question opens the loop.",
+        "One complete value point advances the story.",
+        "The final card delivers the payoff.",
+    ]
+    config.buffer_channels = lambda: {"threads": "threads-channel"}
+    publisher.create_post = fake_create_post
+    try:
+        thread_results = publisher.publish_all({"threads": thread_items}, image_url)
+    finally:
+        config.buffer_channels = original_channels
+        publisher.create_post = original_create_post
+    assert thread_results["threads"][0] is True
+    assert calls == [
+        (
+            "threads-channel",
+            thread_items[0],
+            "threads",
+            thread_items,
+            image_url,
+        )
+    ]
+
+    _, platform, planned = publisher._publication_payload("threads", thread_items)
+    assert platform == "threads" and planned == thread_items
+
+    generated = generator._draft("Master text", "", thread_items)
+    assert generated.thread_items == thread_items
+    try:
+        generator._draft("Master text", "", ["x" * (config.THREAD_ITEM_CHARS + 1)])
+    except RuntimeError as exc:
+        assert "превышают лимит" in str(exc)
+    else:
+        raise AssertionError("oversized AI Threads card was accepted")
+
     original_gql = publisher._gql
     gql_queries: list[str] = []
 
@@ -87,10 +123,21 @@ def main() -> None:
             "Text and image",
             image_url=image_url,
         ) == "buffer-image-post"
+        assert publisher.create_post(
+            "threads-channel",
+            thread_items[0],
+            thread_platform="threads",
+            thread=thread_items,
+            image_url=image_url,
+        ) == "buffer-image-post"
     finally:
         publisher._gql = original_gql
     assert "assets: [{ image: { url:" in gql_queries[0]
     assert image_url in gql_queries[0]
+    assert "metadata: {threads: {thread:" in gql_queries[1]
+    assert gql_queries[1].count(image_url) == 1
+    first_thread_entry = gql_queries[1].split("thread: [", 1)[1].split("}", 1)[0]
+    assert "assets:" in first_thread_entry
 
     long_text = " ".join(f"word{index}" for index in range(300))
     x_chunks = publisher.split_for_thread(long_text, 280)

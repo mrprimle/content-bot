@@ -1,5 +1,6 @@
 """Offline async test: raw delivery must not call the LLM or Buffer."""
 import asyncio
+import json
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -125,6 +126,7 @@ async def test_evening_planning_and_next_day_publish() -> None:
                 x_text=text,
                 threads_text=text,
                 notes="",
+                thread_items=[f"Planning hook {generated}.", f"Planning payoff {generated}."],
             )
 
         def fake_publish(texts, image_url=None):
@@ -192,12 +194,18 @@ async def test_evening_planning_and_next_day_publish() -> None:
                 f"✅ Готово на завтра ({position}/3)",
                 "✏️ Редактировать руками",
                 "🤖 Редактировать с AI",
+                "🧵 Пересобрать Threads с AI",
                 "⏭ Другой материал",
                 "⏹ Закончить на сегодня",
             ]
             if position == 2:
                 edited = "Owner-edited second planning post."
                 db.update_draft_texts(conn, draft["id"], "old-li", "old-x", "old-th", edited)
+                db.set_draft_thread_items(
+                    conn,
+                    draft["id"],
+                    ["Edited planning hook.", "Edited planning payoff."],
+                )
             ready = FakeQuery(f"planready:{draft['id']}")
             await bot.on_callback(
                 SimpleNamespace(
@@ -229,7 +237,10 @@ async def test_evening_planning_and_next_day_publish() -> None:
             assert len(fake.messages) == before_publish_messages + 1
             assert "опубликован в LinkedIn, X и Threads" in fake.messages[-1]["text"]
         assert len(published) == 3
-        assert set(published[1].values()) == {"Owner-edited second planning post."}
+        assert published[0]["threads"] == ["Planning hook 1.", "Planning payoff 1."]
+        assert published[1]["linkedin"] == "Owner-edited second planning post."
+        assert published[1]["twitter"] == "Owner-edited second planning post."
+        assert published[1]["threads"] == ["Edited planning hook.", "Edited planning payoff."]
         session = db.get_planning_session(conn, session["id"])
         assert session["status"] == "published"
     finally:
@@ -303,10 +314,19 @@ async def test_edit_retry_loop() -> None:
     old_db_path = config.DB_PATH
     old_owner = config.OWNER_CHAT_ID
     old_delay = config.BOT_SEND_DELAY
+    original_threadify = generator.threadify_post
+
+    def fake_threadify(text: str):
+        return generator.ThreadPlanOut(
+            thread_items=["Edited hook.", f"Edited payoff: {text}"],
+            notes="Тестовый Threads-план",
+        )
+
     try:
         config.DB_PATH = tmp.name
         config.OWNER_CHAT_ID = 123
         config.BOT_SEND_DELAY = 0
+        generator.threadify_post = fake_threadify
         conn = db.connect()
         source_id = db.upsert_source(conn, "@edit-loop", "Edit loop")
         assert db.insert_post(
@@ -356,9 +376,14 @@ async def test_edit_retry_loop() -> None:
             SimpleNamespace(bot=fake_bot),
         )
         assert valid.responses[0]["text"].startswith("⏳ Текст принят:")
-        assert fake_bot.messages[-1]["text"] == valid_text
+        assert fake_bot.messages[-2]["text"] == "📄 LinkedIn / X:\n\n" + valid_text
+        assert fake_bot.messages[-1]["text"].startswith("🧵 Threads preview")
         verify = db.connect()
         assert db.get_draft(verify, draft_id)["edited_text"] == valid_text
+        assert json.loads(db.get_draft(verify, draft_id)["threads_json"]) == [
+            "Edited hook.",
+            f"Edited payoff: {valid_text}",
+        ]
         assert db.get_draft(verify, draft_id)["status"] == "awaiting_review"
         verify.close()
 
@@ -369,6 +394,7 @@ async def test_edit_retry_loop() -> None:
         )
         assert "не нашёл активное редактирование" in unknown.responses[0]["text"]
     finally:
+        generator.threadify_post = original_threadify
         config.DB_PATH = old_db_path
         config.OWNER_CHAT_ID = old_owner
         config.BOT_SEND_DELAY = old_delay
@@ -383,7 +409,9 @@ async def test_anytime_owner_post() -> None:
     old_owner = config.OWNER_CHAT_ID
     old_delay = config.BOT_SEND_DELAY
     original_translate = generator.translate_post
+    original_threadify = generator.threadify_post
     translate_calls: list[tuple[str, str]] = []
+    threadify_calls: list[str] = []
 
     def fake_translate(source: str, date: str, text: str):
         translate_calls.append((source, text))
@@ -392,6 +420,14 @@ async def test_anytime_owner_post() -> None:
             x_text="Prepared English owner post.",
             threads_text="Prepared English owner post.",
             notes="",
+            thread_items=["A strong owner-post hook.", "The owner-post payoff."],
+        )
+
+    def fake_threadify(text: str):
+        threadify_calls.append(text)
+        return generator.ThreadPlanOut(
+            thread_items=["Manual edit hook.", "Manual edit payoff."],
+            notes="",
         )
 
     try:
@@ -399,6 +435,7 @@ async def test_anytime_owner_post() -> None:
         config.OWNER_CHAT_ID = 123
         config.BOT_SEND_DELAY = 0
         generator.translate_post = fake_translate
+        generator.threadify_post = fake_threadify
 
         start_message = FakeIncomingMessage(bot.NEW_POST_BUTTON, 0)
         await bot.cmd_new_post(
@@ -440,7 +477,8 @@ async def test_anytime_owner_post() -> None:
         )
         assert "без AI" in submission.responses[0]["text"]
         assert translate_calls == []
-        assert fake_bot.messages[-1]["text"] == source_text
+        assert fake_bot.messages[-2]["text"] == "📄 LinkedIn / X:\n\n" + source_text
+        assert fake_bot.messages[-1]["text"].startswith("🧵 Threads preview")
         verify = db.connect()
         draft = verify.execute("SELECT * FROM draft ORDER BY id DESC LIMIT 1").fetchone()
         assert draft["status"] == "awaiting_review"
@@ -454,9 +492,28 @@ async def test_anytime_owner_post() -> None:
             "✨ Standard Transform",
             "✏️ Редактировать руками",
             "🤖 Редактировать с AI",
+            "🧵 Пересобрать Threads с AI",
             "❌ Отменить",
         ]
         verify.close()
+
+        raw_publish = FakeQuery(f"pub:{draft['id']}")
+        await bot.on_callback(
+            SimpleNamespace(
+                callback_query=raw_publish,
+                effective_chat=SimpleNamespace(id=123),
+            ),
+            SimpleNamespace(bot=fake_bot),
+        )
+        assert threadify_calls == [source_text]
+        verify = db.connect()
+        assert db.get_draft(verify, draft["id"])["status"] == "awaiting_review"
+        assert json.loads(db.get_draft(verify, draft["id"])["threads_json"]) == [
+            "Manual edit hook.",
+            "Manual edit payoff.",
+        ]
+        verify.close()
+        assert "нажми финальную кнопку ещё раз" in fake_bot.messages[-3]["text"]
 
         transform = FakeQuery(f"transform:{draft['id']}")
         await bot.on_callback(
@@ -467,7 +524,8 @@ async def test_anytime_owner_post() -> None:
             SimpleNamespace(bot=fake_bot),
         )
         assert translate_calls == [("Собственный пост", source_text)]
-        assert fake_bot.messages[-1]["text"] == "Prepared English owner post."
+        assert fake_bot.messages[-2]["text"] == "📄 LinkedIn / X:\n\nPrepared English owner post."
+        assert "A strong owner-post hook." in fake_bot.messages[-1]["text"]
         verify = db.connect()
         draft_message_id = db.get_draft(verify, draft["id"])["tg_message_id"]
         verify.close()
@@ -480,13 +538,16 @@ async def test_anytime_owner_post() -> None:
             SimpleNamespace(bot=second_bot),
         )
         assert "2000/3000" in edit.responses[0]["text"]
-        assert second_bot.messages[-1]["text"] == expanded
-        assert len(translate_calls) == 1, "ручная версия после transform не должна снова вызывать Terra"
+        assert second_bot.messages[-2]["text"] == "📄 LinkedIn / X:\n\n" + expanded
+        assert second_bot.messages[-1]["text"].startswith("🧵 Threads preview")
+        assert len(translate_calls) == 1, "ручная версия не должна снова запускать полный transform"
+        assert threadify_calls == [source_text, expanded]
         verify = db.connect()
         assert len(db.get_draft(verify, draft["id"])["edited_text"]) == 2_000
         verify.close()
     finally:
         generator.translate_post = original_translate
+        generator.threadify_post = original_threadify
         config.DB_PATH = old_db_path
         config.OWNER_CHAT_ID = old_owner
         config.BOT_SEND_DELAY = old_delay
@@ -538,6 +599,7 @@ async def test_photo_choice_and_publication() -> None:
             "Ready image post",
             "Ready image post",
             "",
+            ["Ready image hook.", "Ready image payoff."],
         )
         fake_bot = FakeBot()
         choose = FakeQuery(f"pub:{draft_id}")
@@ -565,7 +627,7 @@ async def test_photo_choice_and_publication() -> None:
                 {
                     "linkedin": "Ready image post",
                     "twitter": "Ready image post",
-                    "threads": "Ready image post",
+                    "threads": ["Ready image hook.", "Ready image payoff."],
                 },
                 "https://content.example/api/media/media-token",
             )
@@ -594,6 +656,7 @@ async def test_photo_choice_and_publication() -> None:
             "Planning image post",
             "Planning image post",
             "",
+            ["Planning image hook.", "Planning image payoff."],
         )
         session, _ = db.create_planning_session(
             conn,
@@ -729,6 +792,7 @@ async def main() -> None:
     old_delay = config.BOT_SEND_DELAY
     original_translate = generator.translate_post
     original_revise = generator.revise_post
+    original_threadify = generator.threadify_post
     original_publish = publisher.publish_all
     original_stage = ingest.stage_post_for_bot
     original_cleanup = ingest.delete_bot_staging_messages
@@ -779,6 +843,10 @@ async def main() -> None:
                 x_text="Faithful English translation.",
                 threads_text="Faithful English translation.",
                 notes="Служебная заметка о заменах",
+                thread_items=[
+                    "Why do faithful translations still fail on Threads?",
+                    "Because structure matters as much as wording.",
+                ],
             )
 
         generator.translate_post = fake_translate
@@ -795,20 +863,22 @@ async def main() -> None:
         await bot.on_callback(text_update, SimpleNamespace(bot=fake))
         text_generation_messages = fake.messages[before_text_generation:]
         assert route_calls == {"translate": 1}
-        assert len(text_generation_messages) == 3
+        assert len(text_generation_messages) == 4
         assert text_generation_messages[0]["text"].startswith("⏳ Пост #")
         assert "10–30 секунд" in text_generation_messages[0]["text"]
         assert text_generation_messages[1]["text"].startswith(
             "⚠️ Заменено / проверить:"
         )
         assert "Служебная заметка о заменах" in text_generation_messages[1]["text"]
-        assert text_generation_messages[2]["text"] == "Faithful English translation."
-        draft_keyboard = text_generation_messages[2]["reply_markup"].inline_keyboard
+        assert text_generation_messages[2]["text"] == "📄 LinkedIn / X:\n\nFaithful English translation."
+        assert "Why do faithful translations" in text_generation_messages[3]["text"]
+        draft_keyboard = text_generation_messages[3]["reply_markup"].inline_keyboard
         draft_labels = [button.text for row in draft_keyboard for button in row]
         assert draft_labels == [
             "✅ Опубликовать сейчас",
             "✏️ Редактировать руками",
             "🤖 Редактировать с AI",
+            "🧵 Пересобрать Threads с AI",
             "⏭ Другой материал",
             "⏹ Закончить итерацию",
         ]
@@ -821,6 +891,35 @@ async def main() -> None:
             "SELECT id FROM draft WHERE post_id=?",
             (text_post_id,),
         ).fetchone()["id"]
+        assert json.loads(db.get_draft(conn, draft_id)["threads_json"]) == [
+            "Why do faithful translations still fail on Threads?",
+            "Because structure matters as much as wording.",
+        ]
+
+        threadify_calls: list[str] = []
+
+        def fake_threadify(text: str):
+            threadify_calls.append(text)
+            return generator.ThreadPlanOut(
+                thread_items=["A rebuilt Threads hook.", "A rebuilt Threads payoff."],
+                notes="Hook и payoff пересобраны",
+            )
+
+        generator.threadify_post = fake_threadify
+        threadify_button = FakeQuery(f"threadify:{draft_id}")
+        await bot.on_callback(
+            SimpleNamespace(
+                callback_query=threadify_button,
+                effective_chat=SimpleNamespace(id=config.OWNER_CHAT_ID),
+            ),
+            SimpleNamespace(bot=fake),
+        )
+        assert threadify_calls == ["Faithful English translation."]
+        assert json.loads(db.get_draft(conn, draft_id)["threads_json"]) == [
+            "A rebuilt Threads hook.",
+            "A rebuilt Threads payoff.",
+        ]
+        assert "A rebuilt Threads hook." in fake.messages[-1]["text"]
 
         revise_calls: list[tuple[str, str]] = []
 
@@ -832,6 +931,10 @@ async def main() -> None:
                 x_text=revised,
                 threads_text=revised,
                 notes="Добавлена более острая шутка.",
+                thread_items=[
+                    "A sharper hook for the revised story.",
+                    "And the joke lands only in the payoff.",
+                ],
             )
 
         generator.revise_post = fake_revise
@@ -856,8 +959,11 @@ async def main() -> None:
         )
         assert instruction.responses[0]["text"].startswith("⏳ Terra редактирует")
         assert revise_calls == [("Faithful English translation.", "Добавь более острую шутку")]
-        assert len(fake.messages) == before_ai_messages + 2
-        assert fake.messages[-1]["text"] == "Faithful English translation with a sharper joke."
+        assert len(fake.messages) == before_ai_messages + 3
+        assert fake.messages[-2]["text"] == (
+            "📄 LinkedIn / X:\n\nFaithful English translation with a sharper joke."
+        )
+        assert "A sharper hook" in fake.messages[-1]["text"]
         assert db.get_draft(conn, draft_id)["ai_prompt_id"] is None
 
         finish_query = FakeQuery(f"draftskip:{draft_id}")
@@ -989,6 +1095,7 @@ async def main() -> None:
     finally:
         generator.translate_post = original_translate
         generator.revise_post = original_revise
+        generator.threadify_post = original_threadify
         publisher.publish_all = original_publish
         ingest.stage_post_for_bot = original_stage
         ingest.delete_bot_staging_messages = original_cleanup

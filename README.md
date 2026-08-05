@@ -59,9 +59,9 @@ Telethon user session ───────────────┐
 7. The ready planning draft has five actions: `✅ Готово на завтра`,
    `✏️ Редактировать руками`, `🤖 Редактировать с AI`, `⏭ Другой материал`,
    and `⏹ Закончить на сегодня`.
-8. Editing means replying with the complete replacement text. It is authoritative
-   and is **not** sent through AI again. The 1500-character AI target no longer
-   applies; manual edits may use up to 3000 characters so LinkedIn remains valid.
+8. Editing means replying with the complete replacement master text. LinkedIn/X
+   keep that text exactly and do not AI-compress it; manual edits may use up to
+   3000 characters. Terra only rebuilds the separate Threads sequence.
 9. `Готово на завтра` saves the draft durably in PostgreSQL and immediately starts
    the next iteration. If the selected Telegram source has a photo, this last step
    asks `С картинкой` or `Без картинки`; no media question appears for text-only
@@ -81,7 +81,7 @@ It opens two immediate modes:
   immediately instead of scheduling for tomorrow.
 - `✍️ Написать свой текст` stores the submitted text unchanged and without an AI
   call. The owner can publish it as-is, run `✨ Standard Transform`, edit manually,
-  edit with AI, or cancel.
+  rebuild Threads with AI, edit with AI, or cancel.
 
 ## Queue semantics
 
@@ -178,7 +178,11 @@ Terra must:
 - preserve book titles, public people, third-party companies, products,
   methodologies, quotations, and third-party biographies or transactions;
 - return strict JSON with `full_text` and a short Russian `notes` field describing
-  factual corrections that need review.
+  factual corrections that need review;
+- return a separate ordered `thread_items` sequence: a truthful hook or question,
+  one complete story/value point per card, and a final payoff/optional discussion
+  question. Every card is at most 250 characters and never cuts a sentence merely
+  to fill the limit.
 
 The response schema also enforces the 1500-character limit. If the model still
 returns a longer string, generation fails visibly instead of silently truncating it.
@@ -208,7 +212,8 @@ staging messages. If forwarding fails, it tries a bounded just-in-time download;
 if that also fails, the original Telegram link remains available.
 
 Choosing `Создать пост` on voice/audio/video asks the owner to write the full post
-manually. That text then enters the normal draft review screen without an AI call.
+manually. The LinkedIn/X master remains exactly owner-written; Terra only builds
+the separate Threads sequence.
 
 For photo sources, the bot stores Telegram's reusable Bot API `file_id` plus an
 unguessable media capability token. On the final approval step the owner chooses
@@ -216,6 +221,8 @@ with or without the photo. A selected photo is exposed to Buffer through
 `GET /api/media/{token}` on the Vercel origin; that endpoint streams the Telegram
 file without revealing `BOT_TOKEN`. Buffer receives the stable public URL in
 `assets: [{ image: { url } }]`, so LinkedIn, X, and Threads all get the same image.
+For a multi-card Threads post the asset belongs to the first `thread` item because
+Buffer treats that ordered array as the publication source of truth.
 Buffer requires a direct HTTPS image smaller than 10 MB. The media token and choice
 are durable, including across a restart between evening review and next-day publish.
 
@@ -229,7 +236,12 @@ same per-platform mutation.
 | --- | --- |
 | LinkedIn | One post containing the full master text. |
 | X | One long post when `X_PREMIUM=true`; no Buffer thread metadata. |
-| Threads | The same text split at paragraph/sentence/word boundaries into chunks of at most 500 characters. |
+| Threads | AI-authored ordered cards of at most 250 characters, sent exactly as previewed through `metadata.threads.thread`. The first card is repeated as top-level `text`, as Buffer requires. |
+
+The bot shows `📄 LinkedIn / X` and a numbered `🧵 Threads preview` separately.
+`🧵 Пересобрать Threads с AI` changes only the Threads sequence; it never changes
+the LinkedIn/X master. Legacy/raw drafts without an AI plan fall back to conservative
+sentence/paragraph splitting at 250 characters.
 
 `BUFFER_POST_MODE=shareNow` publishes immediately. `addToQueue` delegates timing to
 the Buffer channel queue. The current production environment uses `shareNow`.
@@ -323,6 +335,8 @@ Copy [`.env.example`](.env.example) to `.env` for local use. Never commit `.env`
 | `BUFFER_CHANNELS` | yes | `linkedin:id,twitter:id,threads:id`. |
 | `BUFFER_POST_MODE` | yes | `shareNow` or `addToQueue`. |
 | `MAX_POST_CHARS` | yes | Master draft limit; clamped to a maximum of 1500. |
+| `THREAD_ITEM_CHARS` | yes | Target and hard validation limit for each Threads card; `250`. |
+| `THREAD_MAX_ITEMS` | yes | Maximum ordered cards in one Threads thread; `10`. |
 | `MANUAL_MAX_POST_CHARS` | yes | Owner-edited final text limit; 3000 for LinkedIn compatibility. |
 | `X_PREMIUM` | yes | Allows one X post up to 25,000 characters; master limit still applies. |
 | `PLANNING_TIME` | yes | Single London review trigger, currently `21:00`. |
@@ -398,8 +412,9 @@ input session independently of the 21:00 planning session. Russian, English, or
 mixed input is first saved byte-for-byte with zero LLM calls. `Standard Transform`
 then explicitly runs the three-stage pipeline: translate to English, correct only
 Mike/Vahue facts, and semantically compress only when needed to fit 1500 characters.
-`✏️ Редактировать руками` accepts a complete owner-written replacement up to 3000
-characters without calling AI. `🤖 Редактировать с AI` opens a durable Terra
+`✏️ Редактировать руками` accepts a complete owner-written master up to 3000
+characters without rewriting or compressing that master; Terra then rebuilds only
+the Threads sequence. `🤖 Редактировать с AI` opens a durable Terra
 instruction loop: each reply is applied to the current version and preserves its
 current language unless the instruction requests translation.
 

@@ -1,4 +1,5 @@
 import hashlib
+import json
 import re
 import sqlite3
 import uuid
@@ -51,6 +52,7 @@ CREATE TABLE IF NOT EXISTS draft(
   linkedin_text TEXT,
   x_text TEXT,
   threads_text TEXT,
+  threads_json TEXT,
   edited_text TEXT,
   notes TEXT,
   status TEXT NOT NULL DEFAULT 'awaiting_review',
@@ -171,6 +173,7 @@ CREATE TABLE IF NOT EXISTS draft(
   linkedin_text TEXT,
   x_text TEXT,
   threads_text TEXT,
+  threads_json TEXT,
   edited_text TEXT,
   notes TEXT,
   status TEXT NOT NULL DEFAULT 'awaiting_review',
@@ -183,6 +186,7 @@ CREATE TABLE IF NOT EXISTS draft(
 CREATE INDEX IF NOT EXISTS idx_draft_tg ON draft(tg_message_id);
 ALTER TABLE draft ADD COLUMN IF NOT EXISTS ai_prompt_id BIGINT;
 ALTER TABLE draft ADD COLUMN IF NOT EXISTS include_media INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE draft ADD COLUMN IF NOT EXISTS threads_json TEXT;
 
 CREATE TABLE IF NOT EXISTS publication(
   id BIGSERIAL PRIMARY KEY,
@@ -362,6 +366,7 @@ def connect(path: str | None = None):
     conn.executescript(SCHEMA)
     _ensure_column(conn, "draft", "edit_msg_id", "INTEGER")
     _ensure_column(conn, "draft", "ai_prompt_id", "INTEGER")
+    _ensure_column(conn, "draft", "threads_json", "TEXT")
     _ensure_column(conn, "post", "media_kind", "TEXT NOT NULL DEFAULT 'text'")
     _ensure_column(conn, "post", "media_mime", "TEXT")
     _ensure_column(conn, "post", "media_size", "INTEGER")
@@ -1022,7 +1027,16 @@ def post_by_media_token(conn, access_token: str):
     ).fetchone()
 
 
-def create_draft(conn, post_id: int, model: str, linkedin: str, x: str, threads: str, notes: str) -> int:
+def create_draft(
+    conn,
+    post_id: int,
+    model: str,
+    linkedin: str,
+    x: str,
+    threads: str,
+    notes: str,
+    thread_items: list[str] | None = None,
+) -> int:
     existing = conn.execute(
         "SELECT id FROM draft WHERE post_id=? AND status NOT IN ('expired','skipped') ORDER BY id DESC LIMIT 1",
         (post_id,),
@@ -1030,9 +1044,17 @@ def create_draft(conn, post_id: int, model: str, linkedin: str, x: str, threads:
     if existing:
         return existing["id"]
     cur = conn.execute(
-        "INSERT INTO draft(post_id, model, linkedin_text, x_text, threads_text, notes) "
-        "VALUES(?,?,?,?,?,?) RETURNING id",
-        (post_id, model, linkedin, x, threads, notes),
+        "INSERT INTO draft(post_id, model, linkedin_text, x_text, threads_text, notes, threads_json) "
+        "VALUES(?,?,?,?,?,?,?) RETURNING id",
+        (
+            post_id,
+            model,
+            linkedin,
+            x,
+            threads,
+            notes,
+            json.dumps(thread_items, ensure_ascii=False) if thread_items else None,
+        ),
     )
     draft_id = cur.fetchone()["id"]
     conn.execute("UPDATE post SET status='drafted' WHERE id=?", (post_id,))
@@ -1106,10 +1128,26 @@ def set_draft_message(conn, draft_id: int, tg_message_id: int) -> None:
     conn.commit()
 
 
-def update_draft_texts(conn, draft_id: int, linkedin: str, x: str, threads: str, edited: str | None = None) -> None:
+def update_draft_texts(
+    conn,
+    draft_id: int,
+    linkedin: str,
+    x: str,
+    threads: str,
+    edited: str | None = None,
+    thread_items: list[str] | None = None,
+) -> None:
     conn.execute(
-        "UPDATE draft SET linkedin_text=?, x_text=?, threads_text=?, edited_text=? WHERE id=?",
-        (linkedin, x, threads, edited, draft_id),
+        "UPDATE draft SET linkedin_text=?, x_text=?, threads_text=?, edited_text=?, "
+        "threads_json=? WHERE id=?",
+        (
+            linkedin,
+            x,
+            threads,
+            edited,
+            json.dumps(thread_items, ensure_ascii=False) if thread_items else None,
+            draft_id,
+        ),
     )
     conn.commit()
 
@@ -1123,6 +1161,14 @@ def set_draft_include_media(conn, draft_id: int, include_media: bool) -> None:
     conn.execute(
         "UPDATE draft SET include_media=? WHERE id=?",
         (1 if include_media else 0, draft_id),
+    )
+    conn.commit()
+
+
+def set_draft_thread_items(conn, draft_id: int, thread_items: list[str]) -> None:
+    conn.execute(
+        "UPDATE draft SET threads_json=? WHERE id=?",
+        (json.dumps(thread_items, ensure_ascii=False), draft_id),
     )
     conn.commit()
 

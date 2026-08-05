@@ -46,6 +46,8 @@ BUFFER_POST_MODE = _get("BUFFER_POST_MODE") or "addToQueue"
 
 MIN_POST_CHARS = int(_get("MIN_POST_CHARS") or 1)
 MAX_POST_CHARS = max(1, min(int(_get("MAX_POST_CHARS") or 1500), 1500))
+THREAD_ITEM_CHARS = max(100, min(int(_get("THREAD_ITEM_CHARS") or 250), 500))
+THREAD_MAX_ITEMS = max(1, min(int(_get("THREAD_MAX_ITEMS") or 10), 20))
 MANUAL_MAX_POST_CHARS = max(
     MAX_POST_CHARS,
     min(int(_get("MANUAL_MAX_POST_CHARS") or 3000), 3000),

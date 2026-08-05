@@ -1,5 +1,5 @@
 import httpx
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from . import config, prompts
 
@@ -9,10 +9,17 @@ class DraftOut(BaseModel):
     x_text: str
     threads_text: str
     notes: str
+    thread_items: list[str] = Field(default_factory=list)
 
 
 class TranslationOut(BaseModel):
     full_text: str
+    thread_items: list[str]
+    notes: str
+
+
+class ThreadPlanOut(BaseModel):
+    thread_items: list[str]
     notes: str
 
 
@@ -31,13 +38,36 @@ def _validate_full_text(text: str) -> str:
     return text
 
 
-def _draft(text: str, notes: str = "") -> DraftOut:
+def _validate_thread_items(items: list[str]) -> list[str]:
+    clean = [item.strip() for item in items if item and item.strip()]
+    if not clean:
+        raise RuntimeError("Модель не вернула Threads-план")
+    if len(clean) > config.THREAD_MAX_ITEMS:
+        raise RuntimeError(
+            f"Модель вернула {len(clean)} Threads-карточек при лимите {config.THREAD_MAX_ITEMS}"
+        )
+    too_long = [
+        index
+        for index, item in enumerate(clean, start=1)
+        if len(item) > config.THREAD_ITEM_CHARS
+    ]
+    if too_long:
+        raise RuntimeError(
+            "Threads-карточки превышают лимит "
+            f"{config.THREAD_ITEM_CHARS}: {', '.join(map(str, too_long))}"
+        )
+    return clean
+
+
+def _draft(text: str, notes: str = "", thread_items: list[str] | None = None) -> DraftOut:
     text = _validate_full_text(text)
+    items = _validate_thread_items(thread_items or [])
     return DraftOut(
         linkedin_text=text,
         x_text=text,
         threads_text=text,
         notes=notes.strip(),
+        thread_items=items,
     )
 
 
@@ -73,8 +103,18 @@ def _openai_parse(system: str, user: str) -> TranslationOut:
                 "maxLength": config.MAX_POST_CHARS,
             },
             "notes": {"type": "string"},
+            "thread_items": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": config.THREAD_MAX_ITEMS,
+                "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": config.THREAD_ITEM_CHARS,
+                },
+            },
         },
-        "required": ["full_text", "notes"],
+        "required": ["full_text", "thread_items", "notes"],
         "additionalProperties": False,
     }
     r = httpx.post(
@@ -106,13 +146,92 @@ def _parse(system: str, user: str) -> TranslationOut:
     return _anthropic_parse(system, user)
 
 
+def _anthropic_thread_parse(system: str, user: str) -> ThreadPlanOut:
+    global _anthropic_client
+    if _anthropic_client is None:
+        from anthropic import Anthropic
+
+        _anthropic_client = Anthropic()
+    resp = _anthropic_client.messages.parse(
+        model=config.ANTHROPIC_MODEL,
+        max_tokens=8000,
+        system=system,
+        messages=[{"role": "user", "content": user}],
+        output_format=ThreadPlanOut,
+    )
+    if resp.stop_reason == "refusal":
+        raise RuntimeError("Модель отказалась создавать Threads-план (refusal)")
+    if resp.parsed_output is None:
+        raise RuntimeError("Модель не вернула Threads-план")
+    return resp.parsed_output
+
+
+def _openai_thread_parse(system: str, user: str) -> ThreadPlanOut:
+    if not config.OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY не задан в .env")
+    schema = {
+        "type": "object",
+        "properties": {
+            "thread_items": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": config.THREAD_MAX_ITEMS,
+                "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": config.THREAD_ITEM_CHARS,
+                },
+            },
+            "notes": {"type": "string"},
+        },
+        "required": ["thread_items", "notes"],
+        "additionalProperties": False,
+    }
+    r = httpx.post(
+        "https://api.openai.com/v1/chat/completions",
+        headers={"Authorization": f"Bearer {config.OPENAI_API_KEY}"},
+        json={
+            "model": config.OPENAI_MODEL,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "threads_plan", "strict": True, "schema": schema},
+            },
+        },
+        timeout=180,
+    )
+    r.raise_for_status()
+    msg = r.json()["choices"][0]["message"]
+    if msg.get("refusal"):
+        raise RuntimeError(f"Модель отказалась: {msg['refusal']}")
+    return ThreadPlanOut.model_validate_json(msg["content"])
+
+
+def threadify_post(text: str) -> ThreadPlanOut:
+    """Create a Threads-native sequence without changing the master post."""
+    text = text.strip()
+    if not text:
+        raise RuntimeError("Пустой текст нельзя разбить для Threads")
+    if config.llm_provider() == "openai":
+        out = _openai_thread_parse(prompts.THREAD_SYSTEM, prompts.thread_message(text))
+    else:
+        out = _anthropic_thread_parse(prompts.THREAD_SYSTEM, prompts.thread_message(text))
+    return ThreadPlanOut(
+        thread_items=_validate_thread_items(out.thread_items),
+        notes=out.notes.strip(),
+    )
+
+
 def translate_post(source: str, date: str, text: str) -> DraftOut:
-    """Translate the full source once; every platform receives the same text."""
+    """Create the LinkedIn/X master and a separate Threads-native sequence."""
     out = _parse(
         prompts.TRANSLATE_SYSTEM,
         prompts.user_message(source, date, text),
     )
-    return _draft(out.full_text, out.notes)
+    return _draft(out.full_text, out.notes, out.thread_items)
 
 
 def generate(source: str, date: str, text: str) -> DraftOut:
@@ -132,11 +251,11 @@ def revise_post(current_text: str, instruction: str) -> DraftOut:
         prompts.REVISE_SYSTEM,
         prompts.revise_message(current_text, instruction),
     )
-    return _draft(out.full_text, out.notes)
+    return _draft(out.full_text, out.notes, out.thread_items)
 
 
 def adapt(edited_text: str) -> DraftOut:
-    """An owner's English edit is authoritative and needs no second AI call."""
+    """Validate an authoritative owner master; Threads is generated separately."""
     text = edited_text.strip()
     if not text:
         raise RuntimeError("Пустой текст нельзя опубликовать")
@@ -150,4 +269,5 @@ def adapt(edited_text: str) -> DraftOut:
         x_text=text,
         threads_text=text,
         notes="",
+        thread_items=[],
     )

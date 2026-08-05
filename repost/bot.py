@@ -109,6 +109,28 @@ def _draft_body(draft) -> str:
     return (draft["edited_text"] or draft["linkedin_text"] or "").strip()
 
 
+def _thread_items_for_draft(draft) -> list[str]:
+    raw = draft["threads_json"] if "threads_json" in draft.keys() else None
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            items = [str(item).strip() for item in parsed if str(item).strip()]
+            if items:
+                return items
+        except (TypeError, ValueError):
+            LOGGER.warning("invalid threads_json draft_id=%s", draft["id"])
+    return publisher.split_for_thread(_draft_body(draft), config.THREAD_ITEM_CHARS)
+
+
+def _threads_preview(draft) -> str:
+    items = _thread_items_for_draft(draft)
+    total = len(items)
+    parts = [f"🧵 Threads preview · {total} частей · до {config.THREAD_ITEM_CHARS} символов"]
+    for index, item in enumerate(items, start=1):
+        parts.append(f"{index}/{total} · {len(item)} chars\n{item}")
+    return "\n\n".join(parts)
+
+
 def _message_media_file_id(message, media_kind: str) -> str | None:
     """Extract the reusable Bot API file_id from a delivered Telegram message."""
     if media_kind == "photo" and getattr(message, "photo", None):
@@ -144,6 +166,12 @@ def _draft_keyboard(conn, draft_id: int) -> InlineKeyboardMarkup:
                         "🤖 Редактировать с AI",
                         callback_data=f"aiedit:{draft_id}",
                     ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🧵 Пересобрать Threads с AI",
+                        callback_data=f"threadify:{draft_id}",
+                    )
                 ],
                 [
                     InlineKeyboardButton(
@@ -196,6 +224,12 @@ def _draft_keyboard(conn, draft_id: int) -> InlineKeyboardMarkup:
                     "🤖 Редактировать с AI",
                     callback_data=f"aiedit:{draft_id}",
                 ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🧵 Пересобрать Threads с AI",
+                    callback_data=f"threadify:{draft_id}",
+                )
             ],
             final_row,
         ]
@@ -322,14 +356,57 @@ async def _send_raw_parts(bot, post, *, keyboard_on_last: bool) -> int:
 
 async def _send_draft(bot, conn, draft_id: int) -> None:
     draft = db.get_draft(conn, draft_id)
+    master = _draft_body(draft)
+    for chunk in _text_chunks("📄 LinkedIn / X:\n\n" + master):
+        await _send(bot.send_message, config.OWNER_CHAT_ID, chunk)
     msg = await _send(
         bot.send_message,
         config.OWNER_CHAT_ID,
-        _draft_body(draft),
+        _threads_preview(draft),
         reply_markup=_draft_keyboard(conn, draft_id),
     )
     db.set_draft_message(conn, draft_id, msg.message_id)
     db.set_draft_status(conn, draft_id, "awaiting_review")
+
+
+async def _prepare_missing_threads(bot, conn, draft) -> bool:
+    """Build a durable AI thread plan and require the owner to review it once."""
+    if draft["threads_json"]:
+        return True
+    if not db.transition_draft(
+        conn,
+        draft["id"],
+        ("awaiting_review", "approved", "delivery_failed"),
+        "ai_editing",
+    ):
+        return False
+    await _send(
+        bot.send_message,
+        config.OWNER_CHAT_ID,
+        f"⏳ Перед финальным подтверждением Terra собирает Threads-план: каждый "
+        f"story/value point до {config.THREAD_ITEM_CHARS} символов.",
+    )
+    try:
+        plan = await asyncio.to_thread(generator.threadify_post, _draft_body(draft))
+        db.set_draft_thread_items(conn, draft["id"], plan.thread_items)
+        db.set_draft_status(conn, draft["id"], "awaiting_review")
+        await _send(
+            bot.send_message,
+            config.OWNER_CHAT_ID,
+            "🧵 Threads-план готов. Проверь карточки и нажми финальную кнопку ещё раз."
+            + (f"\n\n{plan.notes[:500]}" if plan.notes else ""),
+        )
+        await _send_draft(bot, conn, draft["id"])
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("missing Threads plan preparation failed draft_id=%s", draft["id"])
+        db.set_draft_status(conn, draft["id"], "awaiting_review")
+        await _send(
+            bot.send_message,
+            config.OWNER_CHAT_ID,
+            f"⚠️ Threads-план не создан: {_public_error_text(exc)}",
+            reply_markup=_draft_keyboard(conn, draft["id"]),
+        )
+    return False
 
 
 async def _send_generation_note(bot, draft) -> None:
@@ -765,6 +842,7 @@ async def _generate_from_post(
             out.x_text,
             out.threads_text,
             out.notes,
+            out.thread_items,
         )
         db.attach_planning_draft(conn, post["id"], draft_id)
     except Exception as exc:  # noqa: BLE001
@@ -798,13 +876,18 @@ async def _generate_from_post(
         return False
 
 
-def _texts_for_publish(draft) -> dict[str, str]:
+def _texts_for_publish(draft) -> dict[str, str | list[str]]:
     if draft["edited_text"]:
-        return {platform: draft["edited_text"] for platform in PLATFORM_LABELS}
+        master = draft["edited_text"]
+        return {
+            "linkedin": master,
+            "twitter": master,
+            "threads": _thread_items_for_draft(draft),
+        }
     return {
         "linkedin": draft["linkedin_text"] or "",
         "twitter": draft["x_text"] or "",
-        "threads": draft["threads_text"] or "",
+        "threads": _thread_items_for_draft(draft),
     }
 
 
@@ -1018,6 +1101,13 @@ async def _finalize_planning_draft(query, context, conn, draft_id: int, include_
     if draft is None:
         await query.answer("Черновик не найден", show_alert=True)
         return
+    if not draft["threads_json"]:
+        try:
+            await query.answer("Готовлю Threads-план")
+        except Exception:
+            pass
+        await _prepare_missing_threads(context.bot, conn, draft)
+        return
     if include_media:
         error = _photo_publish_error(conn, draft)
         if error:
@@ -1186,7 +1276,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             context.bot.send_message,
             config.OWNER_CHAT_ID,
             f"⏳ Пост #{post['id']}: перевожу на английский, проверяю факты и "
-            f"укладываю текст в {config.MAX_POST_CHARS} символов. Обычно это занимает 10–30 секунд.",
+            f"укладываю master в {config.MAX_POST_CHARS} символов; отдельно собираю "
+            f"Threads-карточки до {config.THREAD_ITEM_CHARS}. Обычно это занимает 10–30 секунд.",
         )
         success = await _generate_from_post(
             context.bot,
@@ -1246,6 +1337,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         if planning_slot["session_status"] != "active" or planning_slot["status"] != "reviewing":
             await query.answer("Слот уже сохранён или вечерняя сессия закрыта", show_alert=True)
+            return
+        if not draft["threads_json"]:
+            await query.answer("Готовлю Threads-план")
+            await _prepare_missing_threads(context.bot, conn, draft)
             return
         if _draft_has_photo(conn, draft):
             await query.answer("Выбери вариант картинки")
@@ -1307,7 +1402,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             f"{result['target']}; готовые посты останутся в расписании, остальные слоты отменены.",
         )
         return
-    if action in {"edit", "aiedit"}:
+    if action in {"edit", "aiedit", "threadify"}:
         planning_slot = db.planning_slot_for_draft(conn, object_id)
         if planning_slot is not None and planning_slot["status"] != "reviewing":
             await query.answer("Пост уже сохранён в расписание; редактирование закрыто", show_alert=True)
@@ -1322,7 +1417,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    if action in {"draftskip", "draftnext", "plandiscard", "edit", "aiedit", "transform"} and _ok_platforms(
+    if action in {
+        "draftskip",
+        "draftnext",
+        "plandiscard",
+        "edit",
+        "aiedit",
+        "threadify",
+        "transform",
+    } and _ok_platforms(
         conn,
         object_id,
     ):
@@ -1418,6 +1521,40 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             ),
         )
         db.set_ai_prompt(conn, object_id, prompt.message_id)
+    elif action == "threadify":
+        if not db.transition_draft(
+            conn,
+            object_id,
+            ("awaiting_review", "approved", "delivery_failed"),
+            "ai_editing",
+        ):
+            return
+        await _send(
+            context.bot.send_message,
+            config.OWNER_CHAT_ID,
+            f"⏳ Terra пересобирает Threads-план для поста #{object_id}: цельный hook → "
+            f"story/value points → payoff, каждый до {config.THREAD_ITEM_CHARS} символов.",
+        )
+        try:
+            plan = await asyncio.to_thread(generator.threadify_post, _draft_body(draft))
+            db.set_draft_thread_items(conn, object_id, plan.thread_items)
+            db.set_draft_status(conn, object_id, "awaiting_review")
+            await _send(
+                context.bot.send_message,
+                config.OWNER_CHAT_ID,
+                "🧵 Threads-план готов."
+                + (f"\n\n{plan.notes[:500]}" if plan.notes else ""),
+            )
+            await _send_draft(context.bot, conn, object_id)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("Threads regeneration failed draft_id=%s", object_id)
+            db.set_draft_status(conn, object_id, "awaiting_review")
+            await _send(
+                context.bot.send_message,
+                config.OWNER_CHAT_ID,
+                f"⚠️ Threads-план не обновлён: {_public_error_text(exc)}",
+                reply_markup=_draft_keyboard(conn, object_id),
+            )
     elif action == "transform":
         post = db.get_post(conn, draft["post_id"])
         if post is None or post["media_kind"] != "manual":
@@ -1438,7 +1575,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             context.bot.send_message,
             config.OWNER_CHAT_ID,
             f"⏳ Standard Transform для поста #{object_id}: English → факты Mike/Vahue → "
-            f"смысловое сжатие только при необходимости до {config.MAX_POST_CHARS}. "
+            f"смысловое сжатие только при необходимости до {config.MAX_POST_CHARS} → "
+            f"Threads-план по {config.THREAD_ITEM_CHARS} символов. "
             "Обычно это занимает 10–30 секунд.",
         )
         try:
@@ -1455,6 +1593,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 out.x_text,
                 out.threads_text,
                 None,
+                out.thread_items,
             )
             db.set_draft_status(conn, object_id, "awaiting_review")
             transformed = db.get_draft(conn, object_id)
@@ -1471,6 +1610,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 reply_markup=_draft_keyboard(conn, object_id),
             )
     elif action == "pub":
+        if not await _prepare_missing_threads(context.bot, conn, draft):
+            return
         if _draft_has_photo(conn, draft):
             await query.edit_message_reply_markup(
                 _media_choice_keyboard(object_id, planning=False)
@@ -1478,6 +1619,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         else:
             await _publish(context.bot, conn, object_id)
     elif action in {"pubwith", "pubwithout"}:
+        if not await _prepare_missing_threads(context.bot, conn, draft):
+            return
         include_media = action == "pubwith"
         if include_media:
             error = _photo_publish_error(conn, draft)
@@ -1520,7 +1663,8 @@ async def _apply_ai_instruction(update, context, conn, draft, instruction: str) 
         return
     await update.message.reply_text(
         f"⏳ Terra редактирует пост #{draft['id']} по твоей инструкции и проверяет "
-        f"лимит {config.MAX_POST_CHARS}. Обычно это занимает 10–30 секунд."
+        f"лимит {config.MAX_POST_CHARS}; затем обновляет Threads-план. "
+        "Обычно это занимает 10–30 секунд."
     )
     current_text = _draft_body(draft)
     try:
@@ -1532,6 +1676,7 @@ async def _apply_ai_instruction(update, context, conn, draft, instruction: str) 
             out.x_text,
             out.threads_text,
             out.linkedin_text,
+            out.thread_items,
         )
         db.set_draft_status(conn, draft["id"], "awaiting_review")
         db.set_ai_prompt(conn, draft["id"], None)
@@ -1641,7 +1786,7 @@ async def on_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         else:
             await update.message.reply_text(
                 f"⏳ Текст принят: {len(text)}/{config.MANUAL_MAX_POST_CHARS}. "
-                "Обновляю черновик без повторного AI-сжатия…"
+                "Обновляю LinkedIn/X без AI-сжатия и отдельно пересобираю Threads-план…"
             )
 
         if post is not None:
@@ -1675,6 +1820,7 @@ async def on_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     )
                 else:
                     out = await asyncio.to_thread(generator.adapt, text)
+                    thread_plan = await asyncio.to_thread(generator.threadify_post, text)
                     draft_id = db.create_draft(
                         conn,
                         post["id"],
@@ -1683,6 +1829,7 @@ async def on_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                         out.x_text,
                         out.threads_text,
                         out.notes,
+                        thread_plan.thread_items,
                     )
                 db.attach_planning_draft(conn, post["id"], draft_id)
             except Exception as exc:  # noqa: BLE001
@@ -1728,6 +1875,7 @@ async def on_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         try:
             out = await asyncio.to_thread(generator.adapt, text)
+            thread_plan = await asyncio.to_thread(generator.threadify_post, text)
             db.update_draft_texts(
                 conn,
                 draft["id"],
@@ -1735,6 +1883,7 @@ async def on_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 out.x_text,
                 out.threads_text,
                 text,
+                thread_plan.thread_items,
             )
             db.set_draft_status(conn, draft["id"], "awaiting_review")
             await _send_draft(context.bot, conn, draft["id"])

@@ -31,6 +31,8 @@ BUFFER_CHANNELS
 BUFFER_POST_MODE=shareNow
 AUTHOR_FACTS
 MAX_POST_CHARS=1500
+THREAD_ITEM_CHARS=250
+THREAD_MAX_ITEMS=10
 MANUAL_MAX_POST_CHARS=3000
 X_PREMIUM=true
 PLANNING_TIME=21:00
@@ -104,7 +106,10 @@ curl -fsS -X POST -H "Authorization: Bearer $CRON_SECRET" \
 - один master-text до 1500 Unicode-символов создаётся через `gpt-5.6-terra`;
 - LinkedIn получает его одним постом;
 - X Premium получает его одним long post без Buffer thread metadata;
-- Threads получает тот же текст, разбитый Buffer на сообщения до 500 символов.
+- Terra отдельно создаёт связный Threads-план: hook/question, один законченный
+  story/value point на карточку и payoff; каждая карточка до 250 символов;
+- Buffer получает точный массив через `metadata.threads.thread`, включая root-card
+  первым элементом; top-level `text` повторяет root-card;
 - если владелец выбрал исходное фото, все три мутации Buffer получают один
   `assets.image.url` вида `$PUBLIC_BASE_URL/api/media/<random-token>`;
 - media-endpoint по запросу получает файл из Telegram по сохранённому `file_id` и

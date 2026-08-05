@@ -1653,3 +1653,55 @@ def stats(conn) -> dict:
     for row in conn.execute("SELECT status, COUNT(*) n FROM planning_slot GROUP BY status"):
         out[f"planning:{row['status']}"] = row["n"]
     return out
+
+
+def content_pool_progress(conn) -> dict[str, int]:
+    """Return an exact partition of imported, eligible source materials.
+
+    Manual owner posts and text messages rejected as ``short`` were never part
+    of the candidate pool. A material counts as sent only after its raw card was
+    successfully delivered to the owner in Telegram. This makes the invariant
+    ``remaining + sent == total`` explicit and stable across later draft/post
+    status transitions.
+    """
+    pool_filter = (
+        "p.media_kind<>'manual' AND p.status<>'short' "
+        # Double ``%`` is a literal percent for psycopg's query parser and is
+        # equivalent to a single LIKE wildcard in SQLite.
+        "AND s.username NOT LIKE 'manual:%%'"
+    )
+    total = conn.execute(
+        "SELECT COUNT(*) n FROM post p JOIN source s ON s.id=p.source_id WHERE "
+        + pool_filter
+    ).fetchone()["n"]
+    sent = conn.execute(
+        "SELECT COUNT(DISTINCT p.id) n FROM post p "
+        "JOIN source s ON s.id=p.source_id "
+        "JOIN delivery_item di ON di.post_id=p.id AND di.status='sent' "
+        "WHERE " + pool_filter
+    ).fetchone()["n"]
+    return {
+        "total": int(total),
+        "remaining": int(total) - int(sent),
+        "sent": int(sent),
+    }
+
+
+def planning_status_for_date(conn, target_date: str):
+    """Return the latest plan and all ordered slots for one publication date."""
+    session = conn.execute(
+        "SELECT * FROM planning_session WHERE target_date=? ORDER BY id DESC LIMIT 1",
+        (target_date,),
+    ).fetchone()
+    if session is None:
+        return None, []
+    slots = conn.execute(
+        "SELECT ps.*, d.status draft_status, d.edited_text, d.linkedin_text, "
+        "p.status post_status "
+        "FROM planning_slot ps "
+        "LEFT JOIN draft d ON d.id=ps.draft_id "
+        "LEFT JOIN post p ON p.id=ps.post_id "
+        "WHERE ps.session_id=? ORDER BY ps.position",
+        (session["id"],),
+    ).fetchall()
+    return session, slots

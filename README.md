@@ -41,6 +41,15 @@ Telethon user session ───────────────┐
 
 ## What the production bot does
 
+### Bot voice
+
+Operational messages use a deliberately warm, caring co-author voice: gentle
+encouragement, hearts, clear reassurance that durable state is safe, and occasional
+playful references to Mike as Neo who has made the Matrix work for him. The tone
+never modifies source material, generated drafts, publication text, error details,
+or database state. The completed 3/3 planning session gets the strongest affirmation
+and explicitly invites the owner to rest while the next-day automation takes over.
+
 1. A dedicated Telegram user account reads the 49 public channels listed in
    [`sources.txt`](sources.txt). The list is the current snapshot of the Founders
    Pack: <https://t.me/addlist/efNe-fsXVp1lYWZi>.
@@ -65,7 +74,8 @@ Telethon user session ───────────────┐
 9. `Готово на завтра` saves the draft durably in PostgreSQL and immediately starts
    the next iteration. If the selected Telegram source has a photo, this last step
    asks `С картинкой` or `Без картинки`; no media question appears for text-only
-   sources. After 3/3, the evening session closes without publishing yet.
+   sources. After 3/3, the evening session closes without publishing yet and sends
+   a warm completion/Neo affirmation.
 10. On the next day the three drafts publish automatically through Buffer at
     09:00, 14:00, and 19:00 London time. Successful platforms are recorded
     individually, so a retry targets only failed platforms. Every slot sends one
@@ -73,6 +83,13 @@ Telethon user session ───────────────┐
     failure/unknown-state warning.
 11. `Закончить на сегодня` stops the remaining evening iterations. Drafts already
     marked ready remain scheduled; unfinished slots are cancelled.
+
+The persistent `📊 Статус` button shows an auditable content-pool partition
+(`total = remaining + already sent to the owner`) and today's three-slot plan. Each
+planned post is represented by its London publication time, state, and first
+sentence. Missing drafts, failed/unknown slots, overdue ready posts, invalid times,
+and inconsistent plan sizes are surfaced in a dedicated error section; the status
+handler is read-only and reports database failures without changing state.
 
 The persistent `✍️ Создать пост` action remains independent from the evening batch.
 It opens two immediate modes:
@@ -419,9 +436,9 @@ instruction loop: each reply is applied to the current version and preserves its
 current language unless the instruction requests translation.
 
 Telegram's Bot API cannot prefill arbitrary text into the user's composer. The
-manual-edit ForceReply therefore includes the complete current text in the same
-message and opens the reply field, which is the closest native in-chat behavior
-without a separate Mini App editor.
+manual-edit action therefore sends only `waiting for edited text:` as a ForceReply
+prompt. The owner replies with the complete replacement text; the bot does not
+repeat the current draft before input.
 
 ## Production deployment
 
@@ -512,7 +529,7 @@ vercel logs --environment production --since 1h --expand --no-branch
 ## Non-goals and intentional limitations
 
 - Telegram cannot prefill arbitrary long text into the native composer; manual edit
-  therefore uses ForceReply with the full current text shown above the input field.
+  therefore uses a short ForceReply prompt and waits for the complete replacement.
 - Media is not transcribed or summarized.
 - Source membership is controlled by `sources.txt`; the Telegram chat-folder link is
   documentation, not dynamically parsed on every run.

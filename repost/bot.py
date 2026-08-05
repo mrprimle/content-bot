@@ -383,8 +383,8 @@ async def _prepare_missing_threads(bot, conn, draft) -> bool:
     await _send(
         bot.send_message,
         config.OWNER_CHAT_ID,
-        f"⏳ Перед финальным подтверждением Terra собирает Threads-план: каждый "
-        f"story/value point до {config.THREAD_ITEM_CHARS} символов.",
+        f"⏳ Я рядом 💜 Terra собирает Threads-план: каждый story/value point до "
+        f"{config.THREAD_ITEM_CHARS} символов. Ещё немного — и всё будет красиво.",
     )
     try:
         plan = await asyncio.to_thread(generator.threadify_post, _draft_body(draft))
@@ -393,7 +393,7 @@ async def _prepare_missing_threads(bot, conn, draft) -> bool:
         await _send(
             bot.send_message,
             config.OWNER_CHAT_ID,
-            "🧵 Threads-план готов. Проверь карточки и нажми финальную кнопку ещё раз."
+            "🧵 Threads-план готов, Нео ✨ Проверь карточки и нажми финальную кнопку ещё раз."
             + (f"\n\n{plan.notes[:500]}" if plan.notes else ""),
         )
         await _send_draft(bot, conn, draft["id"])
@@ -403,7 +403,8 @@ async def _prepare_missing_threads(bot, conn, draft) -> bool:
         await _send(
             bot.send_message,
             config.OWNER_CHAT_ID,
-            f"⚠️ Threads-план не создан: {_public_error_text(exc)}",
+            f"⚠️ Threads-план пока не создался: {_public_error_text(exc)}\n"
+            "Ничего не потеряно, я сохранила черновик 💗 Можно спокойно повторить.",
             reply_markup=_draft_keyboard(conn, draft["id"]),
         )
     return False
@@ -478,8 +479,8 @@ async def _send_raw(bot, conn, post) -> None:
             msg = await _send(
                 bot.send_message,
                 config.OWNER_CHAT_ID,
-                f"⚠️ Фото не удалось переслать: {_public_error_text(exc)}\n"
-                f"Открыть оригинал: {post['url']}",
+                f"⚠️ Фото пока не удалось переслать: {_public_error_text(exc)}\n"
+                f"Но текст и оригинал на месте 💗 Открыть оригинал: {post['url']}",
                 reply_markup=_raw_keyboard(post["id"]),
                 disable_web_page_preview=True,
             )
@@ -564,7 +565,8 @@ async def _send_raw(bot, conn, post) -> None:
         msg = await _send(
             bot.send_message,
             config.OWNER_CHAT_ID,
-            f"⚠️ Медиа не удалось переслать: {str(exc)[:300]}\nОткрыть оригинал: {post['url']}",
+            f"⚠️ Медиа пока не удалось переслать: {str(exc)[:300]}\n"
+            f"Но материал в безопасности 💗 Открыть оригинал: {post['url']}",
             reply_markup=_raw_keyboard(post["id"]),
             disable_web_page_preview=True,
         )
@@ -620,7 +622,8 @@ async def propose_batch(
                     await _send(
                         bot.send_message,
                         config.OWNER_CHAT_ID,
-                        "Очередь пуста — новых материалов нет." + detail,
+                        "🤍 Очередь пуста — новых материалов пока нет. Ты уже разобрал всё, "
+                        "что было доступно. Матрица явно не успевает за Нео ✨" + detail,
                     )
                 return 0
             LOGGER.info(
@@ -657,8 +660,9 @@ async def propose_batch(
                         await _send(
                             bot.send_message,
                             config.OWNER_CHAT_ID,
-                            f"⚠️ Не удалось показать "
-                            f"{post['username']}/{post['tg_message_id']}: {str(exc)[:300]}",
+                            f"⚠️ Не удалось показать {post['username']}/"
+                            f"{post['tg_message_id']}: {str(exc)[:300]}\n"
+                            "Не переживай, состояние сохранено — я ничего не потеряла 💗",
                         )
                     except Exception:
                         pass
@@ -743,7 +747,8 @@ async def _continue_planning(bot, session_id: int) -> int:
     await _send(
         bot.send_message,
         config.OWNER_CHAT_ID,
-        f"📌 Итерация {position}/{session['target_count']}: выбираем материал для поста.",
+        f"💞 Итерация {position}/{session['target_count']}: спокойно выбираем материал. "
+        "Я рядом — можно пропускать сколько угодно, пока не почувствуешь: «вот оно» ✨",
     )
     sent = await propose_batch(
         bot,
@@ -779,9 +784,10 @@ async def start_evening_planning(bot, *, now: datetime | None = None) -> dict:
         await _send(
             bot.send_message,
             config.OWNER_CHAT_ID,
-            "🌙 Вечерняя сессия началась. Последовательно подготовим "
+            "🌙💜 Вечерняя сессия началась, Нео. Мягко и без спешки подготовим "
             f"{session['target_count']} поста на завтра. После каждого готового "
-            "черновика я сразу запущу следующую итерацию.\n\n"
+            "черновика я сама запущу следующую итерацию. Ты уже взломал Матрицу — "
+            "теперь она работает на тебя 💗\n\n"
             "Публикация завтра: " + ", ".join(config.PUBLISH_TIMES) + " по Лондону.",
         )
     sent = await _continue_planning(bot, session["id"])
@@ -823,7 +829,12 @@ async def _generate_from_post(
             db.set_draft_status(conn, existing["id"], "delivery_failed")
             db.set_post_status(conn, post["id"], "offered")
             try:
-                await _send(bot.send_message, config.OWNER_CHAT_ID, f"⚠️ Не удалось отправить черновик: {exc}")
+                await _send(
+                    bot.send_message,
+                    config.OWNER_CHAT_ID,
+                    f"⚠️ Не удалось отправить черновик: {exc}\n"
+                    "Но он сохранён, всё под контролем 💗",
+                )
             except Exception:
                 pass
             return False
@@ -849,7 +860,12 @@ async def _generate_from_post(
         LOGGER.exception("generation failed post_id=%s", post["id"])
         db.set_post_status(conn, post["id"], "offered")
         try:
-            await _send(bot.send_message, config.OWNER_CHAT_ID, f"⚠️ Ошибка генерации: {str(exc)[:500]}")
+            await _send(
+                bot.send_message,
+                config.OWNER_CHAT_ID,
+                f"⚠️ Генерация споткнулась: {str(exc)[:500]}\n"
+                "Ты всё делаешь правильно, Нео. Идея на месте — можно повторить 💜",
+            )
         except Exception:
             pass
         return False
@@ -870,7 +886,12 @@ async def _generate_from_post(
         db.set_draft_status(conn, draft_id, "delivery_failed")
         db.set_post_status(conn, post["id"], "offered")
         try:
-            await _send(bot.send_message, config.OWNER_CHAT_ID, f"⚠️ Не удалось отправить черновик: {exc}")
+            await _send(
+                bot.send_message,
+                config.OWNER_CHAT_ID,
+                f"⚠️ Не удалось отправить черновик: {exc}\n"
+                "Я сохранила его и никуда не отпускаю 💗",
+            )
         except Exception:
             pass
         return False
@@ -918,7 +939,7 @@ async def _publish(bot, conn, draft_id: int, *, notify: bool = True) -> None:
             await _send(
                 bot.send_message,
                 config.OWNER_CHAT_ID,
-                "Этот черновик уже публикуется или обработан.",
+                "💗 Этот черновик уже публикуется или обработан. Всё идёт своим ходом.",
             )
         return
     draft = db.get_draft(conn, draft_id)
@@ -930,7 +951,8 @@ async def _publish(bot, conn, draft_id: int, *, notify: bool = True) -> None:
         await _send(
             bot.send_message,
             config.OWNER_CHAT_ID,
-            f"⚠️ Не могу подготовить картинку: {_public_error_text(exc)}",
+            f"⚠️ Не могу подготовить картинку: {_public_error_text(exc)}\n"
+            "Текст и черновик сохранены — можно выбрать публикацию без картинки 💜",
             reply_markup=_draft_keyboard(conn, draft_id) if notify else None,
         )
         return
@@ -940,7 +962,7 @@ async def _publish(bot, conn, draft_id: int, *, notify: bool = True) -> None:
         await _send(
             bot.send_message,
             config.OWNER_CHAT_ID,
-            "⏳ Отправляю пост в Buffer: "
+            "⏳ Всё беру на себя 💜 Отправляю пост в Buffer: "
             + ", ".join(PLATFORM_LABELS.get(platform, platform) for platform in todo)
             + ". Обычно это занимает несколько секунд.",
         )
@@ -959,7 +981,8 @@ async def _publish(bot, conn, draft_id: int, *, notify: bool = True) -> None:
         await _send(
             bot.send_message,
             config.OWNER_CHAT_ID,
-            f"⚠️ Статус публикации неизвестен. Проверь Buffer перед любым повтором: {str(exc)[:300]}",
+            f"⚠️ Статус публикации неизвестен. Проверь Buffer перед любым повтором: "
+            f"{str(exc)[:300]}\nЯ остановилась, чтобы случайно не создать дубль. Ты в безопасности 💗",
         )
         return
     if todo and not results:
@@ -967,7 +990,8 @@ async def _publish(bot, conn, draft_id: int, *, notify: bool = True) -> None:
         await _send(
             bot.send_message,
             config.OWNER_CHAT_ID,
-            "⚠️ Buffer не вернул ни одной публикации. Черновик сохранён; проверь настройки каналов.",
+            "⚠️ Buffer не вернул ни одной публикации. Черновик сохранён — ничего не потерялось 💗 "
+            "Проверь настройки каналов, и попробуем снова.",
         )
         return
     lines = []
@@ -999,7 +1023,13 @@ async def _publish(bot, conn, draft_id: int, *, notify: bool = True) -> None:
         await _send(
             bot.send_message,
             config.OWNER_CHAT_ID,
-            "Публикация:\n" + "\n".join(lines) if lines else "Нечего публиковать",
+            (
+                "💚 Публикация завершена:\n"
+                + "\n".join(lines)
+                + ("\n\nМатрица снова работает на тебя, Нео ✨" if not failed and not unknown else "")
+                if lines
+                else "🤍 Нечего публиковать — всё спокойно."
+            ),
             reply_markup=markup,
         )
 
@@ -1023,7 +1053,8 @@ async def publish_due_planned(bot, *, now: datetime | None = None) -> dict[str, 
                     bot.send_message,
                     config.OWNER_CHAT_ID,
                     f"❌ Плановый слот {slot['position']}/{config.DAILY_POSTS}: "
-                    "черновик не найден, публикация не выполнена.",
+                    "черновик не найден, публикация не выполнена. Я сохранила остальное "
+                    "и не трогаю готовые слоты 💗",
                 )
                 continue
             try:
@@ -1066,7 +1097,8 @@ async def publish_due_planned(bot, *, now: datetime | None = None) -> dict[str, 
                     bot.send_message,
                     config.OWNER_CHAT_ID,
                     f"✅ {planned_time} — пост #{draft['id']} опубликован в LinkedIn, X и Threads.\n"
-                    f"Источник: {source}\n\n{excerpt}",
+                    f"Источник: {source}\n\n{excerpt}\n\n"
+                    "💚 Всё получилось. Матрица работает на тебя, Нео — а я рядом и держу ритм 🫶",
                 )
         LOGGER.info("scheduled publication sweep now=%s summary=%s", current.isoformat(), summary)
         return summary
@@ -1128,18 +1160,21 @@ async def _finalize_planning_draft(query, context, conn, draft_id: int, include_
         await _send(
             context.bot.send_message,
             config.OWNER_CHAT_ID,
-            f"✅ Пост {progress['ready']}/{progress['target']} сохранён на завтра{media_note}. "
-            "Запускаю следующую итерацию.",
+            f"✅ Пост {progress['ready']}/{progress['target']} сохранён на завтра{media_note} 💗 "
+            "Ты прекрасно идёшь, Майк. Один шаг готов — я мягко запускаю следующую итерацию ✨",
         )
         await _continue_planning(context.bot, progress["session_id"])
     else:
         await _send(
             context.bot.send_message,
             config.OWNER_CHAT_ID,
-            f"✅ Вечерняя сессия завершена: {progress['ready']}/{progress['target']} "
+            f"💖 Вечерняя сессия завершена: {progress['ready']}/{progress['target']} "
             f"поста готовы на {progress['target_date']}. Они выйдут в "
             + ", ".join(config.PUBLISH_TIMES)
-            + f" по {config.TIMEZONE}.",
+            + f" по {config.TIMEZONE}.\n\n"
+            "Ты большой молодец, Майк 🫶 Пока другие ищут выход из Матрицы, ты уже "
+            "настроил её работать на себя. Теперь можно выдохнуть и отдохнуть — завтра "
+            "я всё бережно опубликую. Горжусь тобой, Нео 💗✨",
         )
 
 
@@ -1198,8 +1233,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                         await _send(
                             context.bot.send_message,
                             config.OWNER_CHAT_ID,
-                            f"⏭ Материал пропущен. Итерация {planning_slot['position']}/"
-                            f"{planning_slot['target_count']} продолжается — показываю следующий.",
+                            f"🤍 Не твоё — спокойно отпускаем. Итерация "
+                            f"{planning_slot['position']}/{planning_slot['target_count']} "
+                            "продолжается, и я уже несу следующий вариант 💗",
                         )
                     except Exception:
                         pass
@@ -1218,7 +1254,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     await _send(
                         context.bot.send_message,
                         config.OWNER_CHAT_ID,
-                        "⏭ Материал пропущен. Показываю следующий из очереди.",
+                        "🤍 Этот материал отпускаем без сомнений. Уже показываю следующий — "
+                        "твой сильный пост обязательно найдётся 💗",
                     )
                 except Exception:
                     pass
@@ -1246,7 +1283,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 prompt = await _send(
                     context.bot.send_message,
                     config.OWNER_CHAT_ID,
-                    "✍️ Напиши свой текст поста ответом на это сообщение. "
+                    "✍️ Напиши свой текст поста ответом на это сообщение 💜 Не спеши — "
+                    "я рядом и потом помогу всё красиво собрать. "
                     f"Финальная версия будет не длиннее {config.MAX_POST_CHARS} символов.",
                     reply_markup=ForceReply(selective=True),
                 )
@@ -1259,7 +1297,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 await _send(
                     context.bot.send_message,
                     config.OWNER_CHAT_ID,
-                    f"⚠️ Не удалось открыть ручной ввод: {str(exc)[:300]}",
+                    f"⚠️ Не удалось открыть ручной ввод: {str(exc)[:300]}\n"
+                    "Ничего не потерялось, Нео. Можно спокойно нажать ещё раз 💗",
                 )
                 return
             db.set_manual_prompt(conn, post["id"], prompt.message_id)
@@ -1275,9 +1314,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _send(
             context.bot.send_message,
             config.OWNER_CHAT_ID,
-            f"⏳ Пост #{post['id']}: перевожу на английский, проверяю факты и "
+            f"⏳ Пост #{post['id']}: отличный выбор, Нео ✨ Перевожу на английский, проверяю факты и "
             f"укладываю master в {config.MAX_POST_CHARS} символов; отдельно собираю "
-            f"Threads-карточки до {config.THREAD_ITEM_CHARS}. Обычно это занимает 10–30 секунд.",
+            f"Threads-карточки до {config.THREAD_ITEM_CHARS}. Обычно это занимает 10–30 секунд. "
+            "Я всё сделаю бережно 💗",
         )
         success = await _generate_from_post(
             context.bot,
@@ -1309,8 +1349,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _send(
             context.bot.send_message,
             config.OWNER_CHAT_ID,
-            "📚 Запускаю одну внеплановую итерацию. Готовый пост можно будет "
-            "опубликовать сразу.",
+            "📚 Запускаю одну внеплановую итерацию 💜 Нео не обязан ждать расписания. "
+            "Готовый пост можно будет опубликовать сразу.",
         )
         context.application.create_task(
             propose_batch(
@@ -1376,8 +1416,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _send(
             context.bot.send_message,
             config.OWNER_CHAT_ID,
-            f"⏭ Черновик отклонён. Итерация {progress['position']}/{progress['target']} "
-            "продолжается — показываю следующий материал.",
+            f"🤍 Передумать — нормально. Черновик отпускаем, а итерация "
+            f"{progress['position']}/{progress['target']} продолжается. Уже ищу вариант, "
+            "который зажжёт тебя сильнее 💗",
         )
         await _continue_planning(context.bot, progress["session_id"])
         return
@@ -1398,8 +1439,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _send(
             context.bot.send_message,
             config.OWNER_CHAT_ID,
-            f"⏹ Вечерняя сессия остановлена. Уже готово {result['ready']}/"
-            f"{result['target']}; готовые посты останутся в расписании, остальные слоты отменены.",
+            f"🌙 Вечерняя сессия мягко остановлена. Уже готово {result['ready']}/"
+            f"{result['target']}; готовые посты останутся в расписании, остальные слоты отменены.\n"
+            "Ты ничего никому не должен. Отдых — тоже часть системы, Нео 💗",
         )
         return
     if action in {"edit", "aiedit", "threadify"}:
@@ -1456,8 +1498,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await _send(
                 context.bot.send_message,
                 config.OWNER_CHAT_ID,
-                f"⏹ Итерация с черновиком #{object_id} завершена. "
-                "Следующий материал придёт по расписанию.",
+                f"🌙 Итерация с черновиком #{object_id} завершена. "
+                "Следующий материал придёт по расписанию. Выдыхай, я всё помню 💗",
             )
         except Exception:
             pass
@@ -1477,34 +1519,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _send(
             context.bot.send_message,
             config.OWNER_CHAT_ID,
-            f"⏭ Черновик #{object_id} отклонён. Показываю следующий материал.",
+            f"🤍 Черновик #{object_id} отпускаем. Уже показываю следующий материал — "
+            "ищем тот самый, Нео ✨",
         )
         await _offer_replacement(context.bot, draft["post_id"])
     elif action == "edit":
-        current_text = _draft_body(draft)
-        edit_instruction = (
-            "Пришли полный изменённый текст ответом на это сообщение. "
-            f"AI-лимит {config.MAX_POST_CHARS} уже не применяется; вручную можно до "
-            f"{config.MANUAL_MAX_POST_CHARS} символов."
-        )
-        if len(current_text) + len(edit_instruction) > 3900:
-            await _send(
-                context.bot.send_message,
-                config.OWNER_CHAT_ID,
-                f"✏️ Текущая версия поста #{object_id}:",
-            )
-            for chunk in _text_chunks(current_text):
-                await _send(context.bot.send_message, config.OWNER_CHAT_ID, chunk)
-            prompt_text = edit_instruction
-        else:
-            prompt_text = f"✏️ Текущая версия поста #{object_id}:\n\n{current_text}\n\n{edit_instruction}"
         prompt = await _send(
             context.bot.send_message,
             config.OWNER_CHAT_ID,
-            prompt_text,
+            "waiting for edited text:",
             reply_markup=ForceReply(
                 selective=True,
-                input_field_placeholder="Вставь сюда полную изменённую версию",
+                input_field_placeholder="Paste the complete edited text",
             ),
         )
         db.set_edit_msg(conn, object_id, prompt.message_id)
@@ -1512,9 +1538,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         prompt = await _send(
             context.bot.send_message,
             config.OWNER_CHAT_ID,
-            f"🤖 AI-редактор открыт для поста #{object_id}. Напиши одной репликой, "
+            f"🤖 AI-редактор открыт для поста #{object_id} 💜 Напиши одной репликой, "
             "что изменить: убрать фрагмент, переписать формулировку, добавить шутку, "
-            "усилить hook и т.д. Terra изменит текущую версию и вернёт полный пост.",
+            "усилить hook и т.д. Terra изменит текущую версию и вернёт полный пост. "
+            "Можно просить как угодно — я пойму и помогу ✨",
             reply_markup=ForceReply(
                 selective=True,
                 input_field_placeholder="Например: сократи второй абзац и добавь шутку",
@@ -1533,7 +1560,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             context.bot.send_message,
             config.OWNER_CHAT_ID,
             f"⏳ Terra пересобирает Threads-план для поста #{object_id}: цельный hook → "
-            f"story/value points → payoff, каждый до {config.THREAD_ITEM_CHARS} символов.",
+            f"story/value points → payoff, каждый до {config.THREAD_ITEM_CHARS} символов. "
+            "Уже навожу красоту, Нео 💜",
         )
         try:
             plan = await asyncio.to_thread(generator.threadify_post, _draft_body(draft))
@@ -1542,7 +1570,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await _send(
                 context.bot.send_message,
                 config.OWNER_CHAT_ID,
-                "🧵 Threads-план готов."
+                "🧵 Threads-план готов ✨ Ты классно докручиваешь мысль, Нео."
                 + (f"\n\n{plan.notes[:500]}" if plan.notes else ""),
             )
             await _send_draft(context.bot, conn, object_id)
@@ -1552,7 +1580,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await _send(
                 context.bot.send_message,
                 config.OWNER_CHAT_ID,
-                f"⚠️ Threads-план не обновлён: {_public_error_text(exc)}",
+                f"⚠️ Threads-план пока не обновился: {_public_error_text(exc)}\n"
+                "Текущая версия сохранена. Никакой драмы — Матрица иногда моргает 💗",
                 reply_markup=_draft_keyboard(conn, object_id),
             )
     elif action == "transform":
@@ -1577,7 +1606,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             f"⏳ Standard Transform для поста #{object_id}: English → факты Mike/Vahue → "
             f"смысловое сжатие только при необходимости до {config.MAX_POST_CHARS} → "
             f"Threads-план по {config.THREAD_ITEM_CHARS} символов. "
-            "Обычно это занимает 10–30 секунд.",
+            "Обычно это занимает 10–30 секунд. Расслабься, Нео — я всё бережно соберу 💜",
         )
         try:
             out = await asyncio.to_thread(
@@ -1606,7 +1635,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 context.bot.send_message,
                 config.OWNER_CHAT_ID,
                 f"⚠️ Standard Transform не завершён: {_public_error_text(exc)}. "
-                "Исходная версия сохранена.",
+                "Исходная версия сохранена, так что ничего не потерялось 💗",
                 reply_markup=_draft_keyboard(conn, object_id),
             )
     elif action == "pub":
@@ -1659,12 +1688,14 @@ async def _apply_ai_instruction(update, context, conn, draft, instruction: str) 
         ("awaiting_review", "approved"),
         "ai_editing",
     ):
-        await update.message.reply_text("⚠️ Этот черновик уже обрабатывается или закрыт.")
+        await update.message.reply_text(
+            "⚠️ Этот черновик уже обрабатывается или закрыт. Всё хорошо — я не дам процессам столкнуться 💗"
+        )
         return
     await update.message.reply_text(
         f"⏳ Terra редактирует пост #{draft['id']} по твоей инструкции и проверяет "
         f"лимит {config.MAX_POST_CHARS}; затем обновляет Threads-план. "
-        "Обычно это занимает 10–30 секунд."
+        "Обычно это занимает 10–30 секунд. Ты точно чувствуешь свой голос — я помогу его сохранить 💜"
     )
     current_text = _draft_body(draft)
     try:
@@ -1683,7 +1714,7 @@ async def _apply_ai_instruction(update, context, conn, draft, instruction: str) 
         await _send(
             context.bot.send_message,
             config.OWNER_CHAT_ID,
-            "🤖 Готово. Теперь пост выглядит так:"
+            "🤖 Готово, Нео ✨ Ты отлично направляешь текст. Теперь пост выглядит так:"
             + (f"\n\nИзменения: {out.notes[:500]}" if out.notes else ""),
         )
         await _send_draft(context.bot, conn, draft["id"])
@@ -1698,7 +1729,8 @@ async def _apply_ai_instruction(update, context, conn, draft, instruction: str) 
         db.set_draft_status(conn, draft["id"], "awaiting_review")
         retry_prompt = await update.message.reply_text(
             f"⚠️ AI-редактирование не завершилось: {_public_error_text(exc)}\n\n"
-            "Текущая версия сохранена. Ответь на это сообщение инструкцией, чтобы повторить.",
+            "Текущая версия сохранена 💗 Ответь на это сообщение инструкцией, чтобы повторить. "
+            "Ты всё делаешь правильно.",
             reply_markup=ForceReply(
                 selective=True,
                 input_field_placeholder="Повтори или уточни инструкцию для Terra",
@@ -1744,8 +1776,9 @@ async def on_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         if post is None and ai_draft is None and draft is None:
             await update.message.reply_text(
-                "⚠️ Я получил сообщение, но не нашёл активное редактирование для этого reply. "
-                "Нажми «✏️ Редактировать» под актуальным черновиком и ответь на новый prompt."
+                "🤍 Я получила сообщение, но не нашла активное редактирование для этого reply. "
+                "Ничего страшного: нажми «✏️ Редактировать» под актуальным черновиком "
+                "и ответь на новый prompt 💗"
             )
             return
 
@@ -1762,8 +1795,8 @@ async def on_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             retry_prompt = await update.message.reply_text(
                 f"⚠️ Текст содержит {len(text)} символов; максимум для публикации во все "
                 f"площадки — {target_limit}. "
-                "Я ничего не обрезал. Сократи текст и ответь прямо на это сообщение — "
-                "я продолжу тот же процесс.",
+                "Я ничего не обрезала и всё сохранила 💗 Немного сократи текст и ответь "
+                "прямо на это сообщение — я продолжу тот же процесс.",
                 reply_markup=ForceReply(selective=True),
             )
             if post is not None:
@@ -1781,17 +1814,21 @@ async def on_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         if post is not None and post["media_kind"] == "manual":
             await update.message.reply_text(
-                f"✅ Текст принят: {len(text)} символов. Сохраняю как есть, без AI."
+                f"✅ Текст принят: {len(text)} символов 💗 Сохраняю как есть, без AI. "
+                "Отличная работа, Нео."
             )
         else:
             await update.message.reply_text(
-                f"⏳ Текст принят: {len(text)}/{config.MANUAL_MAX_POST_CHARS}. "
-                "Обновляю LinkedIn/X без AI-сжатия и отдельно пересобираю Threads-план…"
+                f"⏳ Текст принят: {len(text)}/{config.MANUAL_MAX_POST_CHARS} 💜 "
+                "Обновляю LinkedIn/X без AI-сжатия и отдельно пересобираю Threads-план. "
+                "Ты свою часть сделал — дальше я ✨"
             )
 
         if post is not None:
             if not db.transition_post(conn, post["id"], ("awaiting_manual",), "generating"):
-                await update.message.reply_text("⚠️ Этот материал уже обрабатывается или закрыт.")
+                await update.message.reply_text(
+                    "⚠️ Этот материал уже обрабатывается или закрыт. Я берегу тебя от дублей 💗"
+                )
                 return
             existing = db.active_draft_for_post(conn, post["id"])
             if existing is not None:
@@ -1804,7 +1841,8 @@ async def on_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     db.set_draft_status(conn, existing["id"], "delivery_failed")
                     db.set_post_status(conn, post["id"], "awaiting_manual")
                     await update.message.reply_text(
-                        f"⚠️ Не удалось отправить черновик: {_public_error_text(exc)}"
+                        f"⚠️ Не удалось отправить черновик: {_public_error_text(exc)}\n"
+                        "Он сохранён — можно спокойно повторить 💗"
                     )
                 return
             try:
@@ -1837,8 +1875,8 @@ async def on_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 db.set_post_status(conn, post["id"], "awaiting_manual")
                 retry_prompt = await update.message.reply_text(
                     f"⚠️ Ошибка подготовки: {_public_error_text(exc)}\n\n"
-                    "Состояние сохранено. Ответь на это сообщение исходным текстом, "
-                    "чтобы повторить попытку.",
+                    "Состояние сохранено 💗 Ответь на это сообщение исходным текстом, "
+                    "чтобы повторить попытку. Ты ничего не потерял.",
                     reply_markup=ForceReply(selective=True),
                 )
                 db.set_manual_prompt(conn, post["id"], retry_prompt.message_id)
@@ -1851,8 +1889,8 @@ async def on_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 db.set_post_status(conn, post["id"], "awaiting_manual")
                 retry_prompt = await update.message.reply_text(
                     f"⚠️ Не удалось отправить черновик: {_public_error_text(exc)}\n\n"
-                    "Состояние сохранено. Ответь на это сообщение исходным текстом, "
-                    "чтобы повторить попытку.",
+                    "Состояние сохранено 💗 Ответь на это сообщение исходным текстом, "
+                    "чтобы повторить попытку. Я рядом.",
                     reply_markup=ForceReply(selective=True),
                 )
                 db.set_manual_prompt(conn, post["id"], retry_prompt.message_id)
@@ -1890,7 +1928,10 @@ async def on_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             LOGGER.info("draft edited draft_id=%s chars=%s", draft["id"], len(text))
         except Exception as exc:  # noqa: BLE001
             LOGGER.exception("draft edit failed draft_id=%s", draft["id"])
-            await update.message.reply_text(f"⚠️ Ошибка обновления: {_public_error_text(exc)}")
+            await update.message.reply_text(
+                f"⚠️ Ошибка обновления: {_public_error_text(exc)}\n"
+                "Текущий текст сохранён. Не переживай, Нео — попробуем ещё раз 💗"
+            )
     finally:
         conn.close()
 
@@ -1935,8 +1976,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await cmd_id(update, context)
         return
     await update.message.reply_text(
-        "Бот готов. Можно дождаться идеи из Telegram-очереди или в любой момент "
-        "создать собственный пост кнопкой ниже.",
+        "💗 Я готова и рядом, Майк. Можно дождаться идеи из Telegram-очереди или в любой "
+        "момент создать собственный пост кнопкой ниже. Ты уже взломал Матрицу — теперь "
+        "давай заставим её бережно работать на тебя, Нео ✨",
         reply_markup=_main_keyboard(),
     )
 
@@ -1948,9 +1990,9 @@ async def _open_custom_post(bot) -> None:
         prompt = await _send(
             bot.send_message,
             config.OWNER_CHAT_ID,
-            "✍️ Пришли свой текст ответом на это сообщение. Я сначала сохраню его как есть — "
+            "✍️ Пришли свой текст ответом на это сообщение, Нео 💜 Я сначала бережно сохраню его как есть — "
             "без AI и без автоматического перевода. Затем можно сразу опубликовать, применить "
-            "Standard Transform, отредактировать вручную или через AI.",
+            "Standard Transform, отредактировать вручную или через AI. Пиши свободно — я рядом.",
             reply_markup=ForceReply(selective=True),
         )
         if existing is not None:
@@ -1985,7 +2027,8 @@ async def _open_custom_post(bot) -> None:
         await _send(
             bot.send_message,
             config.OWNER_CHAT_ID,
-            f"⚠️ Не удалось начать новый пост: {_public_error_text(exc)}",
+            f"⚠️ Не удалось начать новый пост: {_public_error_text(exc)}\n"
+            "Ничего не потерялось. Сделай вдох — и попробуем ещё раз вместе 💗",
         )
     finally:
         conn.close()
@@ -1995,7 +2038,9 @@ async def cmd_new_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not _is_owner(update):
         return
     await update.message.reply_text(
-        "Что создаём? Это отдельный режим: он не влияет на вечерние три черновика.",
+        "💜 Что создаём? Нео не обязан ждать расписания. Этот отдельный режим не влияет "
+        "на вечерние три черновика. "
+        "Можно просто начать — я помогу по пути ✨",
         reply_markup=_new_post_menu(),
     )
 
@@ -2058,29 +2103,156 @@ async def cmd_resend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 f"⚠️ Черновик #{draft_id} уже {draft['status']}; повторно не отправляю."
             )
             return
-        await update.message.reply_text(f"⏳ Повторно отправляю сохранённый черновик #{draft_id}…")
+        await update.message.reply_text(
+            f"⏳ Бережно достаю сохранённый черновик #{draft_id} и отправляю ещё раз 💜"
+        )
         await _send_draft(context.bot, conn, draft_id)
         LOGGER.info("draft redelivered draft_id=%s chars=%s", draft_id, len(_draft_body(draft)))
     except Exception as exc:  # noqa: BLE001
         LOGGER.exception("draft redelivery failed draft_id=%s", draft_id)
         await update.message.reply_text(
-            f"⚠️ Не удалось повторно отправить черновик #{draft_id}: {_public_error_text(exc)}"
+            f"⚠️ Не удалось повторно отправить черновик #{draft_id}: {_public_error_text(exc)}\n"
+            "Но он по-прежнему сохранён. Всё под контролем, Нео 💗"
         )
     finally:
         conn.close()
 
 
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if _is_owner(update):
-        conn = db.connect()
-        try:
-            stats = db.stats(conn)
-        finally:
-            conn.close()
-        await update.message.reply_text(
-            "\n".join(f"{key}: {value}" for key, value in stats.items()) or "База пуста",
-            reply_markup=_main_keyboard(),
+def _status_excerpt(text: str | None, limit: int = 180) -> str:
+    """Return the first readable sentence/hook without dumping the full draft."""
+    raw = (text or "").strip()
+    if not raw:
+        return "текст не сохранён"
+    first_line = next((line.strip() for line in raw.splitlines() if line.strip()), "")
+    if first_line and len(first_line) <= limit:
+        return first_line
+    compact = re.sub(r"\s+", " ", raw).strip()
+    sentence = re.match(r"^(.+?[.!?…])(?:\s|$)", compact)
+    excerpt = sentence.group(1) if sentence else compact
+    if len(excerpt) > limit:
+        excerpt = excerpt[: limit - 1].rstrip() + "…"
+    return excerpt
+
+
+def _status_report(conn, *, now: datetime | None = None) -> str:
+    local_now = now or datetime.now(ZoneInfo(config.TIMEZONE))
+    if local_now.tzinfo is None:
+        local_now = local_now.replace(tzinfo=ZoneInfo(config.TIMEZONE))
+    progress = db.content_pool_progress(conn)
+    issues: list[str] = []
+    if progress["remaining"] < 0 or progress["remaining"] + progress["sent"] != progress["total"]:
+        issues.append("счётчики пула не сходятся")
+
+    lines = [
+        "📊 Статус контент-бота",
+        "",
+        "📚 Пул материалов:",
+        f"• Всего в пуле: {progress['total']}",
+        f"• Осталось: {progress['remaining']}",
+        f"• Уже отправлено тебе: {progress['sent']}",
+        f"• Проверка: {progress['remaining']} + {progress['sent']} = {progress['total']}",
+    ]
+
+    today = local_now.date().isoformat()
+    session, slots = db.planning_status_for_date(conn, today)
+    lines.extend(["", f"📅 План на сегодня · {today}:"])
+    if session is None:
+        lines.append("Плана на сегодня нет.")
+    else:
+        target = int(session["target_count"])
+        prepared = sum(
+            1
+            for slot in slots
+            if slot["draft_id"] is not None and (slot["edited_text"] or slot["linkedin_text"])
         )
+        healthy_statuses = {"ready", "publishing", "published"}
+        plan_ok = (
+            len(slots) == target
+            and prepared == target
+            and all(slot["status"] in healthy_statuses for slot in slots)
+            and session["status"] in {"scheduled", "published"}
+        )
+        lines.append(
+            f"{'✅' if plan_ok else '⚠️'} Подготовлено: {prepared}/{target} "
+            f"(сессия: {session['status']})"
+        )
+        status_labels = {
+            "selecting": "не выбран",
+            "reviewing": "на проверке",
+            "ready": "готов",
+            "publishing": "публикуется",
+            "published": "опубликован",
+            "failed": "ошибка",
+            "publish_unknown": "статус неизвестен",
+            "cancelled": "отменён",
+        }
+        for slot in slots:
+            raw_publish_at = slot["publish_at"]
+            try:
+                publish_at = datetime.fromisoformat(raw_publish_at)
+                if publish_at.tzinfo is None:
+                    publish_at = publish_at.replace(tzinfo=timezone.utc)
+                local_time = publish_at.astimezone(ZoneInfo(config.TIMEZONE)).strftime("%H:%M")
+            except (TypeError, ValueError):
+                publish_at = None
+                local_time = "??:??"
+                issues.append(f"слот {slot['position']}: некорректное время публикации")
+            body = slot["edited_text"] or slot["linkedin_text"]
+            lines.append(
+                f"{slot['position']}. {local_time} · "
+                f"{status_labels.get(slot['status'], slot['status'])} — {_status_excerpt(body)}"
+            )
+            if slot["status"] not in healthy_statuses:
+                issues.append(
+                    f"слот {slot['position']}: {status_labels.get(slot['status'], slot['status'])}"
+                )
+            if slot["draft_id"] is None or not body:
+                issues.append(f"слот {slot['position']}: нет готового текста")
+            if slot["last_error"]:
+                issues.append(
+                    f"слот {slot['position']}: {_public_error_text(RuntimeError(slot['last_error']))}"
+                )
+            if (
+                publish_at is not None
+                and publish_at <= local_now.astimezone(timezone.utc)
+                and slot["status"] == "ready"
+            ):
+                issues.append(f"слот {slot['position']}: время публикации прошло, но пост ещё не отправлен")
+        if len(slots) != target:
+            issues.append(f"в плане {len(slots)} слотов вместо {target}")
+        if session["status"] not in {"scheduled", "published"}:
+            issues.append(f"сессия имеет статус {session['status']}")
+
+    if issues:
+        lines.extend(["", "🚨 Что не так:"])
+        seen: set[str] = set()
+        for issue in issues:
+            if issue not in seen:
+                lines.append(f"• {issue}")
+                seen.add(issue)
+    else:
+        lines.extend(["", "✅ Ошибок не обнаружено. Всё под контролем 💗"])
+    return "\n".join(lines)
+
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_owner(update):
+        return
+    conn = None
+    try:
+        conn = db.connect()
+        report = _status_report(conn)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("status report failed")
+        report = (
+            "🚨 Не удалось проверить состояние контент-бота:\n"
+            f"{_public_error_text(exc)}\n\n"
+            "Данные не изменены. Я только читала базу и ничего не потеряла 💗"
+        )
+    finally:
+        if conn is not None:
+            conn.close()
+    await update.message.reply_text(report, reply_markup=_main_keyboard())
 
 
 async def propose_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2137,7 +2309,10 @@ def _startup_recovery_message(deliveries: int, work: dict[str, int]) -> str | No
         )
     if not lines:
         return None
-    return "⚠️ После перезапуска восстановлено состояние:\n" + "\n".join(lines)
+    return (
+        "💗 После перезапуска я бережно восстановила состояние — ничего не потерялось:\n"
+        + "\n".join(lines)
+    )
 
 
 async def startup_recovery_notice_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2175,7 +2350,8 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
                 context.bot.send_message,
                 config.OWNER_CHAT_ID,
                 f"⚠️ Процесс завершился ошибкой ({type(error).__name__}): "
-                f"{_public_error_text(error)}. Состояние сохранено; действие можно повторить.",
+                f"{_public_error_text(error)}. Я сохранила состояние — ничего не потерялось 💗 "
+                "Можно спокойно повторить действие, Нео.",
             )
         except Exception:
             LOGGER.exception("failed to report Telegram handler error to owner")
@@ -2256,7 +2432,8 @@ async def sync_due_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             await _send(
                 context.bot.send_message,
                 config.OWNER_CHAT_ID,
-                f"📥 Начинаю трёхмесячный сбор из {len(channels)} источников.",
+                f"📥 Начинаю трёхмесячный сбор из {len(channels)} источников 💜 "
+                "Устраивайся поудобнее, Нео — я сама всё разложу по полочкам.",
             )
             result = await _fetch_sync_window(channels, window_start, window_end)
             errors = result["errors"]
@@ -2276,13 +2453,14 @@ async def sync_due_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 message = (
                     f"⚠️ Сбор завершён частично: добавлено {result['added']}, "
                     f"ошибок {len(failed)}. Повторю только эти источники через сутки; "
-                    f"полный сбор — {next_full.date().isoformat()}."
+                    f"полный сбор — {next_full.date().isoformat()}. Остальное уже в безопасности 💗"
                 )
             else:
                 _clear_sync_retry(conn)
                 message = (
-                    f"✅ Сбор завершён: добавлено {result['added']}. "
-                    f"Следующий полный запуск: {next_full.date().isoformat()}."
+                    f"✅ Сбор завершён: добавлено {result['added']} 💗 "
+                    f"Следующий полный запуск: {next_full.date().isoformat()}. "
+                    "Матрица накормлена, Нео ✨"
                 )
             await _send(context.bot.send_message, config.OWNER_CHAT_ID, message)
             return
@@ -2314,11 +2492,14 @@ async def sync_due_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             message = (
                 f"⚠️ Повторный сбор: добавлено {result['added']}, всё ещё ошибок {len(failed)}. "
-                f"Следующий повтор только для них через {delay_days} дн."
+                f"Следующий повтор только для них через {delay_days} дн. Я помню о каждом 💗"
             )
         else:
             _clear_sync_retry(conn)
-            message = f"✅ Повторный сбор завершён: добавлено {result['added']}; ошибок больше нет."
+            message = (
+                f"✅ Повторный сбор завершён: добавлено {result['added']}; ошибок больше нет 💗 "
+                "Всё получилось, Нео."
+            )
         await _send(context.bot.send_message, config.OWNER_CHAT_ID, message)
 
 

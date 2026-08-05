@@ -223,6 +223,42 @@ async def test_evening_planning_and_next_day_publish() -> None:
             "SELECT COUNT(*) n FROM planning_slot WHERE session_id=? AND status='ready'",
             (session["id"],),
         ).fetchone()["n"] == 3
+        assert "Нео" in fake.messages[-1]["text"]
+        assert "Горжусь тобой" in fake.messages[-1]["text"]
+
+        status_report = bot._status_report(
+            conn,
+            now=datetime(2026, 8, 6, 0, 30, tzinfo=ZoneInfo(config.TIMEZONE)),
+        )
+        assert "Всего в пуле: 6" in status_report
+        assert "Осталось: 2" in status_report
+        assert "Уже отправлено тебе: 4" in status_report
+        assert "Проверка: 2 + 4 = 6" in status_report
+        assert "Подготовлено: 3/3" in status_report
+        assert "1. 09:00 · готов — Prepared planning draft 1." in status_report
+        assert "2. 14:00 · готов — Owner-edited second planning post." in status_report
+        assert "3. 19:00 · готов — Prepared planning draft 3." in status_report
+        assert "Ошибок не обнаружено" in status_report
+
+        conn.execute(
+            "UPDATE planning_slot SET status='failed', last_error='Buffer timeout' "
+            "WHERE session_id=? AND position=2",
+            (session["id"],),
+        )
+        conn.commit()
+        broken_report = bot._status_report(
+            conn,
+            now=datetime(2026, 8, 6, 0, 30, tzinfo=ZoneInfo(config.TIMEZONE)),
+        )
+        assert "🚨 Что не так:" in broken_report
+        assert "слот 2: ошибка" in broken_report
+        assert "слот 2: Buffer timeout" in broken_report
+        conn.execute(
+            "UPDATE planning_slot SET status='ready', last_error=NULL "
+            "WHERE session_id=? AND position=2",
+            (session["id"],),
+        )
+        conn.commit()
 
         duplicate_start = await bot.start_evening_planning(fake, now=planning_now)
         assert duplicate_start["created"] is False and duplicate_start["sent"] == 0
@@ -392,7 +428,7 @@ async def test_edit_retry_loop() -> None:
             SimpleNamespace(message=unknown, effective_chat=SimpleNamespace(id=123)),
             SimpleNamespace(bot=FakeBot()),
         )
-        assert "не нашёл активное редактирование" in unknown.responses[0]["text"]
+        assert "не нашла активное редактирование" in unknown.responses[0]["text"]
     finally:
         generator.threadify_post = original_threadify
         config.DB_PATH = old_db_path
@@ -895,6 +931,21 @@ async def main() -> None:
             "Why do faithful translations still fail on Threads?",
             "Because structure matters as much as wording.",
         ]
+
+        manual_edit_button = FakeQuery(f"edit:{draft_id}")
+        before_manual_edit = len(fake.messages)
+        await bot.on_callback(
+            SimpleNamespace(
+                callback_query=manual_edit_button,
+                effective_chat=SimpleNamespace(id=config.OWNER_CHAT_ID),
+            ),
+            SimpleNamespace(bot=fake),
+        )
+        assert len(fake.messages) == before_manual_edit + 1
+        assert fake.messages[-1]["text"] == "waiting for edited text:"
+        assert fake.messages[-1]["reply_markup"].force_reply is True
+        assert "Faithful English translation" not in fake.messages[-1]["text"]
+        assert db.get_draft(conn, draft_id)["edit_msg_id"] == len(fake.messages)
 
         threadify_calls: list[str] = []
 

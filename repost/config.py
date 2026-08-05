@@ -51,7 +51,20 @@ MANUAL_MAX_POST_CHARS = max(
     min(int(_get("MANUAL_MAX_POST_CHARS") or 3000), 3000),
 )
 X_PREMIUM = _bool("X_PREMIUM", False)
-POST_TIMES = [t.strip() for t in (_get("POST_TIMES") or "10:00,18:00").split(",") if t.strip()]
+PLANNING_TIME = _get("PLANNING_TIME") or "21:00"
+PUBLISH_TIMES = [
+    t.strip()
+    for t in (_get("PUBLISH_TIMES") or "09:00,14:00,19:00").split(",")
+    if t.strip()
+]
+DAILY_POSTS = max(1, int(_get("DAILY_POSTS") or 3))
+if len(PUBLISH_TIMES) != DAILY_POSTS:
+    raise RuntimeError(
+        f"PUBLISH_TIMES содержит {len(PUBLISH_TIMES)} слотов, "
+        f"но DAILY_POSTS={DAILY_POSTS}"
+    )
+# Kept for manual/test delivery helpers; scheduled planning always offers one
+# candidate at a time and creates DAILY_POSTS durable slots.
 ITEMS_PER_SLOT = max(1, int(_get("ITEMS_PER_SLOT") or 1))
 SYNC_TIME = _get("SYNC_TIME") or "08:00"
 SYNC_MONTHS = int(_get("SYNC_MONTHS") or 3)

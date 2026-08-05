@@ -120,6 +120,21 @@ def generate(source: str, date: str, text: str) -> DraftOut:
     return translate_post(source, date, text)
 
 
+def revise_post(current_text: str, instruction: str) -> DraftOut:
+    """Apply one owner instruction to the current draft through Terra."""
+    current_text = current_text.strip()
+    instruction = instruction.strip()
+    if not current_text:
+        raise RuntimeError("Активный черновик пуст")
+    if not instruction:
+        raise RuntimeError("Инструкция для AI пуста")
+    out = _parse(
+        prompts.REVISE_SYSTEM,
+        prompts.revise_message(current_text, instruction),
+    )
+    return _draft(out.full_text, out.notes)
+
+
 def adapt(edited_text: str) -> DraftOut:
     """An owner's English edit is authoritative and needs no second AI call."""
     text = edited_text.strip()

@@ -11,7 +11,7 @@ from repost import config, publisher  # noqa: E402
 def main() -> None:
     original_channels = config.buffer_channels
     original_create_post = publisher.create_post
-    calls: list[tuple[str, str, str | None, list[str] | None]] = []
+    calls: list[tuple[str, str, str | None, list[str] | None, str | None]] = []
     try:
         config.buffer_channels = lambda: {
             "linkedin": "linkedin-channel",
@@ -25,8 +25,9 @@ def main() -> None:
             *,
             thread_platform: str | None = None,
             thread: list[str] | None = None,
+            image_url: str | None = None,
         ) -> str:
-            calls.append((channel_id, text, thread_platform, thread))
+            calls.append((channel_id, text, thread_platform, thread, image_url))
             return f"post-{channel_id}"
 
         publisher.create_post = fake_create_post
@@ -46,7 +47,50 @@ def main() -> None:
     assert results["twitter"][0] is False
     assert "Пустой текст" in results["twitter"][1]
     assert "threads" not in results
-    assert calls == [("linkedin-channel", "A valid post", None, None)]
+    assert calls == [("linkedin-channel", "A valid post", None, None, None)]
+
+    calls.clear()
+    image_url = "https://content.example/api/media/random-token"
+    config.buffer_channels = lambda: {
+        "linkedin": "linkedin-channel",
+        "twitter": "twitter-channel",
+        "threads": "threads-channel",
+    }
+    publisher.create_post = fake_create_post
+    try:
+        image_results = publisher.publish_all(
+            {
+                "linkedin": "Image post",
+                "twitter": "Image post",
+                "threads": "Image post",
+            },
+            image_url,
+        )
+    finally:
+        config.buffer_channels = original_channels
+        publisher.create_post = original_create_post
+    assert all(ok for ok, _ in image_results.values())
+    assert len(calls) == 3
+    assert all(call[-1] == image_url for call in calls)
+
+    original_gql = publisher._gql
+    gql_queries: list[str] = []
+
+    def fake_gql(query: str, variables=None):
+        gql_queries.append(query)
+        return {"createPost": {"post": {"id": "buffer-image-post"}}}
+
+    publisher._gql = fake_gql
+    try:
+        assert publisher.create_post(
+            "linkedin-channel",
+            "Text and image",
+            image_url=image_url,
+        ) == "buffer-image-post"
+    finally:
+        publisher._gql = original_gql
+    assert "assets: [{ image: { url:" in gql_queries[0]
+    assert image_url in gql_queries[0]
 
     long_text = " ".join(f"word{index}" for index in range(300))
     x_chunks = publisher.split_for_thread(long_text, 280)

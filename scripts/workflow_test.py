@@ -1,9 +1,11 @@
 """Offline async test: raw delivery must not call the LLM or Buffer."""
 import asyncio
 import tempfile
+from datetime import datetime
 from pathlib import Path
 import sys
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -32,6 +34,7 @@ class FakeBot:
         self.messages: list[dict] = []
         self.copies: list[dict] = []
         self.deleted: list[tuple[int, int]] = []
+        self.photos: list[dict] = []
 
     async def send_message(self, chat_id, text, **kwargs):
         self.messages.append({"chat_id": chat_id, "text": text, **kwargs})
@@ -43,6 +46,13 @@ class FakeBot:
 
     async def delete_message(self, chat_id, message_id):
         self.deleted.append((chat_id, message_id))
+
+    async def send_photo(self, **kwargs):
+        self.photos.append(kwargs)
+        return SimpleNamespace(
+            message_id=20_000 + len(self.photos),
+            photo=[SimpleNamespace(file_id=f"bot-photo-{len(self.photos)}")],
+        )
 
 
 class FakeQuery:
@@ -58,17 +68,39 @@ class FakeQuery:
         self.markup_edits.append(reply_markup)
 
 
-async def test_daily_schedule_and_skip(calls: dict[str, int]) -> None:
-    """Two daily iterations; a raw skip immediately adds one replacement."""
+class FakeApplication:
+    def __init__(self):
+        self.tasks: list[asyncio.Task] = []
+
+    def create_task(self, coroutine, **_kwargs):
+        task = asyncio.create_task(coroutine)
+        self.tasks.append(task)
+        return task
+
+
+async def test_evening_planning_and_next_day_publish() -> None:
+    """One 21:00 session must prepare three drafts and publish them next day."""
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     tmp.close()
     old_db_path = config.DB_PATH
+    old_owner = config.OWNER_CHAT_ID
+    old_delay = config.BOT_SEND_DELAY
+    original_translate = generator.translate_post
+    original_publish = publisher.publish_all
     config.DB_PATH = tmp.name
+    config.OWNER_CHAT_ID = 123
+    config.BOT_SEND_DELAY = 0
     conn = db.connect()
     try:
-        post_ids: dict[str, int] = {}
         for index, username in enumerate(
-            ("@skip-alpha", "@skip-bravo", "@skip-charlie", "@skip-delta", "@skip-echo"),
+            (
+                "@plan-alpha",
+                "@plan-bravo",
+                "@plan-charlie",
+                "@plan-delta",
+                "@plan-echo",
+                "@plan-foxtrot",
+            ),
             start=1,
         ):
             source_id = db.upsert_source(conn, username, username)
@@ -80,74 +112,133 @@ async def test_daily_schedule_and_skip(calls: dict[str, int]) -> None:
                 f"Сырой материал {username} " * 20,
                 f"https://t.me/{username[1:]}/{index}",
             )
-            post_ids[username] = conn.execute(
-                "SELECT id FROM post WHERE source_id=? AND tg_message_id=?",
-                (source_id, index),
-            ).fetchone()["id"]
+
+        generated = 0
+        published: list[dict[str, str]] = []
+
+        def fake_translate(*_args, **_kwargs):
+            nonlocal generated
+            generated += 1
+            text = f"Prepared planning draft {generated}."
+            return generator.DraftOut(
+                linkedin_text=text,
+                x_text=text,
+                threads_text=text,
+                notes="",
+            )
+
+        def fake_publish(texts, image_url=None):
+            assert image_url is None
+            published.append(dict(texts))
+            return {platform: (True, f"buffer-{len(published)}-{platform}") for platform in texts}
+
+        generator.translate_post = fake_translate
+        publisher.publish_all = fake_publish
 
         fake = FakeBot()
-        await bot.propose_job(
-            SimpleNamespace(bot=fake, job=SimpleNamespace(data={"slot": "10:00"}))
-        )
-        assert len(fake.messages) == 1, "утренний слот должен показать ровно один материал"
-        assert "@skip-alpha" in fake.messages[0]["text"]
+        planning_now = datetime(2026, 8, 5, 21, 0, tzinfo=ZoneInfo(config.TIMEZONE))
+        started = await bot.start_evening_planning(fake, now=planning_now)
+        assert started == {"created": True, "closed": 0, "sent": 1, "status": "active"}
+        assert "Вечерняя сессия началась" in fake.messages[0]["text"]
+        assert "Итерация 1/3" in fake.messages[1]["text"]
+        assert "@plan-alpha" in fake.messages[2]["text"]
 
-        skipped_id = post_ids["@skip-alpha"]
-        query = FakeQuery(f"drop:{skipped_id}")
-        update = SimpleNamespace(
-            callback_query=query,
-            effective_chat=SimpleNamespace(id=config.OWNER_CHAT_ID),
-        )
-        context = SimpleNamespace(bot=fake)
-        before_skip = len(fake.messages)
-        await bot.on_callback(update, context)
-        assert query.markup_edits == [None]
-        assert len(fake.messages) == before_skip + 2
-        assert "Показываю следующий" in fake.messages[-2]["text"]
-        assert "@skip-bravo" in fake.messages[-1]["text"]
-        assert db.get_post(conn, skipped_id)["status"] == "skipped"
-        assert calls == {"generate": 0, "publish": 0}, (
-            "пропуск сырого материала не должен вызывать LLM или Buffer"
-        )
-
-        duplicate = FakeQuery(f"drop:{skipped_id}")
-        duplicate_update = SimpleNamespace(
-            callback_query=duplicate,
-            effective_chat=SimpleNamespace(id=config.OWNER_CHAT_ID),
-        )
-        before_duplicate = len(fake.messages)
-        await bot.on_callback(duplicate_update, context)
-        assert len(fake.messages) == before_duplicate, (
-            "повторное нажатие той же кнопки не должно выдать ещё одну замену"
-        )
-        assert calls == {"generate": 0, "publish": 0}
-
-        await bot.propose_job(
-            SimpleNamespace(bot=fake, job=SimpleNamespace(data={"slot": "18:00"}))
-        )
-        assert "@skip-charlie" in fake.messages[-1]["text"]
-
-        daily_counts = [
-            row["n"]
-            for row in conn.execute(
-                "SELECT COUNT(*) n FROM delivery_item di "
-                "JOIN delivery_batch b ON b.id=di.batch_id "
-                "WHERE b.slot_key LIKE 'daily:%' GROUP BY b.slot_key ORDER BY b.slot_key"
-            )
+        session = db.planning_session_for_date(conn, "2026-08-05")
+        assert session["target_date"] == "2026-08-06" and session["target_count"] == 3
+        slots = conn.execute(
+            "SELECT * FROM planning_slot WHERE session_id=? ORDER BY position",
+            (session["id"],),
+        ).fetchall()
+        assert [row["publish_at"] for row in slots] == [
+            "2026-08-06T08:00:00+00:00",
+            "2026-08-06T13:00:00+00:00",
+            "2026-08-06T18:00:00+00:00",
         ]
-        replacement_count = conn.execute(
-            "SELECT COUNT(*) n FROM delivery_item di "
-            "JOIN delivery_batch b ON b.id=di.batch_id "
-            "WHERE b.slot_key LIKE 'replacement:%'"
-        ).fetchone()["n"]
-        assert daily_counts == [1, 1] and sum(daily_counts) == 2
-        assert replacement_count == 1, (
-            "замена после пропуска идёт сверх двух базовых итераций дня"
+
+        first_post_id = slots[0]["post_id"]
+        skip = FakeQuery(f"drop:{first_post_id}")
+        await bot.on_callback(
+            SimpleNamespace(
+                callback_query=skip,
+                effective_chat=SimpleNamespace(id=config.OWNER_CHAT_ID),
+            ),
+            SimpleNamespace(bot=fake),
         )
-        assert calls == {"generate": 0, "publish": 0}
+        assert skip.markup_edits == [None]
+        assert db.get_post(conn, first_post_id)["status"] == "skipped"
+        assert "@plan-bravo" in fake.messages[-1]["text"]
+
+        for position in range(1, 4):
+            slot = conn.execute(
+                "SELECT * FROM planning_slot WHERE session_id=? AND position=?",
+                (session["id"], position),
+            ).fetchone()
+            make = FakeQuery(f"make:{slot['post_id']}")
+            await bot.on_callback(
+                SimpleNamespace(
+                    callback_query=make,
+                    effective_chat=SimpleNamespace(id=config.OWNER_CHAT_ID),
+                ),
+                SimpleNamespace(bot=fake),
+            )
+            slot = conn.execute(
+                "SELECT * FROM planning_slot WHERE session_id=? AND position=?",
+                (session["id"], position),
+            ).fetchone()
+            draft = db.get_draft(conn, slot["draft_id"])
+            keyboard = fake.messages[-1]["reply_markup"].inline_keyboard
+            labels = [button.text for row in keyboard for button in row]
+            assert labels == [
+                f"✅ Готово на завтра ({position}/3)",
+                "✏️ Редактировать руками",
+                "🤖 Редактировать с AI",
+                "⏭ Другой материал",
+                "⏹ Закончить на сегодня",
+            ]
+            if position == 2:
+                edited = "Owner-edited second planning post."
+                db.update_draft_texts(conn, draft["id"], "old-li", "old-x", "old-th", edited)
+            ready = FakeQuery(f"planready:{draft['id']}")
+            await bot.on_callback(
+                SimpleNamespace(
+                    callback_query=ready,
+                    effective_chat=SimpleNamespace(id=config.OWNER_CHAT_ID),
+                ),
+                SimpleNamespace(bot=fake),
+            )
+            assert ready.markup_edits == [None]
+
+        session = db.get_planning_session(conn, session["id"])
+        assert session["status"] == "scheduled"
+        assert generated == 3 and published == []
+        assert conn.execute(
+            "SELECT COUNT(*) n FROM planning_slot WHERE session_id=? AND status='ready'",
+            (session["id"],),
+        ).fetchone()["n"] == 3
+
+        duplicate_start = await bot.start_evening_planning(fake, now=planning_now)
+        assert duplicate_start["created"] is False and duplicate_start["sent"] == 0
+
+        for hour in (9, 14, 19):
+            before_publish_messages = len(fake.messages)
+            result = await bot.publish_due_planned(
+                fake,
+                now=datetime(2026, 8, 6, hour, 0, tzinfo=ZoneInfo(config.TIMEZONE)),
+            )
+            assert result["claimed"] == 1 and result["published"] == 1
+            assert len(fake.messages) == before_publish_messages + 1
+            assert "опубликован в LinkedIn, X и Threads" in fake.messages[-1]["text"]
+        assert len(published) == 3
+        assert set(published[1].values()) == {"Owner-edited second planning post."}
+        session = db.get_planning_session(conn, session["id"])
+        assert session["status"] == "published"
     finally:
         conn.close()
+        generator.translate_post = original_translate
+        publisher.publish_all = original_publish
         config.DB_PATH = old_db_path
+        config.OWNER_CHAT_ID = old_owner
+        config.BOT_SEND_DELAY = old_delay
         Path(tmp.name).unlink(missing_ok=True)
 
 
@@ -285,7 +376,7 @@ async def test_edit_retry_loop() -> None:
 
 
 async def test_anytime_owner_post() -> None:
-    """The persistent menu can create and later expand an AI-prepared post."""
+    """Custom text stays raw until the owner explicitly runs Standard Transform."""
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     tmp.close()
     old_db_path = config.DB_PATH
@@ -314,9 +405,26 @@ async def test_anytime_owner_post() -> None:
             SimpleNamespace(message=start_message, effective_chat=SimpleNamespace(id=123)),
             SimpleNamespace(),
         )
-        assert "Можно на русском или английском" in start_message.responses[0]["text"]
-        assert start_message.responses[0]["reply_markup"].force_reply is True
-        prompt_id = start_message.first_response_id + 1
+        assert "Что создаём?" in start_message.responses[0]["text"]
+        menu_labels = [
+            button.text
+            for row in start_message.responses[0]["reply_markup"].inline_keyboard
+            for button in row
+        ]
+        assert menu_labels == ["📚 Накидывать из базы", "✍️ Написать свой текст", "❌ Отменить"]
+
+        fake_bot = FakeBot()
+        custom = FakeQuery("newcustom:0")
+        await bot.on_callback(
+            SimpleNamespace(
+                callback_query=custom,
+                effective_chat=SimpleNamespace(id=123),
+            ),
+            SimpleNamespace(bot=fake_bot),
+        )
+        assert "без AI" in fake_bot.messages[-1]["text"]
+        assert fake_bot.messages[-1]["reply_markup"].force_reply is True
+        prompt_id = 1
         verify = db.connect()
         pending = db.pending_owner_post(verify, 123)
         assert pending is not None
@@ -326,18 +434,42 @@ async def test_anytime_owner_post() -> None:
 
         source_text = "Моя новая идея для собственного поста."
         submission = FakeIncomingMessage(source_text, prompt_id, first_response_id=9_100)
-        fake_bot = FakeBot()
         await bot.on_reply(
             SimpleNamespace(message=submission, effective_chat=SimpleNamespace(id=123)),
             SimpleNamespace(bot=fake_bot),
         )
-        assert "Запускаю Terra" in submission.responses[0]["text"]
-        assert translate_calls == [("Собственный пост", source_text)]
-        assert fake_bot.messages[-1]["text"] == "Prepared English owner post."
+        assert "без AI" in submission.responses[0]["text"]
+        assert translate_calls == []
+        assert fake_bot.messages[-1]["text"] == source_text
         verify = db.connect()
         draft = verify.execute("SELECT * FROM draft ORDER BY id DESC LIMIT 1").fetchone()
         assert draft["status"] == "awaiting_review"
-        draft_message_id = draft["tg_message_id"]
+        raw_labels = [
+            button.text
+            for row in fake_bot.messages[-1]["reply_markup"].inline_keyboard
+            for button in row
+        ]
+        assert raw_labels == [
+            "✅ Опубликовать сейчас",
+            "✨ Standard Transform",
+            "✏️ Редактировать руками",
+            "🤖 Редактировать с AI",
+            "❌ Отменить",
+        ]
+        verify.close()
+
+        transform = FakeQuery(f"transform:{draft['id']}")
+        await bot.on_callback(
+            SimpleNamespace(
+                callback_query=transform,
+                effective_chat=SimpleNamespace(id=123),
+            ),
+            SimpleNamespace(bot=fake_bot),
+        )
+        assert translate_calls == [("Собственный пост", source_text)]
+        assert fake_bot.messages[-1]["text"] == "Prepared English owner post."
+        verify = db.connect()
+        draft_message_id = db.get_draft(verify, draft["id"])["tg_message_id"]
         verify.close()
 
         expanded = "E" * 2_000
@@ -349,12 +481,240 @@ async def test_anytime_owner_post() -> None:
         )
         assert "2000/3000" in edit.responses[0]["text"]
         assert second_bot.messages[-1]["text"] == expanded
-        assert len(translate_calls) == 1, "ручная версия после AI не должна снова вызывать Terra"
+        assert len(translate_calls) == 1, "ручная версия после transform не должна снова вызывать Terra"
         verify = db.connect()
         assert len(db.get_draft(verify, draft["id"])["edited_text"]) == 2_000
         verify.close()
     finally:
         generator.translate_post = original_translate
+        config.DB_PATH = old_db_path
+        config.OWNER_CHAT_ID = old_owner
+        config.BOT_SEND_DELAY = old_delay
+        Path(tmp.name).unlink(missing_ok=True)
+
+
+async def test_photo_choice_and_publication() -> None:
+    """A source photo is optional and the chosen mode survives until publication."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    old_db_path = config.DB_PATH
+    old_owner = config.OWNER_CHAT_ID
+    old_delay = config.BOT_SEND_DELAY
+    old_public_url = config.PUBLIC_BASE_URL
+    original_publish = publisher.publish_all
+    published: list[tuple[dict[str, str], str | None]] = []
+
+    def fake_publish(texts, image_url=None):
+        published.append((dict(texts), image_url))
+        return {platform: (True, f"buffer-{platform}") for platform in texts}
+
+    try:
+        config.DB_PATH = tmp.name
+        config.OWNER_CHAT_ID = 123
+        config.BOT_SEND_DELAY = 0
+        config.PUBLIC_BASE_URL = "https://content.example"
+        publisher.publish_all = fake_publish
+        conn = db.connect()
+        source_id = db.upsert_source(conn, "@photo", "Photo")
+        assert db.insert_post(
+            conn,
+            source_id,
+            1,
+            "2026-08-01T10:00:00+00:00",
+            "Photo source text",
+            "https://t.me/photo/1",
+            status="offered",
+            media_kind="photo",
+            media_mime="image/jpeg",
+            media_size=100_000,
+        )
+        post = conn.execute("SELECT * FROM post WHERE tg_message_id=1").fetchone()
+        db.set_post_bot_media(conn, post["id"], "telegram-photo-file", "media-token")
+        draft_id = db.create_draft(
+            conn,
+            post["id"],
+            "test",
+            "Ready image post",
+            "Ready image post",
+            "Ready image post",
+            "",
+        )
+        fake_bot = FakeBot()
+        choose = FakeQuery(f"pub:{draft_id}")
+        await bot.on_callback(
+            SimpleNamespace(callback_query=choose, effective_chat=SimpleNamespace(id=123)),
+            SimpleNamespace(bot=fake_bot),
+        )
+        assert published == []
+        choice_labels = [
+            button.text for row in choose.markup_edits[-1].inline_keyboard for button in row
+        ]
+        assert choice_labels == [
+            "🖼 С картинкой сейчас",
+            "📝 Без картинки сейчас",
+            "↩️ Назад",
+        ]
+
+        with_photo = FakeQuery(f"pubwith:{draft_id}")
+        await bot.on_callback(
+            SimpleNamespace(callback_query=with_photo, effective_chat=SimpleNamespace(id=123)),
+            SimpleNamespace(bot=fake_bot),
+        )
+        assert published == [
+            (
+                {
+                    "linkedin": "Ready image post",
+                    "twitter": "Ready image post",
+                    "threads": "Ready image post",
+                },
+                "https://content.example/api/media/media-token",
+            )
+        ]
+        assert db.get_draft(conn, draft_id)["include_media"] == 1
+
+        assert db.insert_post(
+            conn,
+            source_id,
+            2,
+            "2026-08-02T10:00:00+00:00",
+            "Planning photo source",
+            "https://t.me/photo/2",
+            status="offered",
+            media_kind="photo",
+            media_mime="image/jpeg",
+            media_size=100_000,
+        )
+        second = conn.execute("SELECT * FROM post WHERE tg_message_id=2").fetchone()
+        db.set_post_bot_media(conn, second["id"], "telegram-planning-photo", "planning-token")
+        second_draft = db.create_draft(
+            conn,
+            second["id"],
+            "test",
+            "Planning image post",
+            "Planning image post",
+            "Planning image post",
+            "",
+        )
+        session, _ = db.create_planning_session(
+            conn,
+            "2026-08-05",
+            "2026-08-06",
+            ["2026-08-06T08:00:00+00:00"],
+        )
+        slot = db.next_planning_slot(conn, session["id"])
+        assert db.assign_planning_post(conn, slot["id"], second["id"])
+        assert db.attach_planning_draft(conn, second["id"], second_draft)
+        planning_choice = FakeQuery(f"planready:{second_draft}")
+        await bot.on_callback(
+            SimpleNamespace(callback_query=planning_choice, effective_chat=SimpleNamespace(id=123)),
+            SimpleNamespace(bot=fake_bot),
+        )
+        assert db.planning_slot_for_draft(conn, second_draft)["status"] == "reviewing"
+        with_planning_photo = FakeQuery(f"planwith:{second_draft}")
+        await bot.on_callback(
+            SimpleNamespace(callback_query=with_planning_photo, effective_chat=SimpleNamespace(id=123)),
+            SimpleNamespace(bot=fake_bot),
+        )
+        assert db.planning_slot_for_draft(conn, second_draft)["status"] == "ready"
+        assert db.get_draft(conn, second_draft)["include_media"] == 1
+        scheduled_result = await bot.publish_due_planned(
+            fake_bot,
+            now=datetime(2026, 8, 6, 9, 0, tzinfo=ZoneInfo(config.TIMEZONE)),
+        )
+        assert scheduled_result["published"] == 1
+        assert published[-1][1] == "https://content.example/api/media/planning-token"
+        conn.close()
+    finally:
+        publisher.publish_all = original_publish
+        config.PUBLIC_BASE_URL = old_public_url
+        config.DB_PATH = old_db_path
+        config.OWNER_CHAT_ID = old_owner
+        config.BOT_SEND_DELAY = old_delay
+        Path(tmp.name).unlink(missing_ok=True)
+
+
+async def test_anytime_database_iteration() -> None:
+    """The menu can start exactly one immediate source-material iteration."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    old_db_path = config.DB_PATH
+    old_owner = config.OWNER_CHAT_ID
+    old_delay = config.BOT_SEND_DELAY
+    try:
+        config.DB_PATH = tmp.name
+        config.OWNER_CHAT_ID = 123
+        config.BOT_SEND_DELAY = 0
+        conn = db.connect()
+        source_id = db.upsert_source(conn, "@ondemand", "On demand")
+        assert db.insert_post(
+            conn,
+            source_id,
+            1,
+            "2026-08-01T10:00:00+00:00",
+            "Материал для внепланового поста",
+            "https://t.me/ondemand/1",
+        )
+        fake_bot = FakeBot()
+        application = FakeApplication()
+        query = FakeQuery("newdb:0")
+        await bot.on_callback(
+            SimpleNamespace(callback_query=query, effective_chat=SimpleNamespace(id=123)),
+            SimpleNamespace(bot=fake_bot, application=application),
+        )
+        assert len(application.tasks) == 1
+        await application.tasks[0]
+        assert "внеплановую итерацию" in fake_bot.messages[0]["text"]
+        assert "On demand" in fake_bot.messages[-1]["text"]
+        post = conn.execute("SELECT * FROM post WHERE tg_message_id=1").fetchone()
+        assert post["status"] == "offered"
+        conn.close()
+    finally:
+        config.DB_PATH = old_db_path
+        config.OWNER_CHAT_ID = old_owner
+        config.BOT_SEND_DELAY = old_delay
+        Path(tmp.name).unlink(missing_ok=True)
+
+
+async def test_direct_photo_delivery_captures_file_id() -> None:
+    """Photo review bypasses cross-instance staging and persists Bot API media."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    old_db_path = config.DB_PATH
+    old_owner = config.OWNER_CHAT_ID
+    old_delay = config.BOT_SEND_DELAY
+    original_download = ingest.download_post_media
+
+    async def fake_download(_post, destination):
+        path = Path(destination) / "photo.jpg"
+        path.write_bytes(b"fake-jpeg")
+        return path
+
+    try:
+        config.DB_PATH = tmp.name
+        config.OWNER_CHAT_ID = 123
+        config.BOT_SEND_DELAY = 0
+        ingest.download_post_media = fake_download
+        conn = db.connect()
+        source_id = db.upsert_source(conn, "@photo-delivery", "Photo delivery")
+        assert db.insert_post(
+            conn,
+            source_id,
+            1,
+            "2026-08-01T10:00:00+00:00",
+            "Photo caption",
+            "https://t.me/photo-delivery/1",
+            media_kind="photo",
+            media_mime="image/jpeg",
+            media_size=9,
+        )
+        fake_bot = FakeBot()
+        assert await bot.propose_batch(fake_bot, slot_key="photo-delivery", max_items=1) == 1
+        post = conn.execute("SELECT * FROM post WHERE tg_message_id=1").fetchone()
+        assert fake_bot.photos and post["bot_media_file_id"] == "bot-photo-1"
+        assert post["media_access_token"] and len(post["media_access_token"]) > 30
+        conn.close()
+    finally:
+        ingest.download_post_media = original_download
         config.DB_PATH = old_db_path
         config.OWNER_CHAT_ID = old_owner
         config.BOT_SEND_DELAY = old_delay
@@ -368,6 +728,7 @@ async def main() -> None:
     old_owner = config.OWNER_CHAT_ID
     old_delay = config.BOT_SEND_DELAY
     original_translate = generator.translate_post
+    original_revise = generator.revise_post
     original_publish = publisher.publish_all
     original_stage = ingest.stage_post_for_bot
     original_cleanup = ingest.delete_bot_staging_messages
@@ -445,9 +806,11 @@ async def main() -> None:
         draft_keyboard = text_generation_messages[2]["reply_markup"].inline_keyboard
         draft_labels = [button.text for row in draft_keyboard for button in row]
         assert draft_labels == [
-            "✅ Опубликовать",
+            "✅ Опубликовать сейчас",
+            "✏️ Редактировать руками",
+            "🤖 Редактировать с AI",
+            "⏭ Другой материал",
             "⏹ Закончить итерацию",
-            "✏️ Редактировать без AI-лимита",
         ]
         assert all(
             "Идея:" not in message["text"]
@@ -458,6 +821,45 @@ async def main() -> None:
             "SELECT id FROM draft WHERE post_id=?",
             (text_post_id,),
         ).fetchone()["id"]
+
+        revise_calls: list[tuple[str, str]] = []
+
+        def fake_revise(current_text: str, instruction: str):
+            revise_calls.append((current_text, instruction))
+            revised = "Faithful English translation with a sharper joke."
+            return generator.DraftOut(
+                linkedin_text=revised,
+                x_text=revised,
+                threads_text=revised,
+                notes="Добавлена более острая шутка.",
+            )
+
+        generator.revise_post = fake_revise
+        ai_button = FakeQuery(f"aiedit:{draft_id}")
+        await bot.on_callback(
+            SimpleNamespace(
+                callback_query=ai_button,
+                effective_chat=SimpleNamespace(id=config.OWNER_CHAT_ID),
+            ),
+            SimpleNamespace(bot=fake),
+        )
+        ai_prompt_id = db.get_draft(conn, draft_id)["ai_prompt_id"]
+        assert ai_prompt_id is not None and "AI-редактор открыт" in fake.messages[-1]["text"]
+        instruction = FakeIncomingMessage("Добавь более острую шутку", ai_prompt_id)
+        before_ai_messages = len(fake.messages)
+        await bot.on_reply(
+            SimpleNamespace(
+                message=instruction,
+                effective_chat=SimpleNamespace(id=config.OWNER_CHAT_ID),
+            ),
+            SimpleNamespace(bot=fake),
+        )
+        assert instruction.responses[0]["text"].startswith("⏳ Terra редактирует")
+        assert revise_calls == [("Faithful English translation.", "Добавь более острую шутку")]
+        assert len(fake.messages) == before_ai_messages + 2
+        assert fake.messages[-1]["text"] == "Faithful English translation with a sharper joke."
+        assert db.get_draft(conn, draft_id)["ai_prompt_id"] is None
+
         finish_query = FakeQuery(f"draftskip:{draft_id}")
         finish_update = SimpleNamespace(
             callback_query=finish_query,
@@ -490,10 +892,13 @@ async def main() -> None:
         assert "reply_markup" not in delivered[0]
         assert "reply_markup" in delivered[-1]
 
-        await test_daily_schedule_and_skip(calls)
+        await test_evening_planning_and_next_day_publish()
         await test_refetch_after_queue_exhaustion()
         await test_edit_retry_loop()
         await test_anytime_owner_post()
+        await test_photo_choice_and_publication()
+        await test_anytime_database_iteration()
+        await test_direct_photo_delivery_captures_file_id()
 
         waiter = asyncio.get_running_loop().create_future()
         bot._STAGING_WAITERS["unit-token"] = waiter
@@ -508,8 +913,28 @@ async def main() -> None:
             ),
         )
         await bot.on_staging_media(staging_update, None)
-        assert waiter.result() == (321, 654)
+        assert waiter.result() == (321, 654, None)
         bot._STAGING_WAITERS.pop("unit-token", None)
+
+        photo_waiter = asyncio.get_running_loop().create_future()
+        bot._STAGING_WAITERS["photo-token"] = photo_waiter
+        await bot.on_staging_media(
+            SimpleNamespace(
+                effective_chat=SimpleNamespace(id=321),
+                effective_message=SimpleNamespace(
+                    message_id=655,
+                    photo=[SimpleNamespace(file_id="photo-small"), SimpleNamespace(file_id="photo-large")],
+                    video=None,
+                    reply_to_message=SimpleNamespace(
+                        text="repost-staging:photo-token",
+                        caption=None,
+                    ),
+                ),
+            ),
+            None,
+        )
+        assert photo_waiter.result() == (321, 655, "photo-large")
+        bot._STAGING_WAITERS.pop("photo-token", None)
 
         cleanup_calls: list[tuple[str, list[int]]] = []
 
@@ -563,6 +988,7 @@ async def main() -> None:
         print("Workflow-тест пройден: raw → выбор, без LLM и Buffer")
     finally:
         generator.translate_post = original_translate
+        generator.revise_post = original_revise
         publisher.publish_all = original_publish
         ingest.stage_post_for_bot = original_stage
         ingest.delete_bot_staging_messages = original_cleanup

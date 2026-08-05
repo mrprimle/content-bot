@@ -1,7 +1,8 @@
-"""Telegram bot for raw review, on-demand LLM drafting and Buffer publishing.
+"""Telegram review bot with an evening three-post plan and next-day publishing.
 
-The bot starts one review iteration at each London slot and sends one candidate.
-LLM generation starts only after the owner presses "Создать пост".
+At 21:00 London time the owner prepares three drafts sequentially. Approved
+drafts remain durable in PostgreSQL and publish automatically the next day.
+LLM generation still starts only after the owner presses "Создать пост".
 """
 import asyncio
 import fcntl
@@ -48,7 +49,7 @@ _STAGING_WAITERS: dict[str, asyncio.Future] = {}
 _STAGING_PREFIX = "repost-staging:"
 _STARTUP_RECOVERY_NOTICE_KEY = "startup_recovery_notice_pending"
 _BOT_PROCESS_LOCK = None
-NEW_POST_BUTTON = "✍️ Создать свой пост"
+NEW_POST_BUTTON = "✍️ Создать пост"
 STATS_BUTTON = "📊 Статус"
 
 
@@ -108,24 +109,136 @@ def _draft_body(draft) -> str:
     return (draft["edited_text"] or draft["linkedin_text"] or "").strip()
 
 
-def _draft_keyboard(draft_id: int) -> InlineKeyboardMarkup:
+def _message_media_file_id(message, media_kind: str) -> str | None:
+    """Extract the reusable Bot API file_id from a delivered Telegram message."""
+    if media_kind == "photo" and getattr(message, "photo", None):
+        return message.photo[-1].file_id
+    media = getattr(message, media_kind, None)
+    return getattr(media, "file_id", None)
+
+
+def _remember_bot_media(conn, post, file_id: str | None) -> None:
+    if not file_id:
+        return
+    access_token = post["media_access_token"] or secrets.token_urlsafe(32)
+    db.set_post_bot_media(conn, post["id"], file_id, access_token)
+
+
+def _draft_keyboard(conn, draft_id: int) -> InlineKeyboardMarkup:
+    planning_slot = db.planning_slot_for_draft(conn, draft_id)
+    if planning_slot is not None and planning_slot["session_status"] == "active":
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        f"✅ Готово на завтра ({planning_slot['position']}/{planning_slot['target_count']})",
+                        callback_data=f"planready:{draft_id}",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "✏️ Редактировать руками",
+                        callback_data=f"edit:{draft_id}",
+                    ),
+                    InlineKeyboardButton(
+                        "🤖 Редактировать с AI",
+                        callback_data=f"aiedit:{draft_id}",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "⏭ Другой материал",
+                        callback_data=f"plandiscard:{draft_id}",
+                    ),
+                    InlineKeyboardButton(
+                        "⏹ Закончить на сегодня",
+                        callback_data=f"plancancel:{draft_id}",
+                    ),
+                ],
+            ]
+        )
+    draft = db.get_draft(conn, draft_id)
+    post = db.get_post(conn, draft["post_id"]) if draft is not None else None
+    final_row = [
+        InlineKeyboardButton(
+            "❌ Отменить" if post is not None and post["media_kind"] == "manual" else "⏹ Закончить итерацию",
+            callback_data=f"draftskip:{draft_id}",
+        )
+    ]
+    if post is not None and post["media_kind"] != "manual":
+        final_row.insert(
+            0,
+            InlineKeyboardButton(
+                "⏭ Другой материал",
+                callback_data=f"draftnext:{draft_id}",
+            ),
+        )
+    rows = [
+        [InlineKeyboardButton("✅ Опубликовать сейчас", callback_data=f"pub:{draft_id}")],
+    ]
+    if post is not None and post["media_kind"] == "manual":
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "✨ Standard Transform",
+                    callback_data=f"transform:{draft_id}",
+                )
+            ]
+        )
+    rows.extend(
+        [
+            [
+                InlineKeyboardButton(
+                    "✏️ Редактировать руками",
+                    callback_data=f"edit:{draft_id}",
+                ),
+                InlineKeyboardButton(
+                    "🤖 Редактировать с AI",
+                    callback_data=f"aiedit:{draft_id}",
+                ),
+            ],
+            final_row,
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def _media_choice_keyboard(draft_id: int, *, planning: bool) -> InlineKeyboardMarkup:
+    prefix = "plan" if planning else "pub"
+    destination = "в очередь" if planning else "сейчас"
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("✅ Опубликовать", callback_data=f"pub:{draft_id}"),
                 InlineKeyboardButton(
-                    "⏹ Закончить итерацию",
-                    callback_data=f"draftskip:{draft_id}",
+                    f"🖼 С картинкой {destination}",
+                    callback_data=f"{prefix}with:{draft_id}",
+                ),
+                InlineKeyboardButton(
+                    f"📝 Без картинки {destination}",
+                    callback_data=f"{prefix}without:{draft_id}",
                 ),
             ],
-            [
-                InlineKeyboardButton(
-                    "✏️ Редактировать без AI-лимита",
-                    callback_data=f"edit:{draft_id}",
-                )
-            ],
+            [InlineKeyboardButton("↩️ Назад", callback_data=f"mediaresume:{draft_id}")],
         ]
     )
+
+
+def _draft_has_photo(conn, draft) -> bool:
+    post = db.get_post(conn, draft["post_id"])
+    return post is not None and post["media_kind"] == "photo"
+
+
+def _photo_publish_error(conn, draft) -> str | None:
+    post = db.get_post(conn, draft["post_id"])
+    if post is None or post["media_kind"] != "photo":
+        return "У этого поста нет исходной картинки"
+    if not post["bot_media_file_id"] or not post["media_access_token"]:
+        return "Фото не удалось сохранить. Можно опубликовать без картинки."
+    if post["media_size"] and post["media_size"] >= 10_000_000:
+        return "Фото превышает лимит Buffer 10 МБ. Можно опубликовать без картинки."
+    if not config.PUBLIC_BASE_URL:
+        return "PUBLIC_BASE_URL не настроен. Buffer не сможет забрать картинку."
+    return None
 
 
 def _main_keyboard() -> ReplyKeyboardMarkup:
@@ -133,6 +246,16 @@ def _main_keyboard() -> ReplyKeyboardMarkup:
         [[KeyboardButton(NEW_POST_BUTTON), KeyboardButton(STATS_BUTTON)]],
         resize_keyboard=True,
         is_persistent=True,
+    )
+
+
+def _new_post_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📚 Накидывать из базы", callback_data="newdb:0")],
+            [InlineKeyboardButton("✍️ Написать свой текст", callback_data="newcustom:0")],
+            [InlineKeyboardButton("❌ Отменить", callback_data="newcancel:0")],
+        ]
     )
 
 
@@ -203,7 +326,7 @@ async def _send_draft(bot, conn, draft_id: int) -> None:
         bot.send_message,
         config.OWNER_CHAT_ID,
         _draft_body(draft),
-        reply_markup=_draft_keyboard(draft_id),
+        reply_markup=_draft_keyboard(conn, draft_id),
     )
     db.set_draft_message(conn, draft_id, msg.message_id)
     db.set_draft_status(conn, draft_id, "awaiting_review")
@@ -259,6 +382,33 @@ async def _send_raw(bot, conn, post) -> None:
         _finish_delivery(conn, post, message_id)
         return
 
+    # Photos are small enough for a direct Bot API upload. This avoids relying
+    # on an in-memory staging waiter across separate Vercel webhook instances
+    # and guarantees that the reusable file_id is durable before review starts.
+    if post["media_kind"] == "photo":
+        await _send_raw_parts(bot, post, keyboard_on_last=False)
+        try:
+            if post["media_size"] and post["media_size"] > config.BOT_MEDIA_MAX_BYTES:
+                raise RuntimeError(
+                    f"файл больше лимита отправки бота ({config.BOT_MEDIA_MAX_BYTES // 1_000_000} МБ)"
+                )
+            async with asyncio.timeout(300):
+                with tempfile.TemporaryDirectory(prefix="repost-photo-") as tmp:
+                    path = await ingest.download_post_media(post, tmp)
+                    msg = await _send_media(bot, post, path)
+                    _remember_bot_media(conn, post, _message_media_file_id(msg, "photo"))
+        except Exception as exc:  # noqa: BLE001
+            msg = await _send(
+                bot.send_message,
+                config.OWNER_CHAT_ID,
+                f"⚠️ Фото не удалось переслать: {_public_error_text(exc)}\n"
+                f"Открыть оригинал: {post['url']}",
+                reply_markup=_raw_keyboard(post["id"]),
+                disable_web_page_preview=True,
+            )
+        _finish_delivery(conn, post, msg.message_id)
+        return
+
     staging = None
     staging_event = None
     token = secrets.token_urlsafe(18)
@@ -279,7 +429,8 @@ async def _send_raw(bot, conn, post) -> None:
             waiter.cancel()
     if staging is not None and staging_event is not None:
         sender_id, marker_user_id, media_user_id = staging
-        bot_chat_id, inbound_bot_message_id = staging_event
+        bot_chat_id, inbound_bot_message_id, bot_media_file_id = staging_event
+        _remember_bot_media(conn, post, bot_media_file_id)
         copied = None
         try:
             if bot_chat_id != sender_id:
@@ -331,6 +482,7 @@ async def _send_raw(bot, conn, post) -> None:
                         f"файл больше лимита отправки бота ({config.BOT_MEDIA_MAX_BYTES // 1_000_000} МБ)"
                     )
                 msg = await _send_media(bot, post, path)
+                _remember_bot_media(conn, post, _message_media_file_id(msg, post["media_kind"]))
     except Exception as exc:  # noqa: BLE001 — ссылка остаётся рабочим fallback
         msg = await _send(
             bot.send_message,
@@ -349,6 +501,7 @@ async def propose_batch(
     source_username: str | None = None,
     max_items: int | None = None,
     announce_empty: bool = False,
+    planning_slot_id: int | None = None,
 ) -> int:
     if not config.OWNER_CHAT_ID:
         return 0
@@ -398,6 +551,20 @@ async def propose_batch(
                 slot_key,
                 ",".join(str(post["id"]) for post in posts),
             )
+            if planning_slot_id is not None:
+                if len(posts) != 1 or not db.assign_planning_post(
+                    conn,
+                    planning_slot_id,
+                    posts[0]["id"],
+                ):
+                    for post in posts:
+                        db.release_delivery(conn, post["id"], post["claim_token"])
+                    LOGGER.warning(
+                        "planning slot assignment lost slot_id=%s post_ids=%s",
+                        planning_slot_id,
+                        ",".join(str(post["id"]) for post in posts),
+                    )
+                    return 0
             sent = 0
             for post in posts:
                 try:
@@ -407,6 +574,8 @@ async def propose_batch(
                 except Exception as exc:  # noqa: BLE001
                     LOGGER.exception("delivery failed slot=%s post_id=%s", slot_key, post["id"])
                     db.release_delivery(conn, post["id"], post["claim_token"])
+                    if planning_slot_id is not None:
+                        db.clear_planning_post(conn, planning_slot_id, post["id"])
                     try:
                         await _send(
                             bot.send_message,
@@ -462,6 +631,95 @@ async def _offer_replacement(bot, skipped_post_id: int) -> int:
     )
 
 
+def _planning_publish_datetimes(local_now: datetime) -> tuple[str, list[str]]:
+    target_date = local_now.date() + timedelta(days=1)
+    tz = ZoneInfo(config.TIMEZONE)
+    publish_at: list[str] = []
+    for slot in config.PUBLISH_TIMES:
+        hour, minute = map(int, slot.split(":"))
+        local_publish = datetime.combine(
+            target_date,
+            dtime(hour, minute),
+            tzinfo=tz,
+        )
+        publish_at.append(local_publish.astimezone(timezone.utc).isoformat())
+    return target_date.isoformat(), publish_at
+
+
+async def _continue_planning(bot, session_id: int) -> int:
+    """Offer exactly one candidate for the next unfinished planning slot."""
+    conn = db.connect()
+    try:
+        session = db.get_planning_session(conn, session_id)
+        if session is None or session["status"] != "active":
+            return 0
+        slot = db.next_planning_slot(conn, session_id)
+        if slot is None or slot["status"] != "selecting" or slot["post_id"] is not None:
+            return 0
+        reserved = db.reserve_planning_attempt(conn, slot["id"])
+        if reserved is None:
+            return 0
+        attempt = reserved["attempt_count"]
+        position = reserved["position"]
+    finally:
+        conn.close()
+    await _send(
+        bot.send_message,
+        config.OWNER_CHAT_ID,
+        f"📌 Итерация {position}/{session['target_count']}: выбираем материал для поста.",
+    )
+    sent = await propose_batch(
+        bot,
+        slot_key=f"planning:{session_id}:{position}:{attempt}",
+        max_items=1,
+        announce_empty=True,
+        planning_slot_id=slot["id"],
+    )
+    return sent
+
+
+async def start_evening_planning(bot, *, now: datetime | None = None) -> dict:
+    """Start the single 21:00 London review flow for tomorrow's posts."""
+    local_now = now or datetime.now(ZoneInfo(config.TIMEZONE))
+    if local_now.tzinfo is None:
+        local_now = local_now.replace(tzinfo=ZoneInfo(config.TIMEZONE))
+    planning_date = local_now.date().isoformat()
+    target_date, publish_at = _planning_publish_datetimes(local_now)
+    conn = db.connect()
+    try:
+        closed = db.close_stale_planning_sessions(conn, planning_date)
+        session, created = db.create_planning_session(
+            conn,
+            planning_date,
+            target_date,
+            publish_at,
+        )
+    finally:
+        conn.close()
+    if session["status"] != "active":
+        return {"created": created, "closed": closed, "sent": 0, "status": session["status"]}
+    if created:
+        await _send(
+            bot.send_message,
+            config.OWNER_CHAT_ID,
+            "🌙 Вечерняя сессия началась. Последовательно подготовим "
+            f"{session['target_count']} поста на завтра. После каждого готового "
+            "черновика я сразу запущу следующую итерацию.\n\n"
+            "Публикация завтра: " + ", ".join(config.PUBLISH_TIMES) + " по Лондону.",
+        )
+    sent = await _continue_planning(bot, session["id"])
+    LOGGER.info(
+        "planning started session_id=%s date=%s target=%s created=%s closed_stale=%s sent=%s",
+        session["id"],
+        planning_date,
+        target_date,
+        created,
+        closed,
+        sent,
+    )
+    return {"created": created, "closed": closed, "sent": sent, "status": session["status"]}
+
+
 async def _generate_from_post(
     bot,
     conn,
@@ -479,6 +737,7 @@ async def _generate_from_post(
     existing = db.active_draft_for_post(conn, post["id"])
     if existing is not None:
         try:
+            db.attach_planning_draft(conn, post["id"], existing["id"])
             await _send_generation_note(bot, existing)
             await _send_draft(bot, conn, existing["id"])
             db.set_post_status(conn, post["id"], "drafted")
@@ -507,6 +766,7 @@ async def _generate_from_post(
             out.threads_text,
             out.notes,
         )
+        db.attach_planning_draft(conn, post["id"], draft_id)
     except Exception as exc:  # noqa: BLE001
         LOGGER.exception("generation failed post_id=%s", post["id"])
         db.set_post_status(conn, post["id"], "offered")
@@ -539,8 +799,26 @@ async def _generate_from_post(
 
 
 def _texts_for_publish(draft) -> dict[str, str]:
-    linkedin = draft["edited_text"] or draft["linkedin_text"] or ""
-    return {"linkedin": linkedin, "twitter": draft["x_text"] or "", "threads": draft["threads_text"] or ""}
+    if draft["edited_text"]:
+        return {platform: draft["edited_text"] for platform in PLATFORM_LABELS}
+    return {
+        "linkedin": draft["linkedin_text"] or "",
+        "twitter": draft["x_text"] or "",
+        "threads": draft["threads_text"] or "",
+    }
+
+
+def _image_url_for_draft(conn, draft) -> str | None:
+    if not draft["include_media"]:
+        return None
+    post = db.get_post(conn, draft["post_id"])
+    if post is None or post["media_kind"] != "photo":
+        raise RuntimeError("Для черновика выбрана картинка, но исходное фото не найдено")
+    if not post["bot_media_file_id"] or not post["media_access_token"]:
+        raise RuntimeError("Фото не удалось сохранить в Telegram Bot API; выбери публикацию без картинки")
+    if not config.PUBLIC_BASE_URL:
+        raise RuntimeError("PUBLIC_BASE_URL не настроен — Buffer не сможет получить картинку")
+    return f"{config.PUBLIC_BASE_URL.rstrip('/')}/api/media/{post['media_access_token']}"
 
 
 def _ok_platforms(conn, draft_id: int) -> set[str]:
@@ -551,28 +829,45 @@ def _ok_platforms(conn, draft_id: int) -> set[str]:
     return {row["platform"] for row in rows}
 
 
-async def _publish(bot, conn, draft_id: int) -> None:
+async def _publish(bot, conn, draft_id: int, *, notify: bool = True) -> None:
     if not db.claim_draft_publish(conn, draft_id):
-        await _send(bot.send_message, config.OWNER_CHAT_ID, "Этот черновик уже публикуется или обработан.")
+        if notify:
+            await _send(
+                bot.send_message,
+                config.OWNER_CHAT_ID,
+                "Этот черновик уже публикуется или обработан.",
+            )
         return
     draft = db.get_draft(conn, draft_id)
     texts = _texts_for_publish(draft)
+    try:
+        image_url = _image_url_for_draft(conn, draft)
+    except Exception as exc:
+        db.set_draft_status(conn, draft_id, "approved")
+        await _send(
+            bot.send_message,
+            config.OWNER_CHAT_ID,
+            f"⚠️ Не могу подготовить картинку: {_public_error_text(exc)}",
+            reply_markup=_draft_keyboard(conn, draft_id) if notify else None,
+        )
+        return
     done = _ok_platforms(conn, draft_id)
     todo = {platform: text for platform, text in texts.items() if platform not in done}
-    await _send(
-        bot.send_message,
-        config.OWNER_CHAT_ID,
-        "⏳ Отправляю пост в Buffer: "
-        + ", ".join(PLATFORM_LABELS.get(platform, platform) for platform in todo)
-        + ". Обычно это занимает несколько секунд.",
-    )
+    if notify:
+        await _send(
+            bot.send_message,
+            config.OWNER_CHAT_ID,
+            "⏳ Отправляю пост в Buffer: "
+            + ", ".join(PLATFORM_LABELS.get(platform, platform) for platform in todo)
+            + ". Обычно это занимает несколько секунд.",
+        )
     LOGGER.info(
         "publication started draft_id=%s platforms=%s",
         draft_id,
         ",".join(todo),
     )
     try:
-        results = await asyncio.to_thread(publisher.publish_all, todo)
+        results = await asyncio.to_thread(publisher.publish_all, todo, image_url)
     except BaseException as exc:
         LOGGER.exception("publication result unknown draft_id=%s", draft_id)
         db.set_draft_status(conn, draft_id, "publish_unknown")
@@ -617,12 +912,83 @@ async def _publish(bot, conn, draft_id: int) -> None:
         db.set_draft_status(conn, draft_id, "published")
         db.set_post_status(conn, draft["post_id"], "published")
         markup = None
-    await _send(
-        bot.send_message,
-        config.OWNER_CHAT_ID,
-        "Публикация:\n" + "\n".join(lines) if lines else "Нечего публиковать",
-        reply_markup=markup,
-    )
+    if notify or failed or unknown:
+        await _send(
+            bot.send_message,
+            config.OWNER_CHAT_ID,
+            "Публикация:\n" + "\n".join(lines) if lines else "Нечего публиковать",
+            reply_markup=markup,
+        )
+
+
+async def publish_due_planned(bot, *, now: datetime | None = None) -> dict[str, int]:
+    """Publish all durable planning slots due by the current UTC instant."""
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    conn = db.connect()
+    summary = {"claimed": 0, "published": 0, "retry": 0, "unknown": 0, "failed": 0}
+    try:
+        slots = db.claim_due_planning_slots(conn, current.astimezone(timezone.utc).isoformat())
+        summary["claimed"] = len(slots)
+        for slot in slots:
+            draft = db.get_draft(conn, slot["draft_id"])
+            if draft is None:
+                db.finish_planning_publication(conn, slot["id"], "missing", "draft missing")
+                summary["failed"] += 1
+                await _send(
+                    bot.send_message,
+                    config.OWNER_CHAT_ID,
+                    f"❌ Плановый слот {slot['position']}/{config.DAILY_POSTS}: "
+                    "черновик не найден, публикация не выполнена.",
+                )
+                continue
+            try:
+                await _publish(bot, conn, draft["id"], notify=False)
+            except BaseException as exc:
+                refreshed = db.get_draft(conn, draft["id"])
+                status = refreshed["status"] if refreshed is not None else "missing"
+                db.finish_planning_publication(
+                    conn,
+                    slot["id"],
+                    status,
+                    _public_error_text(exc),
+                )
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                LOGGER.exception(
+                    "scheduled publication crashed slot_id=%s draft_id=%s",
+                    slot["id"],
+                    draft["id"],
+                )
+                summary["unknown" if status == "publish_unknown" else "failed"] += 1
+                continue
+            refreshed = db.get_draft(conn, draft["id"])
+            status = refreshed["status"] if refreshed is not None else "missing"
+            slot_status = db.finish_planning_publication(conn, slot["id"], status)
+            key = {
+                "published": "published",
+                "ready": "retry",
+                "publish_unknown": "unknown",
+            }.get(slot_status, "failed")
+            summary[key] += 1
+            if slot_status == "published":
+                post = db.get_post(conn, draft["post_id"])
+                source = (post["title"] or post["username"]) if post is not None else "без источника"
+                excerpt = re.sub(r"\s+", " ", _draft_body(draft)).strip()
+                if len(excerpt) > 180:
+                    excerpt = excerpt[:177].rstrip() + "…"
+                planned_time = config.PUBLISH_TIMES[slot["position"] - 1]
+                await _send(
+                    bot.send_message,
+                    config.OWNER_CHAT_ID,
+                    f"✅ {planned_time} — пост #{draft['id']} опубликован в LinkedIn, X и Threads.\n"
+                    f"Источник: {source}\n\n{excerpt}",
+                )
+        LOGGER.info("scheduled publication sweep now=%s summary=%s", current.isoformat(), summary)
+        return summary
+    finally:
+        conn.close()
 
 
 async def on_staging_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -637,7 +1003,54 @@ async def on_staging_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     token = marker.removeprefix(_STAGING_PREFIX).strip()
     waiter = _STAGING_WAITERS.get(token)
     if waiter is not None and not waiter.done():
-        waiter.set_result((chat.id, msg.message_id))
+        media_kind = (
+            "photo"
+            if getattr(msg, "photo", None)
+            else "video"
+            if getattr(msg, "video", None)
+            else "document"
+        )
+        waiter.set_result((chat.id, msg.message_id, _message_media_file_id(msg, media_kind)))
+
+
+async def _finalize_planning_draft(query, context, conn, draft_id: int, include_media: bool) -> None:
+    draft = db.get_draft(conn, draft_id)
+    if draft is None:
+        await query.answer("Черновик не найден", show_alert=True)
+        return
+    if include_media:
+        error = _photo_publish_error(conn, draft)
+        if error:
+            await query.answer(error, show_alert=True)
+            return
+    db.set_draft_include_media(conn, draft_id, include_media)
+    progress = db.mark_planning_draft_ready(conn, draft_id)
+    if progress is None:
+        await query.answer("Слот уже сохранён или вечерняя сессия закрыта", show_alert=True)
+        return
+    try:
+        await query.answer("Сохранено на завтра")
+        await query.edit_message_reply_markup(None)
+    except Exception:
+        pass
+    media_note = " с картинкой" if include_media else ""
+    if progress["ready"] < progress["target"]:
+        await _send(
+            context.bot.send_message,
+            config.OWNER_CHAT_ID,
+            f"✅ Пост {progress['ready']}/{progress['target']} сохранён на завтра{media_note}. "
+            "Запускаю следующую итерацию.",
+        )
+        await _continue_planning(context.bot, progress["session_id"])
+    else:
+        await _send(
+            context.bot.send_message,
+            config.OWNER_CHAT_ID,
+            f"✅ Вечерняя сессия завершена: {progress['ready']}/{progress['target']} "
+            f"поста готовы на {progress['target_date']}. Они выйдут в "
+            + ", ".join(config.PUBLISH_TIMES)
+            + f" по {config.TIMEZONE}.",
+        )
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -666,6 +1079,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if post is None:
             await query.answer("Материал не найден", show_alert=True)
             return
+        planning_slot = db.planning_slot_for_post(conn, post["id"])
         if action == "drop":
             try:
                 await query.answer()
@@ -688,6 +1102,28 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     await query.edit_message_reply_markup(None)
                 except Exception:
                     pass
+                if planning_slot is not None and planning_slot["session_status"] == "active":
+                    db.clear_planning_post(conn, planning_slot["id"], post["id"])
+                    try:
+                        await _send(
+                            context.bot.send_message,
+                            config.OWNER_CHAT_ID,
+                            f"⏭ Материал пропущен. Итерация {planning_slot['position']}/"
+                            f"{planning_slot['target_count']} продолжается — показываю следующий.",
+                        )
+                    except Exception:
+                        pass
+                    replacement_count = await _continue_planning(
+                        context.bot,
+                        planning_slot["session_id"],
+                    )
+                    LOGGER.info(
+                        "planning raw replacement post_id=%s slot_id=%s sent=%s",
+                        post["id"],
+                        planning_slot["id"],
+                        replacement_count,
+                    )
+                    return
                 try:
                     await _send(
                         context.bot.send_message,
@@ -767,12 +1203,115 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
         return
 
+    if action == "newcancel":
+        await query.answer("Отменено")
+        await query.edit_message_reply_markup(None)
+        return
+    if action == "newcustom":
+        await query.answer()
+        await query.edit_message_reply_markup(None)
+        await _open_custom_post(context.bot)
+        return
+    if action == "newdb":
+        await query.answer("Ищу материал")
+        await query.edit_message_reply_markup(None)
+        await _send(
+            context.bot.send_message,
+            config.OWNER_CHAT_ID,
+            "📚 Запускаю одну внеплановую итерацию. Готовый пост можно будет "
+            "опубликовать сразу.",
+        )
+        context.application.create_task(
+            propose_batch(
+                context.bot,
+                slot_key=f"ondemand:{uuid.uuid4().hex}",
+                max_items=1,
+                announce_empty=True,
+            ),
+            update=update,
+            name="ondemand-delivery",
+        )
+        return
+
     draft = db.get_draft(conn, object_id)
     if draft is None:
         await query.answer("Черновик не найден", show_alert=True)
         return
     if action == "skip":  # backwards compatibility for already-sent old keyboards
         action = "draftskip"
+    if action == "planready":
+        planning_slot = db.planning_slot_for_draft(conn, object_id)
+        if planning_slot is None:
+            await query.answer("Этот черновик не относится к вечернему плану", show_alert=True)
+            return
+        if planning_slot["session_status"] != "active" or planning_slot["status"] != "reviewing":
+            await query.answer("Слот уже сохранён или вечерняя сессия закрыта", show_alert=True)
+            return
+        if _draft_has_photo(conn, draft):
+            await query.answer("Выбери вариант картинки")
+            await query.edit_message_reply_markup(
+                _media_choice_keyboard(object_id, planning=True)
+            )
+            return
+        await _finalize_planning_draft(query, context, conn, object_id, False)
+        return
+    if action in {"planwith", "planwithout"}:
+        await _finalize_planning_draft(
+            query,
+            context,
+            conn,
+            object_id,
+            action == "planwith",
+        )
+        return
+    if action == "mediaresume":
+        await query.answer()
+        await query.edit_message_reply_markup(_draft_keyboard(conn, object_id))
+        return
+    if action == "plandiscard":
+        progress = db.discard_planning_draft(conn, object_id)
+        if progress is None:
+            await query.answer("Черновик уже закрыт или сессия завершена", show_alert=True)
+            return
+        try:
+            await query.answer("Ищу другой материал")
+            await query.edit_message_reply_markup(None)
+        except Exception:
+            pass
+        await _send(
+            context.bot.send_message,
+            config.OWNER_CHAT_ID,
+            f"⏭ Черновик отклонён. Итерация {progress['position']}/{progress['target']} "
+            "продолжается — показываю следующий материал.",
+        )
+        await _continue_planning(context.bot, progress["session_id"])
+        return
+    if action == "plancancel":
+        planning_slot = db.planning_slot_for_draft(conn, object_id)
+        if planning_slot is None:
+            await query.answer("Вечерняя сессия не найдена", show_alert=True)
+            return
+        result = db.cancel_planning_session(conn, planning_slot["session_id"])
+        if result is None:
+            await query.answer("Сессия уже закрыта", show_alert=True)
+            return
+        try:
+            await query.answer()
+            await query.edit_message_reply_markup(None)
+        except Exception:
+            pass
+        await _send(
+            context.bot.send_message,
+            config.OWNER_CHAT_ID,
+            f"⏹ Вечерняя сессия остановлена. Уже готово {result['ready']}/"
+            f"{result['target']}; готовые посты останутся в расписании, остальные слоты отменены.",
+        )
+        return
+    if action in {"edit", "aiedit"}:
+        planning_slot = db.planning_slot_for_draft(conn, object_id)
+        if planning_slot is not None and planning_slot["status"] != "reviewing":
+            await query.answer("Пост уже сохранён в расписание; редактирование закрыто", show_alert=True)
+            return
     if draft["status"] in ("expired", "skipped", "published", "publishing", "publish_unknown"):
         await query.answer()
         await query.edit_message_reply_markup(None)
@@ -783,7 +1322,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    if action in {"draftskip", "edit"} and _ok_platforms(conn, object_id):
+    if action in {"draftskip", "draftnext", "plandiscard", "edit", "aiedit", "transform"} and _ok_platforms(
+        conn,
+        object_id,
+    ):
         await query.answer(
             "Часть площадок уже опубликована. Можно только повторить оставшиеся.",
             show_alert=True,
@@ -816,18 +1358,208 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
         except Exception:
             pass
+    elif action == "draftnext":
+        if not db.transition_draft(
+            conn,
+            object_id,
+            ("awaiting_review", "approved", "delivery_failed"),
+            "skipped",
+        ):
+            return
+        db.set_post_status(conn, draft["post_id"], "skipped")
+        try:
+            await query.edit_message_reply_markup(None)
+        except Exception:
+            pass
+        await _send(
+            context.bot.send_message,
+            config.OWNER_CHAT_ID,
+            f"⏭ Черновик #{object_id} отклонён. Показываю следующий материал.",
+        )
+        await _offer_replacement(context.bot, draft["post_id"])
     elif action == "edit":
+        current_text = _draft_body(draft)
+        edit_instruction = (
+            "Пришли полный изменённый текст ответом на это сообщение. "
+            f"AI-лимит {config.MAX_POST_CHARS} уже не применяется; вручную можно до "
+            f"{config.MANUAL_MAX_POST_CHARS} символов."
+        )
+        if len(current_text) + len(edit_instruction) > 3900:
+            await _send(
+                context.bot.send_message,
+                config.OWNER_CHAT_ID,
+                f"✏️ Текущая версия поста #{object_id}:",
+            )
+            for chunk in _text_chunks(current_text):
+                await _send(context.bot.send_message, config.OWNER_CHAT_ID, chunk)
+            prompt_text = edit_instruction
+        else:
+            prompt_text = f"✏️ Текущая версия поста #{object_id}:\n\n{current_text}\n\n{edit_instruction}"
         prompt = await _send(
             context.bot.send_message,
             config.OWNER_CHAT_ID,
-            f"✏️ Пришли полный новый текст поста #{object_id} ответом на это сообщение. "
-            f"AI-лимит {config.MAX_POST_CHARS} уже не применяется; вручную можно до "
-            f"{config.MANUAL_MAX_POST_CHARS} символов.",
-            reply_markup=ForceReply(selective=True),
+            prompt_text,
+            reply_markup=ForceReply(
+                selective=True,
+                input_field_placeholder="Вставь сюда полную изменённую версию",
+            ),
         )
         db.set_edit_msg(conn, object_id, prompt.message_id)
+    elif action == "aiedit":
+        prompt = await _send(
+            context.bot.send_message,
+            config.OWNER_CHAT_ID,
+            f"🤖 AI-редактор открыт для поста #{object_id}. Напиши одной репликой, "
+            "что изменить: убрать фрагмент, переписать формулировку, добавить шутку, "
+            "усилить hook и т.д. Terra изменит текущую версию и вернёт полный пост.",
+            reply_markup=ForceReply(
+                selective=True,
+                input_field_placeholder="Например: сократи второй абзац и добавь шутку",
+            ),
+        )
+        db.set_ai_prompt(conn, object_id, prompt.message_id)
+    elif action == "transform":
+        post = db.get_post(conn, draft["post_id"])
+        if post is None or post["media_kind"] != "manual":
+            await _send(
+                context.bot.send_message,
+                config.OWNER_CHAT_ID,
+                "Standard Transform доступен только для собственного текста.",
+            )
+            return
+        if not db.transition_draft(
+            conn,
+            object_id,
+            ("awaiting_review", "approved", "delivery_failed"),
+            "ai_editing",
+        ):
+            return
+        await _send(
+            context.bot.send_message,
+            config.OWNER_CHAT_ID,
+            f"⏳ Standard Transform для поста #{object_id}: English → факты Mike/Vahue → "
+            f"смысловое сжатие только при необходимости до {config.MAX_POST_CHARS}. "
+            "Обычно это занимает 10–30 секунд.",
+        )
+        try:
+            out = await asyncio.to_thread(
+                generator.translate_post,
+                "Собственный пост",
+                datetime.now(ZoneInfo(config.TIMEZONE)).date().isoformat(),
+                _draft_body(draft),
+            )
+            db.update_draft_texts(
+                conn,
+                object_id,
+                out.linkedin_text,
+                out.x_text,
+                out.threads_text,
+                None,
+            )
+            db.set_draft_status(conn, object_id, "awaiting_review")
+            transformed = db.get_draft(conn, object_id)
+            await _send_generation_note(context.bot, transformed)
+            await _send_draft(context.bot, conn, object_id)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("standard transform failed draft_id=%s", object_id)
+            db.set_draft_status(conn, object_id, "awaiting_review")
+            await _send(
+                context.bot.send_message,
+                config.OWNER_CHAT_ID,
+                f"⚠️ Standard Transform не завершён: {_public_error_text(exc)}. "
+                "Исходная версия сохранена.",
+                reply_markup=_draft_keyboard(conn, object_id),
+            )
     elif action == "pub":
+        if _draft_has_photo(conn, draft):
+            await query.edit_message_reply_markup(
+                _media_choice_keyboard(object_id, planning=False)
+            )
+        else:
+            await _publish(context.bot, conn, object_id)
+    elif action in {"pubwith", "pubwithout"}:
+        include_media = action == "pubwith"
+        if include_media:
+            error = _photo_publish_error(conn, draft)
+            if error:
+                await _send(
+                    context.bot.send_message,
+                    config.OWNER_CHAT_ID,
+                    f"⚠️ {error}",
+                    reply_markup=_media_choice_keyboard(object_id, planning=False),
+                )
+                return
+        db.set_draft_include_media(conn, object_id, include_media)
+        try:
+            await query.edit_message_reply_markup(None)
+        except Exception:
+            pass
         await _publish(context.bot, conn, object_id)
+
+
+async def _apply_ai_instruction(update, context, conn, draft, instruction: str) -> None:
+    planning_slot = db.planning_slot_for_draft(conn, draft["id"])
+    if planning_slot is not None and planning_slot["status"] != "reviewing":
+        await update.message.reply_text(
+            "Этот пост уже сохранён в расписание или вечерняя сессия закрыта; "
+            "AI-редактирование больше не применяется."
+        )
+        return
+    if _ok_platforms(conn, draft["id"]):
+        await update.message.reply_text(
+            "Часть площадок уже опубликована — AI не меняет текст, чтобы версии не разошлись."
+        )
+        return
+    if not db.transition_draft(
+        conn,
+        draft["id"],
+        ("awaiting_review", "approved"),
+        "ai_editing",
+    ):
+        await update.message.reply_text("⚠️ Этот черновик уже обрабатывается или закрыт.")
+        return
+    await update.message.reply_text(
+        f"⏳ Terra редактирует пост #{draft['id']} по твоей инструкции и проверяет "
+        f"лимит {config.MAX_POST_CHARS}. Обычно это занимает 10–30 секунд."
+    )
+    current_text = _draft_body(draft)
+    try:
+        out = await asyncio.to_thread(generator.revise_post, current_text, instruction)
+        db.update_draft_texts(
+            conn,
+            draft["id"],
+            out.linkedin_text,
+            out.x_text,
+            out.threads_text,
+            out.linkedin_text,
+        )
+        db.set_draft_status(conn, draft["id"], "awaiting_review")
+        db.set_ai_prompt(conn, draft["id"], None)
+        await _send(
+            context.bot.send_message,
+            config.OWNER_CHAT_ID,
+            "🤖 Готово. Теперь пост выглядит так:"
+            + (f"\n\nИзменения: {out.notes[:500]}" if out.notes else ""),
+        )
+        await _send_draft(context.bot, conn, draft["id"])
+        LOGGER.info(
+            "AI edit completed draft_id=%s instruction_chars=%s result_chars=%s",
+            draft["id"],
+            len(instruction),
+            len(out.linkedin_text),
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("AI edit failed draft_id=%s", draft["id"])
+        db.set_draft_status(conn, draft["id"], "awaiting_review")
+        retry_prompt = await update.message.reply_text(
+            f"⚠️ AI-редактирование не завершилось: {_public_error_text(exc)}\n\n"
+            "Текущая версия сохранена. Ответь на это сообщение инструкцией, чтобы повторить.",
+            reply_markup=ForceReply(
+                selective=True,
+                input_field_placeholder="Повтори или уточни инструкцию для Terra",
+            ),
+        )
+        db.set_ai_prompt(conn, draft["id"], retry_prompt.message_id)
 
 
 async def on_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -843,20 +1575,37 @@ async def on_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         post = db.post_by_manual_prompt(conn, reply_to)
         if post is not None and post["status"] != "awaiting_manual":
             post = None
-        draft = None if post is not None else db.draft_by_message(conn, reply_to)
+        ai_draft = None if post is not None else db.draft_by_ai_prompt(conn, reply_to)
+        draft = None if post is not None or ai_draft is not None else db.draft_by_message(conn, reply_to)
         LOGGER.info(
             "reply received reply_to=%s chars=%s target=%s target_id=%s",
             reply_to,
             len(text),
-            "manual" if post is not None else "draft" if draft is not None else "none",
-            post["id"] if post is not None else draft["id"] if draft is not None else "none",
+            "manual"
+            if post is not None
+            else "ai"
+            if ai_draft is not None
+            else "draft"
+            if draft is not None
+            else "none",
+            post["id"]
+            if post is not None
+            else ai_draft["id"]
+            if ai_draft is not None
+            else draft["id"]
+            if draft is not None
+            else "none",
         )
 
-        if post is None and draft is None:
+        if post is None and ai_draft is None and draft is None:
             await update.message.reply_text(
                 "⚠️ Я получил сообщение, но не нашёл активное редактирование для этого reply. "
                 "Нажми «✏️ Редактировать» под актуальным черновиком и ответь на новый prompt."
             )
+            return
+
+        if ai_draft is not None:
+            await _apply_ai_instruction(update, context, conn, ai_draft, text)
             return
 
         target_limit = (
@@ -887,9 +1636,7 @@ async def on_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         if post is not None and post["media_kind"] == "manual":
             await update.message.reply_text(
-                f"⏳ Текст принят: {len(text)} символов. Запускаю Terra: "
-                f"1) English → 2) факты Mike/Vahue → 3) смысловое сжатие до "
-                f"{config.MAX_POST_CHARS}. Обычно это занимает 10–30 секунд."
+                f"✅ Текст принят: {len(text)} символов. Сохраняю как есть, без AI."
             )
         else:
             await update.message.reply_text(
@@ -917,23 +1664,27 @@ async def on_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 return
             try:
                 if post["media_kind"] == "manual":
-                    out = await asyncio.to_thread(
-                        generator.translate_post,
-                        "Собственный пост",
-                        datetime.now(ZoneInfo(config.TIMEZONE)).date().isoformat(),
+                    draft_id = db.create_draft(
+                        conn,
+                        post["id"],
+                        "manual/raw",
                         text,
+                        text,
+                        text,
+                        "",
                     )
                 else:
                     out = await asyncio.to_thread(generator.adapt, text)
-                draft_id = db.create_draft(
-                    conn,
-                    post["id"],
-                    config.llm_model(),
-                    out.linkedin_text,
-                    out.x_text,
-                    out.threads_text,
-                    out.notes,
-                )
+                    draft_id = db.create_draft(
+                        conn,
+                        post["id"],
+                        config.llm_model(),
+                        out.linkedin_text,
+                        out.x_text,
+                        out.threads_text,
+                        out.notes,
+                    )
+                db.attach_planning_draft(conn, post["id"], draft_id)
             except Exception as exc:  # noqa: BLE001
                 LOGGER.exception("manual draft preparation failed post_id=%s", post["id"])
                 db.set_post_status(conn, post["id"], "awaiting_manual")
@@ -960,6 +1711,13 @@ async def on_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 db.set_manual_prompt(conn, post["id"], retry_prompt.message_id)
             return
 
+        planning_slot = db.planning_slot_for_draft(conn, draft["id"])
+        if planning_slot is not None and planning_slot["status"] != "reviewing":
+            await update.message.reply_text(
+                "Этот пост уже сохранён в расписание или вечерняя сессия закрыта; "
+                "редактирование больше не применяется."
+            )
+            return
         if draft["status"] not in ("awaiting_review", "approved"):
             await update.message.reply_text(f"Черновик уже нельзя редактировать ({draft['status']}).")
             return
@@ -1034,16 +1792,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def cmd_new_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_owner(update):
-        return
+async def _open_custom_post(bot) -> None:
     conn = db.connect()
     try:
         existing = db.pending_owner_post(conn, config.OWNER_CHAT_ID)
-        prompt = await update.message.reply_text(
-            "✍️ Пришли исходный текст ответом на это сообщение. Можно на русском или "
-            "английском и длиннее 1500 символов: Terra переведёт, исправит факты и "
-            f"смыслово сожмёт результат до {config.MAX_POST_CHARS}.",
+        prompt = await _send(
+            bot.send_message,
+            config.OWNER_CHAT_ID,
+            "✍️ Пришли свой текст ответом на это сообщение. Я сначала сохраню его как есть — "
+            "без AI и без автоматического перевода. Затем можно сразу опубликовать, применить "
+            "Standard Transform, отредактировать вручную или через AI.",
             reply_markup=ForceReply(selective=True),
         )
         if existing is not None:
@@ -1075,9 +1833,22 @@ async def cmd_new_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         LOGGER.info("owner post input created post_id=%s prompt=%s", row["id"], prompt.message_id)
     except Exception as exc:  # noqa: BLE001
         LOGGER.exception("failed to start owner post input")
-        await update.message.reply_text(f"⚠️ Не удалось начать новый пост: {_public_error_text(exc)}")
+        await _send(
+            bot.send_message,
+            config.OWNER_CHAT_ID,
+            f"⚠️ Не удалось начать новый пост: {_public_error_text(exc)}",
+        )
     finally:
         conn.close()
+
+
+async def cmd_new_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_owner(update):
+        return
+    await update.message.reply_text(
+        "Что создаём? Это отдельный режим: он не влияет на вечерние три черновика.",
+        reply_markup=_new_post_menu(),
+    )
 
 
 async def cmd_next(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1126,6 +1897,13 @@ async def cmd_resend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if draft is None:
             await update.message.reply_text(f"⚠️ Черновик #{draft_id} не найден.")
             return
+        planning_slot = db.planning_slot_for_draft(conn, draft_id)
+        if planning_slot is not None and planning_slot["status"] != "reviewing":
+            await update.message.reply_text(
+                f"⚠️ Черновик #{draft_id} уже сохранён в план ({planning_slot['status']}); "
+                "повторная review-карточка не создаётся."
+            )
+            return
         if draft["status"] in ("publishing", "published"):
             await update.message.reply_text(
                 f"⚠️ Черновик #{draft_id} уже {draft['status']}; повторно не отправляю."
@@ -1162,6 +1940,14 @@ async def propose_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     await propose_batch(context.bot, slot_key=f"daily:{now.date().isoformat()}:{slot}")
 
 
+async def planning_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    await start_evening_planning(context.bot)
+
+
+async def publication_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    await publish_due_planned(context.bot)
+
+
 def _startup_recovery_message(deliveries: int, work: dict[str, int]) -> str | None:
     lines: list[str] = []
     if deliveries:
@@ -1194,6 +1980,11 @@ def _startup_recovery_message(deliveries: int, work: dict[str, int]) -> str | No
         lines.append(
             f"• публикаций с неизвестным результатом: {work['publishing_unknown']}. "
             "Автоповтор отключён — проверь Buffer вручную."
+        )
+    if work["ai_edits_reopened"]:
+        lines.append(
+            f"• AI-редактирований возвращено в review после рестарта: "
+            f"{work['ai_edits_reopened']}"
         )
     if not lines:
         return None
@@ -1442,6 +2233,7 @@ def main() -> None:
     source_state = db.reconcile_active_sources(startup_conn, config.read_sources())
     recovered_deliveries = db.recover_incomplete_deliveries(startup_conn)
     recovered_work = db.recover_stranded_work(startup_conn)
+    recovered_planning = db.recover_planning_publications(startup_conn)
     new_recovery_notice = _startup_recovery_message(recovered_deliveries, recovered_work)
     recovery_notice = db.get_meta(startup_conn, _STARTUP_RECOVERY_NOTICE_KEY)
     if new_recovery_notice:
@@ -1455,13 +2247,19 @@ def main() -> None:
     app = create_application()
 
     tz = ZoneInfo(config.TIMEZONE)
-    for slot in config.POST_TIMES:
+    planning_hour, planning_minute = map(int, config.PLANNING_TIME.split(":"))
+    app.job_queue.run_daily(
+        planning_job,
+        time=dtime(planning_hour, planning_minute, tzinfo=tz),
+        name=f"planning-{config.PLANNING_TIME}",
+    )
+    for slot in config.PUBLISH_TIMES:
         hour, minute = map(int, slot.split(":"))
         app.job_queue.run_daily(
-            propose_job,
+            publication_job,
             time=dtime(hour, minute, tzinfo=tz),
             data={"slot": slot},
-            name=f"delivery-{slot}",
+            name=f"publication-{slot}",
         )
     sync_hour, sync_minute = map(int, config.SYNC_TIME.split(":"))
     app.job_queue.run_daily(
@@ -1485,16 +2283,19 @@ def main() -> None:
             "generating_reconciled",
             "undelivered_drafts_reopened",
             "manual_without_prompt_reoffered",
+            "ai_edits_reopened",
         )
     )
     print(
-        f"Бот запущен. Выдача: {', '.join(config.POST_TIMES)} ({config.TIMEZONE}); "
-        f"по {config.ITEMS_PER_SLOT} материала за слот; "
+        f"Бот запущен. Вечернее планирование: {config.PLANNING_TIME}; "
+        f"публикация: {', '.join(config.PUBLISH_TIMES)} ({config.TIMEZONE}); "
+        f"по {config.DAILY_POSTS} поста в день; "
         f"сбор раз в {config.SYNC_MONTHS} мес. {'включён' if config.AUTO_SYNC else 'выключен'}. "
         f"Активных источников: {source_state['configured']}; "
         f"восстановлено доставок: {recovered_deliveries}; "
         f"зависших генераций: {recovered_generation_count}; "
-        f"неизвестных публикаций: {recovered_work['publishing_unknown']}."
+        f"неизвестных публикаций: {recovered_work['publishing_unknown']}; "
+        f"восстановлено planning-слотов: {sum(recovered_planning.values())}."
     )
     # Telegram keeps the previous allowed_updates filter when the parameter is
     # omitted. Explicitly request every update type so inline button callbacks

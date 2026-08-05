@@ -20,6 +20,8 @@ TABLES = (
     "publication",
     "delivery_batch",
     "delivery_item",
+    "planning_session",
+    "planning_slot",
     "app_meta",
 )
 SEQUENCED_TABLES = TABLES[:-1]

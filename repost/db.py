@@ -29,6 +29,8 @@ CREATE TABLE IF NOT EXISTS post(
   media_mime TEXT,
   media_size INTEGER,
   media_name TEXT,
+  bot_media_file_id TEXT,
+  media_access_token TEXT,
   no_forwards INTEGER NOT NULL DEFAULT 0,
   transcript TEXT,
   summary TEXT,
@@ -53,6 +55,8 @@ CREATE TABLE IF NOT EXISTS draft(
   notes TEXT,
   status TEXT NOT NULL DEFAULT 'awaiting_review',
   tg_message_id INTEGER,
+  ai_prompt_id INTEGER,
+  include_media INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_draft_tg ON draft(tg_message_id);
@@ -85,6 +89,33 @@ CREATE TABLE IF NOT EXISTS delivery_item(
   sent_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS planning_session(
+  id INTEGER PRIMARY KEY,
+  planning_date TEXT UNIQUE NOT NULL,
+  target_date TEXT NOT NULL,
+  target_count INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS planning_slot(
+  id INTEGER PRIMARY KEY,
+  session_id INTEGER NOT NULL REFERENCES planning_session(id),
+  position INTEGER NOT NULL,
+  publish_at TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'selecting',
+  post_id INTEGER UNIQUE REFERENCES post(id),
+  draft_id INTEGER UNIQUE REFERENCES draft(id),
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  publish_claimed_at TEXT,
+  last_error TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(session_id, position)
+);
+CREATE INDEX IF NOT EXISTS idx_planning_slot_due ON planning_slot(status, publish_at);
+
 CREATE TABLE IF NOT EXISTS app_meta(
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -114,6 +145,8 @@ CREATE TABLE IF NOT EXISTS post(
   media_mime TEXT,
   media_size BIGINT,
   media_name TEXT,
+  bot_media_file_id TEXT,
+  media_access_token TEXT,
   no_forwards INTEGER NOT NULL DEFAULT 0,
   transcript TEXT,
   summary TEXT,
@@ -127,6 +160,9 @@ CREATE TABLE IF NOT EXISTS post(
 CREATE INDEX IF NOT EXISTS idx_post_status_date ON post(status, posted_at);
 CREATE INDEX IF NOT EXISTS idx_post_hash ON post(text_hash);
 CREATE INDEX IF NOT EXISTS idx_post_manual_prompt ON post(manual_prompt_id);
+ALTER TABLE post ADD COLUMN IF NOT EXISTS bot_media_file_id TEXT;
+ALTER TABLE post ADD COLUMN IF NOT EXISTS media_access_token TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_post_media_token ON post(media_access_token);
 
 CREATE TABLE IF NOT EXISTS draft(
   id BIGSERIAL PRIMARY KEY,
@@ -140,9 +176,13 @@ CREATE TABLE IF NOT EXISTS draft(
   status TEXT NOT NULL DEFAULT 'awaiting_review',
   tg_message_id BIGINT,
   edit_msg_id BIGINT,
+  ai_prompt_id BIGINT,
+  include_media INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT ((CURRENT_TIMESTAMP AT TIME ZONE 'UTC')::text)
 );
 CREATE INDEX IF NOT EXISTS idx_draft_tg ON draft(tg_message_id);
+ALTER TABLE draft ADD COLUMN IF NOT EXISTS ai_prompt_id BIGINT;
+ALTER TABLE draft ADD COLUMN IF NOT EXISTS include_media INTEGER NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS publication(
   id BIGSERIAL PRIMARY KEY,
@@ -171,6 +211,33 @@ CREATE TABLE IF NOT EXISTS delivery_item(
   bot_message_id BIGINT,
   sent_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS planning_session(
+  id BIGSERIAL PRIMARY KEY,
+  planning_date TEXT UNIQUE NOT NULL,
+  target_date TEXT NOT NULL,
+  target_count INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active',
+  created_at TEXT NOT NULL DEFAULT ((CURRENT_TIMESTAMP AT TIME ZONE 'UTC')::text),
+  completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS planning_slot(
+  id BIGSERIAL PRIMARY KEY,
+  session_id BIGINT NOT NULL REFERENCES planning_session(id),
+  position INTEGER NOT NULL,
+  publish_at TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'selecting',
+  post_id BIGINT UNIQUE REFERENCES post(id),
+  draft_id BIGINT UNIQUE REFERENCES draft(id),
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  publish_claimed_at TEXT,
+  last_error TEXT,
+  created_at TEXT NOT NULL DEFAULT ((CURRENT_TIMESTAMP AT TIME ZONE 'UTC')::text),
+  updated_at TEXT NOT NULL DEFAULT ((CURRENT_TIMESTAMP AT TIME ZONE 'UTC')::text),
+  UNIQUE(session_id, position)
+);
+CREATE INDEX IF NOT EXISTS idx_planning_slot_due ON planning_slot(status, publish_at);
 
 CREATE TABLE IF NOT EXISTS app_meta(
   key TEXT PRIMARY KEY,
@@ -294,20 +361,25 @@ def connect(path: str | None = None):
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA)
     _ensure_column(conn, "draft", "edit_msg_id", "INTEGER")
+    _ensure_column(conn, "draft", "ai_prompt_id", "INTEGER")
     _ensure_column(conn, "post", "media_kind", "TEXT NOT NULL DEFAULT 'text'")
     _ensure_column(conn, "post", "media_mime", "TEXT")
     _ensure_column(conn, "post", "media_size", "INTEGER")
     _ensure_column(conn, "post", "media_name", "TEXT")
+    _ensure_column(conn, "post", "bot_media_file_id", "TEXT")
+    _ensure_column(conn, "post", "media_access_token", "TEXT")
     _ensure_column(conn, "post", "no_forwards", "INTEGER NOT NULL DEFAULT 0")
     _ensure_column(conn, "post", "transcript", "TEXT")
     _ensure_column(conn, "post", "summary", "TEXT")
     _ensure_column(conn, "post", "offered_at", "TEXT")
     _ensure_column(conn, "post", "raw_message_id", "INTEGER")
     _ensure_column(conn, "post", "manual_prompt_id", "INTEGER")
+    _ensure_column(conn, "draft", "include_media", "INTEGER NOT NULL DEFAULT 0")
     _ensure_column(conn, "delivery_item", "claim_token", "TEXT")
     _ensure_column(conn, "delivery_item", "claimed_at", "TEXT")
     _remove_delivery_source_uniqueness(conn)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_post_manual_prompt ON post(manual_prompt_id)")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_post_media_token ON post(media_access_token)")
     conn.commit()
     return conn
 
@@ -786,6 +858,7 @@ def recover_stranded_work(conn: sqlite3.Connection) -> dict[str, int]:
         "undelivered_drafts_reopened": 0,
         "manual_without_prompt_reoffered": 0,
         "publishing_unknown": 0,
+        "ai_edits_reopened": 0,
     }
     _begin_write(conn)
     try:
@@ -793,6 +866,10 @@ def recover_stranded_work(conn: sqlite3.Connection) -> dict[str, int]:
             "UPDATE draft SET status='publish_unknown' WHERE status='publishing'"
         )
         result["publishing_unknown"] = publishing.rowcount
+        ai_editing = conn.execute(
+            "UPDATE draft SET status='awaiting_review' WHERE status='ai_editing'"
+        )
+        result["ai_edits_reopened"] = ai_editing.rowcount
 
         rows = conn.execute(
             "SELECT p.id post_id, p.manual_prompt_id, "
@@ -928,6 +1005,23 @@ def set_post_status(conn, post_id: int, status: str) -> None:
     conn.commit()
 
 
+def set_post_bot_media(conn, post_id: int, file_id: str, access_token: str) -> None:
+    """Persist a reusable Bot API file id and an unguessable public media token."""
+    conn.execute(
+        "UPDATE post SET bot_media_file_id=?, media_access_token=? WHERE id=?",
+        (file_id, access_token, post_id),
+    )
+    conn.commit()
+
+
+def post_by_media_token(conn, access_token: str):
+    return conn.execute(
+        "SELECT p.*, s.username, s.title FROM post p JOIN source s ON s.id=p.source_id "
+        "WHERE p.media_access_token=? AND p.bot_media_file_id IS NOT NULL LIMIT 1",
+        (access_token,),
+    ).fetchone()
+
+
 def create_draft(conn, post_id: int, model: str, linkedin: str, x: str, threads: str, notes: str) -> int:
     existing = conn.execute(
         "SELECT id FROM draft WHERE post_id=? AND status NOT IN ('expired','skipped') ORDER BY id DESC LIMIT 1",
@@ -970,6 +1064,18 @@ def set_edit_msg(conn, draft_id: int, tg_message_id: int) -> None:
     conn.commit()
 
 
+def set_ai_prompt(conn, draft_id: int, tg_message_id: int | None) -> None:
+    conn.execute("UPDATE draft SET ai_prompt_id=? WHERE id=?", (tg_message_id, draft_id))
+    conn.commit()
+
+
+def draft_by_ai_prompt(conn, tg_message_id: int):
+    return conn.execute(
+        "SELECT * FROM draft WHERE ai_prompt_id=? ORDER BY id DESC LIMIT 1",
+        (tg_message_id,),
+    ).fetchone()
+
+
 def set_manual_prompt(conn: sqlite3.Connection, post_id: int, tg_message_id: int) -> None:
     conn.execute(
         "UPDATE post SET manual_prompt_id=?, status='awaiting_manual' WHERE id=?",
@@ -1010,6 +1116,14 @@ def update_draft_texts(conn, draft_id: int, linkedin: str, x: str, threads: str,
 
 def set_draft_status(conn, draft_id: int, status: str) -> None:
     conn.execute("UPDATE draft SET status=? WHERE id=?", (status, draft_id))
+    conn.commit()
+
+
+def set_draft_include_media(conn, draft_id: int, include_media: bool) -> None:
+    conn.execute(
+        "UPDATE draft SET include_media=? WHERE id=?",
+        (1 if include_media else 0, draft_id),
+    )
     conn.commit()
 
 
@@ -1088,6 +1202,382 @@ def record_publication(conn, draft_id: int, platform: str, ok: bool, external_id
     conn.commit()
 
 
+def create_planning_session(
+    conn,
+    planning_date: str,
+    target_date: str,
+    publish_at: list[str],
+) -> tuple[object, bool]:
+    """Create one durable evening session and its ordered publication slots."""
+    if not publish_at:
+        raise ValueError("planning session requires at least one publication slot")
+    _begin_write(conn)
+    try:
+        existing = conn.execute(
+            "SELECT * FROM planning_session WHERE planning_date=?",
+            (planning_date,),
+        ).fetchone()
+        created = existing is None
+        if created:
+            cur = conn.execute(
+                "INSERT INTO planning_session(planning_date, target_date, target_count) "
+                "VALUES(?,?,?) RETURNING id",
+                (planning_date, target_date, len(publish_at)),
+            )
+            session_id = cur.fetchone()["id"]
+            for position, planned_at in enumerate(publish_at, start=1):
+                conn.execute(
+                    "INSERT INTO planning_slot(session_id, position, publish_at) VALUES(?,?,?)",
+                    (session_id, position, planned_at),
+                )
+        else:
+            session_id = existing["id"]
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return get_planning_session(conn, session_id), created
+
+
+def get_planning_session(conn, session_id: int):
+    return conn.execute(
+        "SELECT * FROM planning_session WHERE id=?",
+        (session_id,),
+    ).fetchone()
+
+
+def planning_session_for_date(conn, planning_date: str):
+    return conn.execute(
+        "SELECT * FROM planning_session WHERE planning_date=?",
+        (planning_date,),
+    ).fetchone()
+
+
+def next_planning_slot(conn, session_id: int):
+    return conn.execute(
+        "SELECT ps.*, s.planning_date, s.target_date, s.target_count, "
+        "s.status session_status FROM planning_slot ps "
+        "JOIN planning_session s ON s.id=ps.session_id "
+        "WHERE ps.session_id=? AND ps.status IN ('selecting','reviewing') "
+        "ORDER BY ps.position LIMIT 1",
+        (session_id,),
+    ).fetchone()
+
+
+def planning_slot_for_post(conn, post_id: int):
+    return conn.execute(
+        "SELECT ps.*, s.planning_date, s.target_date, s.target_count, "
+        "s.status session_status FROM planning_slot ps "
+        "JOIN planning_session s ON s.id=ps.session_id WHERE ps.post_id=?",
+        (post_id,),
+    ).fetchone()
+
+
+def planning_slot_for_draft(conn, draft_id: int):
+    return conn.execute(
+        "SELECT ps.*, s.planning_date, s.target_date, s.target_count, "
+        "s.status session_status FROM planning_slot ps "
+        "JOIN planning_session s ON s.id=ps.session_id WHERE ps.draft_id=?",
+        (draft_id,),
+    ).fetchone()
+
+
+def reserve_planning_attempt(conn, slot_id: int):
+    cur = conn.execute(
+        "UPDATE planning_slot SET attempt_count=attempt_count+1, updated_at=datetime('now') "
+        "WHERE id=? AND status='selecting' AND post_id IS NULL",
+        (slot_id,),
+    )
+    conn.commit()
+    if cur.rowcount != 1:
+        return None
+    return conn.execute("SELECT * FROM planning_slot WHERE id=?", (slot_id,)).fetchone()
+
+
+def assign_planning_post(conn, slot_id: int, post_id: int) -> bool:
+    cur = conn.execute(
+        "UPDATE planning_slot SET post_id=?, status='reviewing', updated_at=datetime('now') "
+        "WHERE id=? AND status='selecting' AND post_id IS NULL",
+        (post_id, slot_id),
+    )
+    conn.commit()
+    return cur.rowcount == 1
+
+
+def clear_planning_post(conn, slot_id: int, post_id: int) -> bool:
+    cur = conn.execute(
+        "UPDATE planning_slot SET post_id=NULL, draft_id=NULL, status='selecting', "
+        "updated_at=datetime('now') WHERE id=? AND post_id=? AND status='reviewing'",
+        (slot_id, post_id),
+    )
+    conn.commit()
+    return cur.rowcount == 1
+
+
+def attach_planning_draft(conn, post_id: int, draft_id: int) -> bool:
+    cur = conn.execute(
+        "UPDATE planning_slot SET draft_id=?, updated_at=datetime('now') "
+        "WHERE post_id=? AND status='reviewing' AND (draft_id IS NULL OR draft_id=?)",
+        (draft_id, post_id, draft_id),
+    )
+    conn.commit()
+    return cur.rowcount == 1
+
+
+def mark_planning_draft_ready(conn, draft_id: int):
+    """Atomically save one reviewed draft and advance the session counter."""
+    _begin_write(conn)
+    try:
+        slot = planning_slot_for_draft(conn, draft_id)
+        if slot is None or slot["session_status"] != "active" or slot["status"] != "reviewing":
+            conn.rollback()
+            return None
+        draft = conn.execute("SELECT * FROM draft WHERE id=?", (draft_id,)).fetchone()
+        if draft is None or draft["status"] != "awaiting_review":
+            conn.rollback()
+            return None
+        conn.execute("UPDATE draft SET status='approved' WHERE id=?", (draft_id,))
+        conn.execute("UPDATE post SET status='scheduled' WHERE id=?", (draft["post_id"],))
+        conn.execute(
+            "UPDATE planning_slot SET status='ready', updated_at=datetime('now') WHERE id=?",
+            (slot["id"],),
+        )
+        ready = conn.execute(
+            "SELECT COUNT(*) n FROM planning_slot WHERE session_id=? AND status='ready'",
+            (slot["session_id"],),
+        ).fetchone()["n"]
+        if ready == slot["target_count"]:
+            conn.execute(
+                "UPDATE planning_session SET status='scheduled', completed_at=datetime('now') "
+                "WHERE id=? AND status='active'",
+                (slot["session_id"],),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return {
+        "session_id": slot["session_id"],
+        "position": slot["position"],
+        "ready": ready,
+        "target": slot["target_count"],
+        "target_date": slot["target_date"],
+    }
+
+
+def discard_planning_draft(conn, draft_id: int):
+    """Discard a generated draft and reopen the same planning slot for candidates."""
+    _begin_write(conn)
+    try:
+        slot = planning_slot_for_draft(conn, draft_id)
+        if slot is None or slot["session_status"] != "active" or slot["status"] != "reviewing":
+            conn.rollback()
+            return None
+        draft = conn.execute("SELECT * FROM draft WHERE id=?", (draft_id,)).fetchone()
+        if draft is None or draft["status"] not in ("awaiting_review", "approved"):
+            conn.rollback()
+            return None
+        conn.execute("UPDATE draft SET status='skipped' WHERE id=?", (draft_id,))
+        conn.execute("UPDATE post SET status='skipped' WHERE id=?", (draft["post_id"],))
+        conn.execute(
+            "UPDATE planning_slot SET post_id=NULL, draft_id=NULL, status='selecting', "
+            "updated_at=datetime('now') WHERE id=?",
+            (slot["id"],),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return {
+        "session_id": slot["session_id"],
+        "position": slot["position"],
+        "target": slot["target_count"],
+    }
+
+
+def close_stale_planning_sessions(conn, current_planning_date: str) -> int:
+    """Close unfinished older sessions while preserving already-ready slots."""
+    _begin_write(conn)
+    try:
+        sessions = conn.execute(
+            "SELECT id FROM planning_session WHERE status='active' AND planning_date<?",
+            (current_planning_date,),
+        ).fetchall()
+        for session in sessions:
+            pending = conn.execute(
+                "SELECT post_id, draft_id FROM planning_slot "
+                "WHERE session_id=? AND status IN ('selecting','reviewing')",
+                (session["id"],),
+            ).fetchall()
+            for row in pending:
+                if row["draft_id"] is not None:
+                    conn.execute(
+                        "UPDATE draft SET status='skipped' WHERE id=? "
+                        "AND status IN ('awaiting_review','delivery_failed')",
+                        (row["draft_id"],),
+                    )
+                if row["post_id"] is not None:
+                    conn.execute(
+                        "UPDATE post SET status='skipped' WHERE id=? "
+                        "AND status IN ('offered','generating','drafted','awaiting_manual')",
+                        (row["post_id"],),
+                    )
+            conn.execute(
+                "UPDATE planning_slot SET status='cancelled', updated_at=datetime('now') "
+                "WHERE session_id=? AND status IN ('selecting','reviewing')",
+                (session["id"],),
+            )
+            conn.execute(
+                "UPDATE planning_session SET status='partial', completed_at=datetime('now') WHERE id=?",
+                (session["id"],),
+            )
+        conn.commit()
+        return len(sessions)
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def cancel_planning_session(conn, session_id: int) -> dict[str, int] | None:
+    """Stop the remaining evening flow; already-ready posts stay scheduled."""
+    _begin_write(conn)
+    try:
+        session = get_planning_session(conn, session_id)
+        if session is None or session["status"] != "active":
+            conn.rollback()
+            return None
+        pending = conn.execute(
+            "SELECT post_id, draft_id FROM planning_slot "
+            "WHERE session_id=? AND status IN ('selecting','reviewing')",
+            (session_id,),
+        ).fetchall()
+        for row in pending:
+            if row["draft_id"] is not None:
+                conn.execute(
+                    "UPDATE draft SET status='skipped' WHERE id=? "
+                    "AND status IN ('awaiting_review','delivery_failed')",
+                    (row["draft_id"],),
+                )
+            if row["post_id"] is not None:
+                conn.execute(
+                    "UPDATE post SET status='skipped' WHERE id=? "
+                    "AND status IN ('offered','generating','drafted','awaiting_manual')",
+                    (row["post_id"],),
+                )
+        conn.execute(
+            "UPDATE planning_slot SET status='cancelled', updated_at=datetime('now') "
+            "WHERE session_id=? AND status IN ('selecting','reviewing')",
+            (session_id,),
+        )
+        ready = conn.execute(
+            "SELECT COUNT(*) n FROM planning_slot WHERE session_id=? AND status='ready'",
+            (session_id,),
+        ).fetchone()["n"]
+        conn.execute(
+            "UPDATE planning_session SET status=?, completed_at=datetime('now') WHERE id=?",
+            ("partial" if ready else "cancelled", session_id),
+        )
+        conn.commit()
+        return {"ready": ready, "target": session["target_count"]}
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def claim_due_planning_slots(conn, now_iso: str) -> list[object]:
+    """Lease every ready slot due by now; each draft remains idempotent per platform."""
+    _begin_write(conn)
+    try:
+        rows = conn.execute(
+            "SELECT ps.*, s.target_date FROM planning_slot ps "
+            "JOIN planning_session s ON s.id=ps.session_id "
+            "WHERE ps.status='ready' AND ps.publish_at<=? ORDER BY ps.publish_at, ps.position",
+            (now_iso,),
+        ).fetchall()
+        claimed = []
+        for row in rows:
+            cur = conn.execute(
+                "UPDATE planning_slot SET status='publishing', publish_claimed_at=?, "
+                "updated_at=datetime('now') "
+                "WHERE id=? AND status='ready'",
+                (now_iso, row["id"]),
+            )
+            if cur.rowcount == 1:
+                claimed.append(row)
+        conn.commit()
+        return claimed
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def finish_planning_publication(conn, slot_id: int, draft_status: str, error: str | None = None) -> str:
+    if draft_status == "published":
+        slot_status = "published"
+    elif draft_status == "approved":
+        slot_status = "ready"
+    elif draft_status == "publish_unknown":
+        slot_status = "publish_unknown"
+    else:
+        slot_status = "failed"
+    conn.execute(
+        "UPDATE planning_slot SET status=?, last_error=?, publish_claimed_at=NULL, "
+        "updated_at=datetime('now') WHERE id=?",
+        (slot_status, error, slot_id),
+    )
+    row = conn.execute("SELECT session_id FROM planning_slot WHERE id=?", (slot_id,)).fetchone()
+    if row is not None:
+        remaining = conn.execute(
+            "SELECT COUNT(*) n FROM planning_slot WHERE session_id=? "
+            "AND status NOT IN ('published','cancelled')",
+            (row["session_id"],),
+        ).fetchone()["n"]
+        if remaining == 0:
+            conn.execute(
+                "UPDATE planning_session SET status='published' WHERE id=?",
+                (row["session_id"],),
+            )
+    conn.commit()
+    return slot_status
+
+
+def recover_planning_publications(conn, cutoff_iso: str | None = None) -> dict[str, int]:
+    """Reconcile planning leases after a function/process interruption."""
+    result = {"ready": 0, "published": 0, "unknown": 0, "failed": 0}
+    where = "WHERE ps.status='publishing'"
+    params: tuple[object, ...] = ()
+    if cutoff_iso is not None:
+        where += " AND ps.publish_claimed_at<=?"
+        params = (cutoff_iso,)
+    rows = conn.execute(
+        "SELECT ps.id, d.status draft_status FROM planning_slot ps "
+        "LEFT JOIN draft d ON d.id=ps.draft_id " + where,
+        params,
+    ).fetchall()
+    for row in rows:
+        status = row["draft_status"] or "missing"
+        if status == "publishing":
+            conn.execute(
+                "UPDATE draft SET status='publish_unknown' WHERE id=("
+                "SELECT draft_id FROM planning_slot WHERE id=?)",
+                (row["id"],),
+            )
+            status = "publish_unknown"
+        slot_status = finish_planning_publication(
+            conn,
+            row["id"],
+            status,
+            "recovered after interrupted scheduled publication",
+        )
+        key = {
+            "ready": "ready",
+            "published": "published",
+            "publish_unknown": "unknown",
+        }.get(slot_status, "failed")
+        result[key] += 1
+    return result
+
+
 def cleanup(conn, keep_days: int = 120) -> int:
     """Refuse legacy physical cleanup.
 
@@ -1114,4 +1604,6 @@ def stats(conn) -> dict:
         out["newest"] = row["newest"]
     for row in conn.execute("SELECT COUNT(*) n FROM source WHERE active=1"):
         out["sources"] = row["n"]
+    for row in conn.execute("SELECT status, COUNT(*) n FROM planning_slot GROUP BY status"):
+        out[f"planning:{row['status']}"] = row["n"]
     return out

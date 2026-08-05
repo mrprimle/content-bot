@@ -1,9 +1,9 @@
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request, Response
 from telegram import Update
 
 from repost import bot as repost_bot
@@ -67,6 +67,30 @@ async def health() -> dict:
         conn.close()
 
 
+@app.get("/api/media/{access_token}")
+async def public_media(access_token: str) -> Response:
+    """Serve a stable public image URL to Buffer without exposing BOT_TOKEN."""
+    conn = db.connect()
+    try:
+        post = db.post_by_media_token(conn, access_token)
+    finally:
+        conn.close()
+    if post is None or post["media_kind"] != "photo":
+        raise HTTPException(404, "Media not found")
+    await _ensure_initialized()
+    try:
+        telegram_file = await _telegram_app.bot.get_file(post["bot_media_file_id"])
+        payload = await telegram_file.download_as_bytearray()
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("public media fetch failed post_id=%s", post["id"])
+        raise HTTPException(502, "Media temporarily unavailable") from exc
+    return Response(
+        content=bytes(payload),
+        media_type=post["media_mime"] or "image/jpeg",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
 @app.post("/api/telegram")
 async def telegram_webhook(
     request: Request,
@@ -88,36 +112,65 @@ async def telegram_webhook(
     return {"ok": True}
 
 
+@app.get("/api/cron/tick/{trigger_utc_hour}")
 @app.get("/api/cron/delivery/{trigger_utc_hour}")
-async def cron_delivery(
+async def cron_tick(
     trigger_utc_hour: str,
     authorization: str | None = Header(default=None),
 ) -> dict:
     _require_bearer(authorization, config.CRON_SECRET, "CRON_SECRET")
     await _ensure_initialized()
     now = datetime.now(ZoneInfo(config.TIMEZONE))
-    slot = next(
+    local_slot = now.strftime("%H:%M")
+    planning_due = int(config.PLANNING_TIME.split(":", 1)[0]) == now.hour
+    publication_slot = next(
         (
             candidate
-            for candidate in config.POST_TIMES
+            for candidate in config.PUBLISH_TIMES
             if int(candidate.split(":", 1)[0]) == now.hour
         ),
         None,
     )
-    if slot is None:
-        LOGGER.info("cron no-op trigger=%s london_hour=%s", trigger_utc_hour, now.hour)
+    result: dict[str, object] = {
+        "ok": True,
+        "trigger": trigger_utc_hour,
+        "local_slot": local_slot,
+    }
+    recovery_conn = db.connect()
+    try:
+        result["recovered"] = db.recover_planning_publications(
+            recovery_conn,
+            (now.astimezone(timezone.utc) - timedelta(minutes=15)).isoformat(),
+        )
+    finally:
+        recovery_conn.close()
+    ran = False
+    if planning_due:
+        result["planning"] = await repost_bot.start_evening_planning(
+            _telegram_app.bot,
+            now=now,
+        )
+        ran = True
+    if publication_slot is not None:
+        result["publication"] = await repost_bot.publish_due_planned(
+            _telegram_app.bot,
+            now=now,
+        )
+        ran = True
+    if not ran:
+        LOGGER.info("cron no-op trigger=%s local_slot=%s", trigger_utc_hour, local_slot)
         return {
-            "ok": True,
-            "trigger": trigger_utc_hour,
-            "skipped": "not a configured London delivery hour",
+            **result,
+            "skipped": "not a configured London planning/publication slot",
         }
-    sent = await repost_bot.propose_batch(
-        _telegram_app.bot,
-        slot_key=f"schedule:{now.date().isoformat()}:{slot}",
-        max_items=config.ITEMS_PER_SLOT,
+    LOGGER.info(
+        "cron completed trigger=%s local_slot=%s planning=%s publication=%s",
+        trigger_utc_hour,
+        local_slot,
+        "planning" in result,
+        "publication" in result,
     )
-    LOGGER.info("cron completed trigger=%s slot=%s sent=%s", trigger_utc_hour, slot, sent)
-    return {"ok": True, "trigger": trigger_utc_hour, "slot": slot, "sent": sent}
+    return result
 
 
 @app.post("/api/setup-webhook")

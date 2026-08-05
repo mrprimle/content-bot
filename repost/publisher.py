@@ -36,17 +36,21 @@ def create_post(
     *,
     thread_platform: str | None = None,
     thread: list[str] | None = None,
+    image_url: str | None = None,
 ) -> str:
     metadata = ""
     if thread_platform and thread:
         items = ", ".join(f"{{ text: {json.dumps(item)} }}" for item in thread)
         metadata = f", metadata: {{{thread_platform}: {{thread: [{items}]}}}}"
+    assets = ""
+    if image_url:
+        assets = f", assets: [{{ image: {{ url: {json.dumps(image_url)} }} }}]"
     query = (
         "mutation { createPost(input: {"
         f"text: {json.dumps(text)}, "
         f"channelId: {json.dumps(channel_id)}, "
         f"schedulingType: automatic, mode: {config.BUFFER_POST_MODE}"
-        f"{metadata}"
+        f"{metadata}{assets}"
         "}) { ... on PostActionSuccess { post { id } } ... on MutationError { message } } }"
     )
     res = _gql(query)["createPost"]
@@ -111,7 +115,10 @@ def _publication_payload(platform: str, text: str) -> tuple[str, str | None, lis
     return text, None, None
 
 
-def publish_all(texts_by_platform: dict[str, str]) -> dict[str, tuple[bool, str]]:
+def publish_all(
+    texts_by_platform: dict[str, str],
+    image_url: str | None = None,
+) -> dict[str, tuple[bool, str]]:
     """{'linkedin': text, ...} -> {'linkedin': (ok, post_id | error), ...}"""
     results: dict[str, tuple[bool, str]] = {}
     channels = config.buffer_channels()
@@ -136,6 +143,7 @@ def publish_all(texts_by_platform: dict[str, str]) -> dict[str, tuple[bool, str]
                     first,
                     thread_platform=thread_platform,
                     thread=thread,
+                    image_url=image_url,
                 ),
             )
         except (httpx.TimeoutException, httpx.TransportError) as e:

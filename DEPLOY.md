@@ -3,13 +3,14 @@
 Production состоит из трёх частей:
 
 - Vercel Python Function с FastAPI принимает Telegram webhook;
-- Vercel Cron открывает две итерации в 10:00 и 18:00 `Europe/London`;
+- Vercel Cron открывает одну вечернюю сессию в 21:00 `Europe/London` и публикует
+  три подготовленных поста на следующий день в 09:00, 14:00 и 19:00;
 - Neon PostgreSQL хранит 49 источников, все материалы, очередь, черновики,
   публикации, idempotency-слоты и `last_message_id` каждого канала.
 
-В `vercel.json` четыре ежедневных UTC-триггера покрывают переход London между
-GMT и BST. Endpoint сверяет фактический лондонский час, а уникальный `slot_key`
-не даёт одному слоту выполниться дважды.
+В `vercel.json` летние и зимние UTC-варианты четырёх ежедневных событий покрывают
+переход London между GMT и BST. Endpoint сверяет фактический лондонский час, а
+durable planning-slots не дают одному событию выполниться дважды.
 
 ## Переменные окружения
 
@@ -32,7 +33,9 @@ AUTHOR_FACTS
 MAX_POST_CHARS=1500
 MANUAL_MAX_POST_CHARS=3000
 X_PREMIUM=true
-POST_TIMES=10:00,18:00
+PLANNING_TIME=21:00
+PUBLISH_TIMES=09:00,14:00,19:00
+DAILY_POSTS=3
 ITEMS_PER_SLOT=1
 TIMEZONE=Europe/London
 WEBHOOK_SECRET
@@ -102,6 +105,15 @@ curl -fsS -X POST -H "Authorization: Bearer $CRON_SECRET" \
 - LinkedIn получает его одним постом;
 - X Premium получает его одним long post без Buffer thread metadata;
 - Threads получает тот же текст, разбитый Buffer на сообщения до 500 символов.
+- если владелец выбрал исходное фото, все три мутации Buffer получают один
+  `assets.image.url` вида `$PUBLIC_BASE_URL/api/media/<random-token>`;
+- media-endpoint по запросу получает файл из Telegram по сохранённому `file_id` и
+  стримит его без раскрытия `BOT_TOKEN`; URL остаётся стабильным до планового слота;
+- Buffer требует прямой публичный HTTPS-файл меньше 10 МБ.
+
+После deploy проверь, что `PUBLIC_BASE_URL` — production origin без завершающего
+пути. Для безопасного smoke-test выбери один фото-пост в Telegram и сначала
+опубликуй **без картинки**, затем отдельный тестовый материал — **с картинкой**.
 
 ## Проверки
 

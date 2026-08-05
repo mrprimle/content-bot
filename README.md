@@ -18,7 +18,7 @@ Telethon user session ───────────────┐
                          sources, posts, queue, drafts,
                          publications, idempotency state
                                      │
-                      10:00 and 18:00 Europe/London
+                           21:00 Europe/London
                                      ▼
                            Telegram bot review UI
                    ┌─────────────────┴─────────────────┐
@@ -29,8 +29,11 @@ Telethon user session ───────────────┐
                                            + compress to ≤1500 chars
                                                       │
                                    ┌──────────────────┼──────────────────┐
-                             Редактировать      Опубликовать    Закончить итерацию
+                             Редактировать   Готово на завтра   Закончить на сегодня
                                                       │
+                                            repeat until 3/3
+                                                      │
+                                next day 09:00 · 14:00 · 19:00
                                                       ▼
                                                    Buffer
                                       LinkedIn · X Premium · Threads
@@ -44,23 +47,41 @@ Telethon user session ───────────────┐
 2. The initial import stores the last three **calendar** months of messages in the
    database. Text and media metadata are stored; media itself is fetched only when
    it is about to be shown.
-3. At 10:00 and 18:00 `Europe/London`, Vercel Cron starts one review iteration.
-4. The bot sends one original Russian material with two buttons:
+3. At 21:00 `Europe/London`, Vercel Cron starts one evening planning session for
+   three posts that will publish the next day.
+4. The bot starts iteration 1/3 and sends one original Russian material with two buttons:
    `✨ Создать пост` and `⏭ Пропустить`.
 5. `Пропустить` permanently closes that candidate and immediately sends the next
    one. The owner can keep skipping inside the same iteration without an AI call.
 6. `Создать пост` calls Terra once. It translates the post into natural English,
    corrects only author/company facts using `AUTHOR_FACTS`, and compresses only when
    necessary to stay within 1500 Unicode characters.
-7. The ready draft has three actions:
-   `✅ Опубликовать`, `✏️ Редактировать`, and `⏹ Закончить итерацию`.
+7. The ready planning draft has five actions: `✅ Готово на завтра`,
+   `✏️ Редактировать руками`, `🤖 Редактировать с AI`, `⏭ Другой материал`,
+   and `⏹ Закончить на сегодня`.
 8. Editing means replying with the complete replacement text. It is authoritative
    and is **not** sent through AI again. The 1500-character AI target no longer
    applies; manual edits may use up to 3000 characters so LinkedIn remains valid.
-9. Publishing sends the draft through Buffer to LinkedIn, X, and Threads. Successful
-   platforms are recorded individually, so a retry targets only failed platforms.
-10. Publishing or `Закончить итерацию` ends the current chain. The next automatic
-    candidate arrives at the next scheduled slot.
+9. `Готово на завтра` saves the draft durably in PostgreSQL and immediately starts
+   the next iteration. If the selected Telegram source has a photo, this last step
+   asks `С картинкой` or `Без картинки`; no media question appears for text-only
+   sources. After 3/3, the evening session closes without publishing yet.
+10. On the next day the three drafts publish automatically through Buffer at
+    09:00, 14:00, and 19:00 London time. Successful platforms are recorded
+    individually, so a retry targets only failed platforms. Every slot sends one
+    concise Telegram result: either `✅ posted` with a short excerpt or a visible
+    failure/unknown-state warning.
+11. `Закончить на сегодня` stops the remaining evening iterations. Drafts already
+    marked ready remain scheduled; unfinished slots are cancelled.
+
+The persistent `✍️ Создать пост` action remains independent from the evening batch.
+It opens two immediate modes:
+
+- `📚 Накидывать из базы` starts one candidate iteration; the final action publishes
+  immediately instead of scheduling for tomorrow.
+- `✍️ Написать свой текст` stores the submitted text unchanged and without an AI
+  call. The owner can publish it as-is, run `✨ Standard Transform`, edit manually,
+  edit with AI, or cancel.
 
 ## Queue semantics
 
@@ -77,10 +98,10 @@ This prevents a prolific channel from consuming the entire queue while preservin
 oldest-to-newest ordering inside every source and as much global chronology as the
 fairness rule permits. The pool survives process restarts and Vercel invocations.
 
-Every scheduled or manual delivery has a unique `slot_key`. Repeating the same cron
-request cannot reserve a second candidate. A skipped raw post gets its own
-`replacement:<post_id>` slot, so double-clicking an old Telegram button cannot emit
-another replacement.
+Every planning iteration and manual delivery has a unique `slot_key`. Repeating the
+same cron request cannot reserve a second candidate. A `planning_session` owns three
+ordered `planning_slot` rows; replacements stay inside the same slot, so raw skips
+cannot accidentally create a fourth scheduled post.
 
 ### Deduplication
 
@@ -96,33 +117,33 @@ another replacement.
 ## Telegram interaction state machine
 
 ```text
-post:new
-   │ candidate-pool claim
+21:00 London
+   │ create planning_session + slots 1/3, 2/3, 3/3
    ▼
-post:queued ── delivery lease ──► post:offered
-                                      │
-                 ┌────────────────────┴────────────────────┐
-                 │                                         │
-              drop                                      make
-                 │                                         │
-         post:skipped                           post:generating
-         + replacement                                  │
-                                                       draft
-                                                         │
-                                              post:drafted
-                                              draft:awaiting_review
-                                                         │
-                     ┌───────────────────────────────────┼─────────────────┐
-                     │                                   │                 │
-                  edit                               publish       finish iteration
-                     │                                   │                 │
-          same draft, new text              per-platform result    post/draft:skipped
-                                                         │
-                                   ┌─────────────────────┴──────────────────┐
-                                   │                                        │
-                              all success                       partial/unknown result
-                                   │                                        │
-                       post/draft:published        retry failed only / manual Buffer check
+planning_slot:selecting ──► post:offered
+                                │
+                    ┌───────────┴───────────┐
+                    │                       │
+                  drop                    make
+                    │                       │
+          same slot, next candidate   Terra pipeline
+                                            │
+                                   draft:awaiting_review
+                                            │
+                              edit ─────────┤
+                                            │ готово на завтра
+                                            ▼
+                                  planning_slot:ready
+                                            │
+                                  start next iteration
+                                            │
+                              after 3/3: session:scheduled
+                                            │
+                         next day 09:00 · 14:00 · 19:00
+                                            ▼
+                                  Buffer per-platform publish
+                                            │
+                        published / retry-known-failure / unknown
 ```
 
 Database transitions use compare-and-set updates. Concurrent callbacks cannot run
@@ -189,10 +210,20 @@ if that also fails, the original Telegram link remains available.
 Choosing `Создать пост` on voice/audio/video asks the owner to write the full post
 manually. That text then enters the normal draft review screen without an AI call.
 
+For photo sources, the bot stores Telegram's reusable Bot API `file_id` plus an
+unguessable media capability token. On the final approval step the owner chooses
+with or without the photo. A selected photo is exposed to Buffer through
+`GET /api/media/{token}` on the Vercel origin; that endpoint streams the Telegram
+file without revealing `BOT_TOKEN`. Buffer receives the stable public URL in
+`assets: [{ image: { url } }]`, so LinkedIn, X, and Threads all get the same image.
+Buffer requires a direct HTTPS image smaller than 10 MB. The media token and choice
+are durable, including across a restart between evening review and next-day publish.
+
 ## Publishing behavior
 
 [`repost/publisher.py`](repost/publisher.py) uses Buffer's GraphQL `createPost`
-mutation with Bearer authentication.
+mutation with Bearer authentication. Image posts add one `assets.image.url` to the
+same per-platform mutation.
 
 | Platform | Result |
 | --- | --- |
@@ -208,15 +239,18 @@ the Buffer channel queue. The current production environment uses `shareNow`.
 The product schedule is always:
 
 ```text
-10:00 Europe/London
-18:00 Europe/London
+21:00 Europe/London — prepare three drafts sequentially
+next day 09:00 Europe/London — publish draft 1
+next day 14:00 Europe/London — publish draft 2
+next day 19:00 Europe/London — publish draft 3
 ```
 
 Vercel Cron schedules are UTC and do not automatically follow British daylight
-saving time. [`vercel.json`](vercel.json) therefore contains four UTC triggers:
-09:00, 10:00, 17:00, and 18:00. The FastAPI endpoint checks the actual London hour
-and accepts only the matching two. In summer, 09:00/17:00 UTC run; in winter,
-10:00/18:00 UTC run. The other two return a safe no-op.
+saving time. [`vercel.json`](vercel.json) therefore contains the summer and winter
+UTC variants for each of the four London events. The FastAPI tick endpoint checks
+the actual London hour; the matching trigger runs and its paired trigger returns a
+safe no-op. The planning session and every publication slot are durable and
+idempotent, so repeated cron delivery cannot create duplicate posts.
 
 ## Initial backfill and incremental refetch
 
@@ -241,7 +275,7 @@ production path relies on refetch-on-exhaustion.
 
 | File | Responsibility |
 | --- | --- |
-| [`api/index.py`](api/index.py) | FastAPI service: health, Telegram webhook, cron delivery, webhook setup. |
+| [`api/index.py`](api/index.py) | FastAPI service: health, Telegram webhook, public tokenized media, cron delivery, webhook setup. |
 | [`repost/bot.py`](repost/bot.py) | Telegram UI, callbacks, generation/edit/publish flow, recovery, local polling scheduler. |
 | [`repost/db.py`](repost/db.py) | SQLite/PostgreSQL compatibility layer, schema, queue claims, states, locks, idempotency. |
 | [`repost/ingest.py`](repost/ingest.py) | Telethon login, backfill, pointer-based sync, lazy media transfer. |
@@ -256,10 +290,12 @@ production path relies on refetch-on-exhaustion.
 | Table | Durable data |
 | --- | --- |
 | `source` | Telegram username, active flag, title, `last_message_id`, last sync time. |
-| `post` | Original message, media metadata, queue status, Telegram UI ids. |
-| `draft` | Model, platform texts, owner edit, notes, review/publication state. |
+| `post` | Original message, media metadata, reusable Telegram file id, media token, queue status, Telegram UI ids. |
+| `draft` | Model, platform texts, owner edit, notes, optional-image choice, review/publication state. |
 | `publication` | Per-platform success/error and Buffer external id. |
 | `delivery_batch` | Unique scheduled/manual/replacement slot. |
+| `planning_session` | One 21:00 review batch, target date, required count, and lifecycle. |
+| `planning_slot` | Ordered draft, exact next-day UTC publish time, retry/unknown state. |
 | `delivery_item` | Reserved post, send lease token, bot message id, delivery timestamps. |
 | `app_meta` | Refetch leases, recovery notices, and optional sync metadata. |
 
@@ -279,7 +315,7 @@ Copy [`.env.example`](.env.example) to `.env` for local use. Never commit `.env`
 | `BOT_TOKEN` | yes | Telegram Bot API token from BotFather. |
 | `OWNER_CHAT_ID` | yes | Only this private chat may control the bot. |
 | `DATABASE_URL` | Vercel | Neon/PostgreSQL connection. Without it, local SQLite is used. |
-| `OPENAI_API_KEY` | yes | OpenAI API credential used only on `Создать пост`. |
+| `OPENAI_API_KEY` | yes | OpenAI API credential used on source transformation, Standard Transform, and AI edit. |
 | `OPENAI_MODEL` | yes | `gpt-5.6-terra` in production. |
 | `LLM_PROVIDER` | yes | `openai`; Anthropic remains an optional fallback implementation. |
 | `AUTHOR_FACTS` | yes | Verified Mike/Vahue facts available to the correction prompt. |
@@ -289,8 +325,10 @@ Copy [`.env.example`](.env.example) to `.env` for local use. Never commit `.env`
 | `MAX_POST_CHARS` | yes | Master draft limit; clamped to a maximum of 1500. |
 | `MANUAL_MAX_POST_CHARS` | yes | Owner-edited final text limit; 3000 for LinkedIn compatibility. |
 | `X_PREMIUM` | yes | Allows one X post up to 25,000 characters; master limit still applies. |
-| `POST_TIMES` | yes | London product slots, currently `10:00,18:00`. |
-| `ITEMS_PER_SLOT` | yes | Initial cards per slot, currently `1`; skips can request replacements. |
+| `PLANNING_TIME` | yes | Single London review trigger, currently `21:00`. |
+| `PUBLISH_TIMES` | yes | Next-day London publication slots: `09:00,14:00,19:00`. |
+| `DAILY_POSTS` | yes | Drafts required per evening session; must match the number of publish slots. |
+| `ITEMS_PER_SLOT` | yes | Candidate cards shown at once, currently `1`; skips request replacements in the same planning slot. |
 | `TIMEZONE` | yes | `Europe/London`. |
 | `WEBHOOK_SECRET` | Vercel | Validates Telegram's webhook secret header. |
 | `CRON_SECRET` | Vercel | Bearer token for cron and webhook setup endpoints. |
@@ -354,12 +392,21 @@ without discarding successful sources, and a failed full backfill exits non-zero
 | `/stats` | Show queue/database counters. |
 | `/resend <draft_id>` | Re-deliver a saved, unpublished draft after a Telegram/UI delivery failure. |
 
-`/start` installs a persistent `✍️ Создать свой пост` button. It opens a durable
-manual input session at any time, independently of the 10:00/18:00 source queue.
-The submitted Russian, English, or mixed text goes through the same three-stage
-Terra pipeline and returns as a normal reviewable draft. The draft's
-`✏️ Редактировать без AI-лимита` button accepts a complete owner-written replacement
-up to 3000 characters without calling or compressing through AI again.
+`/start` installs a persistent `✍️ Создать пост` button. `Накидывать из базы`
+starts one immediate candidate flow. `Написать свой текст` opens a durable manual
+input session independently of the 21:00 planning session. Russian, English, or
+mixed input is first saved byte-for-byte with zero LLM calls. `Standard Transform`
+then explicitly runs the three-stage pipeline: translate to English, correct only
+Mike/Vahue facts, and semantically compress only when needed to fit 1500 characters.
+`✏️ Редактировать руками` accepts a complete owner-written replacement up to 3000
+characters without calling AI. `🤖 Редактировать с AI` opens a durable Terra
+instruction loop: each reply is applied to the current version and preserves its
+current language unless the instruction requests translation.
+
+Telegram's Bot API cannot prefill arbitrary text into the user's composer. The
+manual-edit ForceReply therefore includes the complete current text in the same
+message and opens the reply field, which is the closest native in-chat behavior
+without a separate Mini App editor.
 
 ## Production deployment
 
@@ -367,7 +414,7 @@ Production is:
 
 - FastAPI on Vercel Functions in `lhr1`;
 - Telegram webhook instead of polling;
-- Vercel Cron for the two London review slots;
+- Vercel Cron for one London review event and three next-day publication slots;
 - Neon PostgreSQL for durable state;
 - GitHub repository `mrprimle/content-bot`, with pushes to `main` automatically
   creating production deployments.
@@ -405,10 +452,14 @@ git diff --check
 Coverage includes:
 
 - fair candidate pools and round boundaries;
-- two daily base iterations plus unlimited skip replacements;
+- one idempotent evening session with three sequential draft slots;
+- three durable next-day publication slots plus unlimited in-slot replacements;
 - no LLM or Buffer calls before explicit owner actions;
+- on-demand database and raw custom-text flows independent from evening planning;
+- explicit Standard Transform with zero AI calls before that button;
 - draft finish behavior without replacement;
 - media staging without transcription;
+- optional photo publication through the stable tokenized Vercel media endpoint;
 - pointer-based refetch after queue exhaustion;
 - duplicate suppression and authoritative source reconciliation;
 - process-crash recovery and unknown-publication safety;
@@ -445,7 +496,8 @@ vercel logs --environment production --since 1h --expand --no-branch
 
 ## Non-goals and intentional limitations
 
-- Editing is full-text replacement, not an AI chat such as “remove paragraph two”.
+- Telegram cannot prefill arbitrary long text into the native composer; manual edit
+  therefore uses ForceReply with the full current text shown above the input field.
 - Media is not transcribed or summarized.
 - Source membership is controlled by `sources.txt`; the Telegram chat-folder link is
   documentation, not dynamically parsed on every run.

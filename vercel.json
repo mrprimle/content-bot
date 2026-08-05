@@ -7,9 +7,13 @@
     }
   },
   "crons": [
-    { "path": "/api/cron/delivery/09", "schedule": "0 9 * * *" },
-    { "path": "/api/cron/delivery/10", "schedule": "0 10 * * *" },
-    { "path": "/api/cron/delivery/17", "schedule": "0 17 * * *" },
-    { "path": "/api/cron/delivery/18", "schedule": "0 18 * * *" }
+    { "path": "/api/cron/tick/08", "schedule": "0 8 * * *" },
+    { "path": "/api/cron/tick/09", "schedule": "0 9 * * *" },
+    { "path": "/api/cron/tick/13", "schedule": "0 13 * * *" },
+    { "path": "/api/cron/tick/14", "schedule": "0 14 * * *" },
+    { "path": "/api/cron/tick/18", "schedule": "0 18 * * *" },
+    { "path": "/api/cron/tick/19", "schedule": "0 19 * * *" },
+    { "path": "/api/cron/tick/20", "schedule": "0 20 * * *" },
+    { "path": "/api/cron/tick/21", "schedule": "0 21 * * *" }
   ]
 }

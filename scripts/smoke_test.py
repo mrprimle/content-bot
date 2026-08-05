@@ -392,6 +392,7 @@ def test_stranded_work_recovery() -> None:
             "undelivered_drafts_reopened": 2,
             "manual_without_prompt_reoffered": 1,
             "publishing_unknown": 2,
+            "ai_edits_reopened": 0,
         }
         assert db.get_post(conn, raw_post)["status"] == "offered"
         assert db.get_post(conn, manual_post)["status"] == "awaiting_manual"
@@ -421,6 +422,7 @@ def test_stranded_work_recovery() -> None:
             "undelivered_drafts_reopened": 0,
             "manual_without_prompt_reoffered": 0,
             "publishing_unknown": 0,
+            "ai_edits_reopened": 0,
         }, "startup recovery должен быть идемпотентным"
         notice = bot._startup_recovery_message(1, recovered)
         assert notice and "Автоповтор отключён" in notice and "Buffer" in notice
@@ -433,6 +435,7 @@ def test_stranded_work_recovery() -> None:
                 "undelivered_drafts_reopened": 0,
                 "manual_without_prompt_reoffered": 0,
                 "publishing_unknown": 0,
+                "ai_edits_reopened": 0,
             },
         ) is None
 
@@ -687,7 +690,9 @@ def main() -> None:
     media = db.get_post(conn, voice[0]["id"])
     assert media["transcript"] == "Расшифровка" and media["summary"] == "Краткое содержание"
 
-    assert config.POST_TIMES == ["10:00", "18:00"]
+    assert config.PLANNING_TIME == "21:00"
+    assert config.PUBLISH_TIMES == ["09:00", "14:00", "19:00"]
+    assert config.DAILY_POSTS == 3
     assert config.ITEMS_PER_SLOT == 1
     assert config.TIMEZONE == "Europe/London"
     assert config.OPENAI_MODEL == "gpt-5.6-terra"

@@ -3,14 +3,16 @@
 Production состоит из трёх частей:
 
 - Vercel Python Function с FastAPI принимает Telegram webhook;
-- Vercel Cron открывает одну вечернюю сессию в 21:00 `Europe/London` и публикует
-  три подготовленных поста на следующий день в 09:00, 14:00 и 19:00;
+- ручная Telegram-кнопка открывает неограниченную сессию отбора и складывает
+  подтверждённые drafts в постоянную FIFO-полку;
+- Vercel Cron три раза в день забирает по одному старейшему посту с полки:
+  в 09:00, 14:00 и 19:00 `Europe/London`;
 - Neon PostgreSQL хранит 49 источников, все материалы, очередь, черновики,
   публикации, idempotency-слоты и `last_message_id` каждого канала.
 
-В `vercel.json` летние и зимние UTC-варианты четырёх ежедневных событий покрывают
+В `vercel.json` летние и зимние UTC-варианты трёх ежедневных событий покрывают
 переход London между GMT и BST. Endpoint сверяет фактический лондонский час, а
-durable planning-slots не дают одному событию выполниться дважды.
+durable leases в `ready_queue` не дают одному событию выполниться дважды.
 
 ## Переменные окружения
 
@@ -35,7 +37,6 @@ THREAD_ITEM_CHARS=250
 THREAD_MAX_ITEMS=10
 MANUAL_MAX_POST_CHARS=3000
 X_PREMIUM=true
-PLANNING_TIME=21:00
 PUBLISH_TIMES=09:00,14:00,19:00
 DAILY_POSTS=3
 ITEMS_PER_SLOT=1

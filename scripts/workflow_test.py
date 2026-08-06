@@ -289,6 +289,175 @@ async def test_evening_planning_and_next_day_publish() -> None:
         Path(tmp.name).unlink(missing_ok=True)
 
 
+async def test_unbounded_curation_shelf_and_fifo_publish() -> None:
+    """Manual curation can save any count; each cron tick publishes one FIFO item."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    old_db_path = config.DB_PATH
+    old_owner = config.OWNER_CHAT_ID
+    old_delay = config.BOT_SEND_DELAY
+    original_translate = generator.translate_post
+    original_publish = publisher.publish_all
+    config.DB_PATH = tmp.name
+    config.OWNER_CHAT_ID = 123
+    config.BOT_SEND_DELAY = 0
+    conn = db.connect()
+    published: list[str] = []
+    try:
+        for index in range(1, 6):
+            source_id = db.upsert_source(conn, f"@shelf-{index}", f"Shelf {index}")
+            assert db.insert_post(
+                conn,
+                source_id,
+                index,
+                f"2026-05-0{index}T10:00:00+00:00",
+                f"Source shelf material {index}. " * 20,
+                f"https://t.me/shelf_{index}/{index}",
+            )
+
+        def fake_translate(*args, **_kwargs):
+            source_text = args[-1]
+            number = source_text.split("material ", 1)[1].split(".", 1)[0]
+            text = f"Shelf-ready draft {number}."
+            return generator.DraftOut(
+                linkedin_text=text,
+                x_text=text,
+                threads_text=text,
+                notes="",
+                thread_items=[f"Shelf hook {number}.", f"Shelf payoff {number}."],
+            )
+
+        def fake_publish(texts, image_url=None):
+            assert image_url is None
+            published.append(str(texts["linkedin"]))
+            return {
+                platform: (True, f"buffer-{len(published)}-{platform}")
+                for platform in texts
+            }
+
+        generator.translate_post = fake_translate
+        publisher.publish_all = fake_publish
+        fake = FakeBot()
+
+        started = await bot.start_curation(fake)
+        assert started["created"] is True and started["sent"] == 1
+        session = db.active_curation_session(conn)
+        assert session is not None and session["saved_count"] == 0
+        first_item = db.current_curation_item(conn, session["id"])
+        assert first_item["status"] == "reviewing"
+
+        skipped = FakeQuery(f"drop:{first_item['post_id']}")
+        await bot.on_callback(
+            SimpleNamespace(
+                callback_query=skipped,
+                effective_chat=SimpleNamespace(id=config.OWNER_CHAT_ID),
+            ),
+            SimpleNamespace(bot=fake),
+        )
+        second_item = db.current_curation_item(conn, session["id"])
+        assert second_item["id"] == first_item["id"]
+        assert second_item["post_id"] != first_item["post_id"]
+
+        make = FakeQuery(f"make:{second_item['post_id']}")
+        await bot.on_callback(
+            SimpleNamespace(
+                callback_query=make,
+                effective_chat=SimpleNamespace(id=config.OWNER_CHAT_ID),
+            ),
+            SimpleNamespace(bot=fake),
+        )
+        reviewing = db.current_curation_item(conn, session["id"])
+        draft = db.get_draft(conn, reviewing["draft_id"])
+        labels = [
+            button.text
+            for row in bot._draft_keyboard(conn, draft["id"]).inline_keyboard
+            for button in row
+        ]
+        assert "📥 Сохранить на полку" in labels
+        assert "⏹ Закончить отбор" in labels
+
+        shelf = FakeQuery(f"shelf:{draft['id']}")
+        await bot.on_callback(
+            SimpleNamespace(
+                callback_query=shelf,
+                effective_chat=SimpleNamespace(id=config.OWNER_CHAT_ID),
+            ),
+            SimpleNamespace(bot=fake),
+        )
+        assert db.ready_queue_stats(conn)["ready"] == 1
+        assert db.active_curation_session(conn)["saved_count"] == 1
+        current = db.current_curation_item(conn, session["id"])
+        assert current["position"] == 2 and current["status"] == "reviewing"
+
+        stop = FakeQuery(f"curstoppost:{current['post_id']}")
+        await bot.on_callback(
+            SimpleNamespace(
+                callback_query=stop,
+                effective_chat=SimpleNamespace(id=config.OWNER_CHAT_ID),
+            ),
+            SimpleNamespace(bot=fake),
+        )
+        assert db.active_curation_session(conn) is None
+        assert db.ready_queue_stats(conn)["ready"] == 1
+
+        manual_source = db.upsert_source(conn, "manual:123", "Own posts")
+        assert db.insert_post(
+            conn,
+            manual_source,
+            999,
+            "2026-08-06T12:00:00+00:00",
+            "Custom shelf post.",
+            None,
+            status="drafted",
+            media_kind="manual",
+        )
+        manual_post = conn.execute(
+            "SELECT * FROM post WHERE source_id=? AND tg_message_id=999",
+            (manual_source,),
+        ).fetchone()
+        manual_draft_id = db.create_draft(
+            conn,
+            manual_post["id"],
+            "manual/raw",
+            "Custom shelf post.",
+            "Custom shelf post.",
+            "Custom shelf post.",
+            "",
+            ["Custom shelf post."],
+        )
+        custom_shelf = FakeQuery(f"shelf:{manual_draft_id}")
+        await bot.on_callback(
+            SimpleNamespace(
+                callback_query=custom_shelf,
+                effective_chat=SimpleNamespace(id=config.OWNER_CHAT_ID),
+            ),
+            SimpleNamespace(bot=fake),
+        )
+        assert db.ready_queue_stats(conn)["ready"] == 2
+
+        first_tick = await bot.publish_scheduled_tick(
+            fake,
+            now=datetime(2026, 8, 7, 9, 0, tzinfo=ZoneInfo(config.TIMEZONE)),
+        )
+        assert first_tick["source"] == "shelf" and first_tick["published"] == 1
+        assert db.ready_queue_stats(conn)["ready"] == 1
+        second_tick = await bot.publish_scheduled_tick(
+            fake,
+            now=datetime(2026, 8, 7, 14, 0, tzinfo=ZoneInfo(config.TIMEZONE)),
+        )
+        assert second_tick["published"] == 1
+        assert db.ready_queue_stats(conn).get("ready", 0) == 0
+        assert published == [draft["linkedin_text"], "Custom shelf post."]
+    finally:
+        conn.close()
+        generator.translate_post = original_translate
+        publisher.publish_all = original_publish
+        config.DB_PATH = old_db_path
+        config.OWNER_CHAT_ID = old_owner
+        config.BOT_SEND_DELAY = old_delay
+        Path(tmp.name).unlink(missing_ok=True)
+
+
 async def test_refetch_after_queue_exhaustion() -> None:
     """An empty durable slot is retried after a pointer-based Telegram refetch."""
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
@@ -484,7 +653,7 @@ async def test_anytime_owner_post() -> None:
             for row in start_message.responses[0]["reply_markup"].inline_keyboard
             for button in row
         ]
-        assert menu_labels == ["📚 Накидывать из базы", "✍️ Написать свой текст", "❌ Отменить"]
+        assert menu_labels == ["📚 Начать отбор в полку", "✍️ Написать свой текст", "❌ Отменить"]
 
         fake_bot = FakeBot()
         custom = FakeQuery("newcustom:0")
@@ -525,6 +694,7 @@ async def test_anytime_owner_post() -> None:
         ]
         assert raw_labels == [
             "✅ Опубликовать сейчас",
+            "📥 На полку",
             "✨ Standard Transform",
             "✏️ Редактировать руками",
             "🤖 Редактировать с AI",
@@ -733,7 +903,7 @@ async def test_photo_choice_and_publication() -> None:
 
 
 async def test_anytime_database_iteration() -> None:
-    """The menu can start exactly one immediate source-material iteration."""
+    """The menu starts a durable unbounded shelf-curation session."""
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     tmp.close()
     old_db_path = config.DB_PATH
@@ -762,10 +932,18 @@ async def test_anytime_database_iteration() -> None:
         )
         assert len(application.tasks) == 1
         await application.tasks[0]
-        assert "внеплановую итерацию" in fake_bot.messages[0]["text"]
+        assert "Начинаем наполнять полку" in fake_bot.messages[0]["text"]
+        assert "Отбор #1" in fake_bot.messages[1]["text"]
         assert "On demand" in fake_bot.messages[-1]["text"]
+        labels = [
+            button.text
+            for row in fake_bot.messages[-1]["reply_markup"].inline_keyboard
+            for button in row
+        ]
+        assert "⏹ Закончить отбор" in labels
         post = conn.execute("SELECT * FROM post WHERE tg_message_id=1").fetchone()
         assert post["status"] == "offered"
+        assert db.active_curation_session(conn) is not None
         conn.close()
     finally:
         config.DB_PATH = old_db_path
@@ -912,6 +1090,7 @@ async def main() -> None:
         draft_labels = [button.text for row in draft_keyboard for button in row]
         assert draft_labels == [
             "✅ Опубликовать сейчас",
+            "📥 На полку",
             "✏️ Редактировать руками",
             "🤖 Редактировать с AI",
             "🧵 Пересобрать Threads с AI",
@@ -1050,6 +1229,7 @@ async def main() -> None:
         assert "reply_markup" in delivered[-1]
 
         await test_evening_planning_and_next_day_publish()
+        await test_unbounded_curation_shelf_and_fifo_publish()
         await test_refetch_after_queue_exhaustion()
         await test_edit_retry_loop()
         await test_anytime_owner_post()

@@ -118,6 +118,38 @@ CREATE TABLE IF NOT EXISTS planning_slot(
 );
 CREATE INDEX IF NOT EXISTS idx_planning_slot_due ON planning_slot(status, publish_at);
 
+CREATE TABLE IF NOT EXISTS curation_session(
+  id INTEGER PRIMARY KEY,
+  status TEXT NOT NULL DEFAULT 'active',
+  saved_count INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS curation_item(
+  id INTEGER PRIMARY KEY,
+  session_id INTEGER NOT NULL REFERENCES curation_session(id),
+  position INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'selecting',
+  post_id INTEGER UNIQUE REFERENCES post(id),
+  draft_id INTEGER UNIQUE REFERENCES draft(id),
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(session_id, position)
+);
+
+CREATE TABLE IF NOT EXISTS ready_queue(
+  id INTEGER PRIMARY KEY,
+  draft_id INTEGER UNIQUE NOT NULL REFERENCES draft(id),
+  status TEXT NOT NULL DEFAULT 'ready',
+  queued_at TEXT NOT NULL DEFAULT (datetime('now')),
+  publish_claimed_at TEXT,
+  published_at TEXT,
+  last_error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ready_queue_fifo ON ready_queue(status, id);
+
 CREATE TABLE IF NOT EXISTS app_meta(
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -242,6 +274,40 @@ CREATE TABLE IF NOT EXISTS planning_slot(
   UNIQUE(session_id, position)
 );
 CREATE INDEX IF NOT EXISTS idx_planning_slot_due ON planning_slot(status, publish_at);
+
+CREATE TABLE IF NOT EXISTS curation_session(
+  id BIGSERIAL PRIMARY KEY,
+  status TEXT NOT NULL DEFAULT 'active',
+  saved_count INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT ((CURRENT_TIMESTAMP AT TIME ZONE 'UTC')::text),
+  completed_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_curation_one_active
+  ON curation_session(status) WHERE status='active';
+
+CREATE TABLE IF NOT EXISTS curation_item(
+  id BIGSERIAL PRIMARY KEY,
+  session_id BIGINT NOT NULL REFERENCES curation_session(id),
+  position INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'selecting',
+  post_id BIGINT UNIQUE REFERENCES post(id),
+  draft_id BIGINT UNIQUE REFERENCES draft(id),
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT ((CURRENT_TIMESTAMP AT TIME ZONE 'UTC')::text),
+  updated_at TEXT NOT NULL DEFAULT ((CURRENT_TIMESTAMP AT TIME ZONE 'UTC')::text),
+  UNIQUE(session_id, position)
+);
+
+CREATE TABLE IF NOT EXISTS ready_queue(
+  id BIGSERIAL PRIMARY KEY,
+  draft_id BIGINT UNIQUE NOT NULL REFERENCES draft(id),
+  status TEXT NOT NULL DEFAULT 'ready',
+  queued_at TEXT NOT NULL DEFAULT ((CURRENT_TIMESTAMP AT TIME ZONE 'UTC')::text),
+  publish_claimed_at TEXT,
+  published_at TEXT,
+  last_error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ready_queue_fifo ON ready_queue(status, id);
 
 CREATE TABLE IF NOT EXISTS app_meta(
   key TEXT PRIMARY KEY,
@@ -1530,6 +1596,369 @@ def cancel_planning_session(conn, session_id: int) -> dict[str, int] | None:
         raise
 
 
+def active_curation_session(conn):
+    return conn.execute(
+        "SELECT * FROM curation_session WHERE status='active' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+
+
+def start_curation_session(conn):
+    """Return the single durable active curation session, creating it if needed."""
+    _begin_write(conn)
+    try:
+        session = active_curation_session(conn)
+        created = session is None
+        if session is None:
+            session = conn.execute(
+                "INSERT INTO curation_session(status) VALUES('active') RETURNING *"
+            ).fetchone()
+        conn.commit()
+        return session, created
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def current_curation_item(conn, session_id: int):
+    return conn.execute(
+        "SELECT ci.*, cs.status session_status, cs.saved_count "
+        "FROM curation_item ci JOIN curation_session cs ON cs.id=ci.session_id "
+        "WHERE ci.session_id=? AND ci.status IN ('selecting','reviewing') "
+        "ORDER BY ci.position DESC LIMIT 1",
+        (session_id,),
+    ).fetchone()
+
+
+def ensure_curation_item(conn, session_id: int):
+    """Create the next unbounded selection item when no item is in progress."""
+    _begin_write(conn)
+    try:
+        session = conn.execute(
+            "SELECT * FROM curation_session WHERE id=?",
+            (session_id,),
+        ).fetchone()
+        if session is None or session["status"] != "active":
+            conn.rollback()
+            return None
+        current = current_curation_item(conn, session_id)
+        if current is not None:
+            conn.commit()
+            return current
+        position = conn.execute(
+            "SELECT COALESCE(MAX(position),0)+1 n FROM curation_item WHERE session_id=?",
+            (session_id,),
+        ).fetchone()["n"]
+        item = conn.execute(
+            "INSERT INTO curation_item(session_id, position) VALUES(?,?) RETURNING *",
+            (session_id, position),
+        ).fetchone()
+        conn.commit()
+        return item
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def reserve_curation_attempt(conn, item_id: int):
+    cur = conn.execute(
+        "UPDATE curation_item SET attempt_count=attempt_count+1, updated_at=datetime('now') "
+        "WHERE id=? AND status='selecting' AND post_id IS NULL",
+        (item_id,),
+    )
+    conn.commit()
+    if cur.rowcount != 1:
+        return None
+    return conn.execute("SELECT * FROM curation_item WHERE id=?", (item_id,)).fetchone()
+
+
+def assign_curation_post(conn, item_id: int, post_id: int) -> bool:
+    cur = conn.execute(
+        "UPDATE curation_item SET post_id=?, status='reviewing', updated_at=datetime('now') "
+        "WHERE id=? AND status='selecting' AND post_id IS NULL",
+        (post_id, item_id),
+    )
+    conn.commit()
+    return cur.rowcount == 1
+
+
+def clear_curation_post(conn, item_id: int, post_id: int) -> bool:
+    cur = conn.execute(
+        "UPDATE curation_item SET post_id=NULL, draft_id=NULL, status='selecting', "
+        "updated_at=datetime('now') WHERE id=? AND post_id=? AND status='reviewing'",
+        (item_id, post_id),
+    )
+    conn.commit()
+    return cur.rowcount == 1
+
+
+def curation_item_for_post(conn, post_id: int):
+    return conn.execute(
+        "SELECT ci.*, cs.status session_status, cs.saved_count "
+        "FROM curation_item ci JOIN curation_session cs ON cs.id=ci.session_id "
+        "WHERE ci.post_id=? ORDER BY ci.id DESC LIMIT 1",
+        (post_id,),
+    ).fetchone()
+
+
+def curation_item_for_draft(conn, draft_id: int):
+    return conn.execute(
+        "SELECT ci.*, cs.status session_status, cs.saved_count "
+        "FROM curation_item ci JOIN curation_session cs ON cs.id=ci.session_id "
+        "WHERE ci.draft_id=? ORDER BY ci.id DESC LIMIT 1",
+        (draft_id,),
+    ).fetchone()
+
+
+def attach_curation_draft(conn, post_id: int, draft_id: int) -> bool:
+    cur = conn.execute(
+        "UPDATE curation_item SET draft_id=?, updated_at=datetime('now') "
+        "WHERE post_id=? AND status='reviewing' AND (draft_id IS NULL OR draft_id=?)",
+        (draft_id, post_id, draft_id),
+    )
+    conn.commit()
+    return cur.rowcount == 1
+
+
+def enqueue_ready_draft(conn, draft_id: int):
+    """Put an approved draft on the durable FIFO shelf exactly once."""
+    _begin_write(conn)
+    try:
+        existing = conn.execute(
+            "SELECT * FROM ready_queue WHERE draft_id=?",
+            (draft_id,),
+        ).fetchone()
+        item = curation_item_for_draft(conn, draft_id)
+        if existing is not None:
+            session = (
+                conn.execute("SELECT * FROM curation_session WHERE id=?", (item["session_id"],)).fetchone()
+                if item is not None
+                else None
+            )
+            shelf_count = conn.execute(
+                "SELECT COUNT(*) n FROM ready_queue WHERE status='ready'"
+            ).fetchone()["n"]
+            conn.commit()
+            return {
+                "queue_id": existing["id"],
+                "shelf_count": shelf_count,
+                "session_id": item["session_id"] if item is not None else None,
+                "saved_count": session["saved_count"] if session is not None else None,
+                "already_queued": True,
+            }
+        draft = conn.execute("SELECT * FROM draft WHERE id=?", (draft_id,)).fetchone()
+        if draft is None or draft["status"] not in ("awaiting_review", "approved", "delivery_failed"):
+            conn.rollback()
+            return None
+        if item is not None and (item["session_status"] != "active" or item["status"] != "reviewing"):
+            conn.rollback()
+            return None
+        queue_row = conn.execute(
+            "INSERT INTO ready_queue(draft_id) VALUES(?) RETURNING *",
+            (draft_id,),
+        ).fetchone()
+        conn.execute("UPDATE draft SET status='approved' WHERE id=?", (draft_id,))
+        conn.execute("UPDATE post SET status='scheduled' WHERE id=?", (draft["post_id"],))
+        session_id = None
+        saved_count = None
+        if item is not None:
+            session_id = item["session_id"]
+            conn.execute(
+                "UPDATE curation_item SET status='saved', updated_at=datetime('now') WHERE id=?",
+                (item["id"],),
+            )
+            conn.execute(
+                "UPDATE curation_session SET saved_count=saved_count+1 WHERE id=?",
+                (session_id,),
+            )
+            saved_count = conn.execute(
+                "SELECT saved_count FROM curation_session WHERE id=?",
+                (session_id,),
+            ).fetchone()["saved_count"]
+        shelf_count = conn.execute(
+            "SELECT COUNT(*) n FROM ready_queue WHERE status='ready'"
+        ).fetchone()["n"]
+        conn.commit()
+        return {
+            "queue_id": queue_row["id"],
+            "shelf_count": shelf_count,
+            "session_id": session_id,
+            "saved_count": saved_count,
+            "already_queued": False,
+        }
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def discard_curation_draft(conn, draft_id: int):
+    _begin_write(conn)
+    try:
+        item = curation_item_for_draft(conn, draft_id)
+        if item is None or item["session_status"] != "active" or item["status"] != "reviewing":
+            conn.rollback()
+            return None
+        draft = conn.execute("SELECT * FROM draft WHERE id=?", (draft_id,)).fetchone()
+        if draft is None or draft["status"] not in ("awaiting_review", "approved", "delivery_failed"):
+            conn.rollback()
+            return None
+        conn.execute("UPDATE draft SET status='skipped' WHERE id=?", (draft_id,))
+        conn.execute("UPDATE post SET status='skipped' WHERE id=?", (draft["post_id"],))
+        conn.execute(
+            "UPDATE curation_item SET status='discarded', updated_at=datetime('now') WHERE id=?",
+            (item["id"],),
+        )
+        conn.commit()
+        return {"session_id": item["session_id"], "position": item["position"]}
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def stop_curation_session(conn, session_id: int):
+    """Stop manual curation and close only the current unfinished item."""
+    _begin_write(conn)
+    try:
+        session = conn.execute(
+            "SELECT * FROM curation_session WHERE id=?",
+            (session_id,),
+        ).fetchone()
+        if session is None or session["status"] != "active":
+            conn.rollback()
+            return None
+        item = current_curation_item(conn, session_id)
+        if item is not None:
+            if item["draft_id"] is not None:
+                conn.execute(
+                    "UPDATE draft SET status='skipped' WHERE id=? "
+                    "AND status IN ('awaiting_review','approved','delivery_failed')",
+                    (item["draft_id"],),
+                )
+            if item["post_id"] is not None:
+                conn.execute(
+                    "UPDATE post SET status='skipped' WHERE id=? "
+                    "AND status IN ('offered','generating','drafted','awaiting_manual')",
+                    (item["post_id"],),
+                )
+            conn.execute(
+                "UPDATE curation_item SET status='cancelled', updated_at=datetime('now') WHERE id=?",
+                (item["id"],),
+            )
+        conn.execute(
+            "UPDATE curation_session SET status='completed', completed_at=datetime('now') WHERE id=?",
+            (session_id,),
+        )
+        conn.commit()
+        return {"saved_count": session["saved_count"]}
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def ready_queue_stats(conn) -> dict[str, int]:
+    out: dict[str, int] = {"total": 0}
+    for row in conn.execute("SELECT status, COUNT(*) n FROM ready_queue GROUP BY status"):
+        out[row["status"]] = int(row["n"])
+        out["total"] += int(row["n"])
+    return out
+
+
+def ready_queue_for_draft(conn, draft_id: int):
+    return conn.execute(
+        "SELECT * FROM ready_queue WHERE draft_id=?",
+        (draft_id,),
+    ).fetchone()
+
+
+def ready_queue_preview(conn, limit: int = 3):
+    return conn.execute(
+        "SELECT rq.*, d.edited_text, d.linkedin_text FROM ready_queue rq "
+        "JOIN draft d ON d.id=rq.draft_id "
+        "WHERE rq.status='ready' ORDER BY rq.id LIMIT ?",
+        (limit,),
+    ).fetchall()
+
+
+def claim_next_ready_queue(conn, now_iso: str):
+    """Lease exactly one oldest shelf item for one publication cron tick."""
+    _begin_write(conn)
+    try:
+        row = conn.execute(
+            "SELECT * FROM ready_queue WHERE status='ready' ORDER BY id LIMIT 1"
+        ).fetchone()
+        if row is None:
+            conn.commit()
+            return None
+        cur = conn.execute(
+            "UPDATE ready_queue SET status='publishing', publish_claimed_at=?, last_error=NULL "
+            "WHERE id=? AND status='ready'",
+            (now_iso, row["id"]),
+        )
+        conn.commit()
+        return row if cur.rowcount == 1 else None
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def finish_ready_queue_publication(
+    conn,
+    queue_id: int,
+    draft_status: str,
+    error: str | None = None,
+) -> str:
+    if draft_status == "published":
+        queue_status = "published"
+    elif draft_status == "approved":
+        queue_status = "ready"
+    elif draft_status == "publish_unknown":
+        queue_status = "publish_unknown"
+    else:
+        queue_status = "failed"
+    conn.execute(
+        "UPDATE ready_queue SET status=?, last_error=?, publish_claimed_at=NULL, "
+        "published_at=CASE WHEN ?='published' THEN datetime('now') ELSE published_at END "
+        "WHERE id=?",
+        (queue_status, error, queue_status, queue_id),
+    )
+    conn.commit()
+    return queue_status
+
+
+def recover_ready_queue_publications(conn, cutoff_iso: str | None = None) -> dict[str, int]:
+    result = {"ready": 0, "published": 0, "unknown": 0, "failed": 0}
+    where = "WHERE rq.status='publishing'"
+    params: tuple[object, ...] = ()
+    if cutoff_iso is not None:
+        where += " AND rq.publish_claimed_at<=?"
+        params = (cutoff_iso,)
+    rows = conn.execute(
+        "SELECT rq.id, rq.draft_id, d.status draft_status FROM ready_queue rq "
+        "LEFT JOIN draft d ON d.id=rq.draft_id " + where,
+        params,
+    ).fetchall()
+    for row in rows:
+        status = row["draft_status"] or "missing"
+        if status == "publishing":
+            conn.execute(
+                "UPDATE draft SET status='publish_unknown' WHERE id=?",
+                (row["draft_id"],),
+            )
+            status = "publish_unknown"
+        queue_status = finish_ready_queue_publication(
+            conn,
+            row["id"],
+            status,
+            "recovered after interrupted shelf publication",
+        )
+        key = {
+            "ready": "ready",
+            "published": "published",
+            "publish_unknown": "unknown",
+        }.get(queue_status, "failed")
+        result[key] += 1
+    return result
+
+
 def claim_due_planning_slots(conn, now_iso: str) -> list[object]:
     """Lease every ready slot due by now; each draft remains idempotent per platform."""
     _begin_write(conn)
@@ -1652,6 +2081,8 @@ def stats(conn) -> dict:
         out["sources"] = row["n"]
     for row in conn.execute("SELECT status, COUNT(*) n FROM planning_slot GROUP BY status"):
         out[f"planning:{row['status']}"] = row["n"]
+    for row in conn.execute("SELECT status, COUNT(*) n FROM ready_queue GROUP BY status"):
+        out[f"shelf:{row['status']}"] = row["n"]
     return out
 
 

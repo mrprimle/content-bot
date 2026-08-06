@@ -18,7 +18,7 @@ Telethon user session ───────────────┐
                          sources, posts, queue, drafts,
                          publications, idempotency state
                                      │
-                           21:00 Europe/London
+                         owner presses «Наполнить полку»
                                      ▼
                            Telegram bot review UI
                    ┌─────────────────┴─────────────────┐
@@ -29,11 +29,11 @@ Telethon user session ───────────────┐
                                            + compress to ≤1500 chars
                                                       │
                                    ┌──────────────────┼──────────────────┐
-                             Редактировать   Готово на завтра   Закончить на сегодня
+                             Редактировать    На полку        Закончить отбор
                                                       │
-                                            repeat until 3/3
+                                      repeat without a limit
                                                       │
-                                next day 09:00 · 14:00 · 19:00
+                                daily 09:00 · 14:00 · 19:00
                                                       ▼
                                                    Buffer
                                       LinkedIn · X Premium · Threads
@@ -47,8 +47,8 @@ Operational messages use a deliberately warm, caring co-author voice: gentle
 encouragement, hearts, clear reassurance that durable state is safe, and occasional
 playful references to Mike as Neo who has made the Matrix work for him. The tone
 never modifies source material, generated drafts, publication text, error details,
-or database state. The completed 3/3 planning session gets the strongest affirmation
-and explicitly invites the owner to rest while the next-day automation takes over.
+or database state. Finishing a curation session explicitly affirms the work and
+hands the durable FIFO shelf back to automation.
 
 1. A dedicated Telegram user account reads the 49 public channels listed in
    [`sources.txt`](sources.txt). The list is the current snapshot of the Founders
@@ -56,49 +56,47 @@ and explicitly invites the owner to rest while the next-day automation takes ove
 2. The initial import stores the last three **calendar** months of messages in the
    database. Text and media metadata are stored; media itself is fetched only when
    it is about to be shown.
-3. At 21:00 `Europe/London`, Vercel Cron starts one evening planning session for
-   three posts that will publish the next day.
-4. The bot starts iteration 1/3 and sends one original Russian material with two buttons:
+3. The owner presses persistent `📚 Наполнить полку` whenever convenient. No review
+   flow starts automatically at 21:00.
+4. The bot opens one durable, unbounded curation session and sends one original material with:
    `✨ Создать пост` and `⏭ Пропустить`.
 5. `Пропустить` permanently closes that candidate and immediately sends the next
    one. The owner can keep skipping inside the same iteration without an AI call.
 6. `Создать пост` calls Terra once. It translates the post into natural English,
    corrects only author/company facts using `AUTHOR_FACTS`, and compresses only when
    necessary to stay within 1500 Unicode characters.
-7. The ready planning draft has five actions: `✅ Готово на завтра`,
+7. The reviewed curation draft has five actions: `📥 Сохранить на полку`,
    `✏️ Редактировать руками`, `🤖 Редактировать с AI`, `⏭ Другой материал`,
-   and `⏹ Закончить на сегодня`.
+   and `⏹ Закончить отбор`.
 8. Editing means replying with the complete replacement master text. LinkedIn/X
    keep that text exactly and do not AI-compress it; manual edits may use up to
    3000 characters. Terra only rebuilds the separate Threads sequence.
-9. `Готово на завтра` saves the draft durably in PostgreSQL and immediately starts
-   the next iteration. If the selected Telegram source has a photo, this last step
+9. `Сохранить на полку` appends the draft to a durable FIFO `ready_queue` and immediately starts
+   the next iteration, with no per-session or total limit. If the source has a photo, this step
    asks `С картинкой` or `Без картинки`; no media question appears for text-only
-   sources. After 3/3, the evening session closes without publishing yet and sends
-   a warm completion/Neo affirmation.
-10. On the next day the three drafts publish automatically through Buffer at
+   sources. `Закончить отбор` closes only the active selection and keeps every saved post.
+10. Three daily cron ticks publish one oldest ready post each through Buffer at
     09:00, 14:00, and 19:00 London time. Successful platforms are recorded
     individually, so a retry targets only failed platforms. Every slot sends one
     concise Telegram result: either `✅ posted` with a short excerpt or a visible
     failure/unknown-state warning.
-11. `Закончить на сегодня` stops the remaining evening iterations. Drafts already
-    marked ready remain scheduled; unfinished slots are cancelled.
+11. A custom owner post keeps `Опубликовать сейчас` and also offers `На полку`, so
+    self-written content can join the same FIFO without starting curation.
 
 The persistent `📊 Статус` button shows an auditable content-pool partition
-(`total = remaining + already sent to the owner`) and today's three-slot plan. Each
-planned post is represented by its London publication time, state, and first
-sentence. Missing drafts, failed/unknown slots, overdue ready posts, invalid times,
-and inconsistent plan sizes are surfaced in a dedicated error section; the status
+(`total = remaining + already sent to the owner`), shelf totals, and the next three
+FIFO drafts. Legacy fixed-date slots remain visible until the pre-migration plan is
+fully published. Failed/unknown shelf or legacy publications are surfaced in a
+dedicated error section; the status
 handler is read-only and reports database failures without changing state.
 
-The persistent `✍️ Создать пост` action remains independent from the evening batch.
+The persistent `✍️ Создать пост` action remains independent from curation.
 It opens two immediate modes:
 
-- `📚 Накидывать из базы` starts one candidate iteration; the final action publishes
-  immediately instead of scheduling for tomorrow.
+- `📚 Начать отбор в полку` starts or resumes the same durable curation flow.
 - `✍️ Написать свой текст` stores the submitted text unchanged and without an AI
   call. The owner can publish it as-is, run `✨ Standard Transform`, edit manually,
-  rebuild Threads with AI, edit with AI, or cancel.
+  rebuild Threads with AI, edit with AI, publish now, save to the shelf, or cancel.
 
 ## Queue semantics
 
@@ -115,10 +113,11 @@ This prevents a prolific channel from consuming the entire queue while preservin
 oldest-to-newest ordering inside every source and as much global chronology as the
 fairness rule permits. The pool survives process restarts and Vercel invocations.
 
-Every planning iteration and manual delivery has a unique `slot_key`. Repeating the
-same cron request cannot reserve a second candidate. A `planning_session` owns three
-ordered `planning_slot` rows; replacements stay inside the same slot, so raw skips
-cannot accidentally create a fourth scheduled post.
+Every curation attempt has a unique `slot_key`. Repeating the same callback cannot
+reserve a second candidate. One active `curation_session` owns sequential
+`curation_item` rows; each accepted draft is appended exactly once to `ready_queue`.
+The older `planning_session` tables remain only for publishing fixed-date drafts
+created before this migration.
 
 ### Deduplication
 
@@ -134,29 +133,29 @@ cannot accidentally create a fourth scheduled post.
 ## Telegram interaction state machine
 
 ```text
-21:00 London
-   │ create planning_session + slots 1/3, 2/3, 3/3
+owner presses «Наполнить полку»
+   │ create/resume one curation_session
    ▼
-planning_slot:selecting ──► post:offered
+curation_item:selecting ──► post:offered
                                 │
                     ┌───────────┴───────────┐
                     │                       │
                   drop                    make
                     │                       │
-          same slot, next candidate   Terra pipeline
+          same item, next candidate   Terra pipeline
                                             │
                                    draft:awaiting_review
                                             │
                               edit ─────────┤
-                                            │ готово на завтра
+                                            │ сохранить на полку
                                             ▼
-                                  planning_slot:ready
+                                    ready_queue:ready
                                             │
-                                  start next iteration
+                                start next curation item
                                             │
-                              after 3/3: session:scheduled
+                                 repeat until owner stops
                                             │
-                         next day 09:00 · 14:00 · 19:00
+                            daily 09:00 · 14:00 · 19:00
                                             ▼
                                   Buffer per-platform publish
                                             │
@@ -268,18 +267,19 @@ the Buffer channel queue. The current production environment uses `shareNow`.
 The product schedule is always:
 
 ```text
-21:00 Europe/London — prepare three drafts sequentially
-next day 09:00 Europe/London — publish draft 1
-next day 14:00 Europe/London — publish draft 2
-next day 19:00 Europe/London — publish draft 3
+any time — owner starts/stops curation and appends any number of drafts
+09:00 Europe/London — publish one oldest ready draft
+14:00 Europe/London — publish one oldest ready draft
+19:00 Europe/London — publish one oldest ready draft
 ```
 
 Vercel Cron schedules are UTC and do not automatically follow British daylight
 saving time. [`vercel.json`](vercel.json) therefore contains the summer and winter
-UTC variants for each of the four London events. The FastAPI tick endpoint checks
+UTC variants for each of the three London publication events. The FastAPI tick endpoint checks
 the actual London hour; the matching trigger runs and its paired trigger returns a
-safe no-op. The planning session and every publication slot are durable and
-idempotent, so repeated cron delivery cannot create duplicate posts.
+safe no-op. Every FIFO lease and per-platform Buffer result is durable and
+idempotent, so repeated cron delivery cannot create duplicate posts. Legacy
+fixed-date slots are published first until the pre-migration plan is exhausted.
 
 ## Initial backfill and incremental refetch
 
@@ -323,8 +323,11 @@ production path relies on refetch-on-exhaustion.
 | `draft` | Model, platform texts, owner edit, notes, optional-image choice, review/publication state. |
 | `publication` | Per-platform success/error and Buffer external id. |
 | `delivery_batch` | Unique scheduled/manual/replacement slot. |
-| `planning_session` | One 21:00 review batch, target date, required count, and lifecycle. |
-| `planning_slot` | Ordered draft, exact next-day UTC publish time, retry/unknown state. |
+| `curation_session` | One owner-triggered, unbounded selection session and its saved count. |
+| `curation_item` | Current/reviewed/saved candidate within manual curation. |
+| `ready_queue` | Permanent FIFO shelf, publication lease, terminal state, and error. |
+| `planning_session` | Legacy fixed-date batch retained until pre-migration plans finish. |
+| `planning_slot` | Legacy exact-time draft and retry/unknown state. |
 | `delivery_item` | Reserved post, send lease token, bot message id, delivery timestamps. |
 | `app_meta` | Refetch leases, recovery notices, and optional sync metadata. |
 
@@ -356,9 +359,9 @@ Copy [`.env.example`](.env.example) to `.env` for local use. Never commit `.env`
 | `THREAD_MAX_ITEMS` | yes | Maximum ordered cards in one Threads thread; `10`. |
 | `MANUAL_MAX_POST_CHARS` | yes | Owner-edited final text limit; 3000 for LinkedIn compatibility. |
 | `X_PREMIUM` | yes | Allows one X post up to 25,000 characters; master limit still applies. |
-| `PLANNING_TIME` | yes | Single London review trigger, currently `21:00`. |
-| `PUBLISH_TIMES` | yes | Next-day London publication slots: `09:00,14:00,19:00`. |
-| `DAILY_POSTS` | yes | Drafts required per evening session; must match the number of publish slots. |
+| `PLANNING_TIME` | legacy | Ignored by production; retained only for old configuration compatibility. |
+| `PUBLISH_TIMES` | yes | Daily FIFO publication ticks: `09:00,14:00,19:00`. |
+| `DAILY_POSTS` | yes | Must equal the number of publication ticks; it no longer limits saved drafts. |
 | `ITEMS_PER_SLOT` | yes | Candidate cards shown at once, currently `1`; skips request replacements in the same planning slot. |
 | `TIMEZONE` | yes | `Europe/London`. |
 | `WEBHOOK_SECRET` | Vercel | Validates Telegram's webhook secret header. |
@@ -419,13 +422,14 @@ without discarding successful sources, and a failed full backfill exits non-zero
 | --- | --- |
 | `/id` | Show the current private chat id and whether it matches `OWNER_CHAT_ID`. |
 | `/test @channel` | Deliver one candidate from a specific source without calling AI. |
-| `/next` | Start an additional manual iteration from the global pool. |
-| `/stats` | Show queue/database counters. |
+| `/next` | Start or resume unlimited curation into the FIFO shelf. |
+| `/stats` | Show pool arithmetic, shelf size/preview, legacy plan, and errors. |
 | `/resend <draft_id>` | Re-deliver a saved, unpublished draft after a Telegram/UI delivery failure. |
 
-`/start` installs a persistent `✍️ Создать пост` button. `Накидывать из базы`
-starts one immediate candidate flow. `Написать свой текст` opens a durable manual
-input session independently of the 21:00 planning session. Russian, English, or
+`/start` installs persistent `📚 Наполнить полку`, `✍️ Создать пост`, and
+`📊 Статус` buttons. `Наполнить полку` starts or resumes unlimited curation.
+`Написать свой текст` opens a durable manual input session independently of
+curation. Russian, English, or
 mixed input is first saved byte-for-byte with zero LLM calls. `Standard Transform`
 then explicitly runs the three-stage pipeline: translate to English, correct only
 Mike/Vahue facts, and semantically compress only when needed to fit 1500 characters.
@@ -446,7 +450,7 @@ Production is:
 
 - FastAPI on Vercel Functions in `lhr1`;
 - Telegram webhook instead of polling;
-- Vercel Cron for one London review event and three next-day publication slots;
+- Vercel Cron for three daily FIFO publication ticks; curation starts only by button;
 - Neon PostgreSQL for durable state;
 - GitHub repository `mrprimle/content-bot`, with pushes to `main` automatically
   creating production deployments.
@@ -484,10 +488,10 @@ git diff --check
 Coverage includes:
 
 - fair candidate pools and round boundaries;
-- one idempotent evening session with three sequential draft slots;
-- three durable next-day publication slots plus unlimited in-slot replacements;
+- one durable owner-triggered curation session with unlimited sequential drafts;
+- a persistent FIFO shelf and exactly one claimed item per publication tick;
 - no LLM or Buffer calls before explicit owner actions;
-- on-demand database and raw custom-text flows independent from evening planning;
+- custom-text publish-now/save-to-shelf flows independent from curation;
 - explicit Standard Transform with zero AI calls before that button;
 - draft finish behavior without replacement;
 - media staging without transcription;

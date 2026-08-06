@@ -122,7 +122,6 @@ async def cron_tick(
     await _ensure_initialized()
     now = datetime.now(ZoneInfo(config.TIMEZONE))
     local_slot = now.strftime("%H:%M")
-    planning_due = int(config.PLANNING_TIME.split(":", 1)[0]) == now.hour
     publication_slot = next(
         (
             candidate
@@ -142,17 +141,15 @@ async def cron_tick(
             recovery_conn,
             (now.astimezone(timezone.utc) - timedelta(minutes=15)).isoformat(),
         )
+        result["recovered_shelf"] = db.recover_ready_queue_publications(
+            recovery_conn,
+            (now.astimezone(timezone.utc) - timedelta(minutes=15)).isoformat(),
+        )
     finally:
         recovery_conn.close()
     ran = False
-    if planning_due:
-        result["planning"] = await repost_bot.start_evening_planning(
-            _telegram_app.bot,
-            now=now,
-        )
-        ran = True
     if publication_slot is not None:
-        result["publication"] = await repost_bot.publish_due_planned(
+        result["publication"] = await repost_bot.publish_scheduled_tick(
             _telegram_app.bot,
             now=now,
         )
@@ -161,13 +158,12 @@ async def cron_tick(
         LOGGER.info("cron no-op trigger=%s local_slot=%s", trigger_utc_hour, local_slot)
         return {
             **result,
-            "skipped": "not a configured London planning/publication slot",
+            "skipped": "not a configured London publication slot",
         }
     LOGGER.info(
-        "cron completed trigger=%s local_slot=%s planning=%s publication=%s",
+        "cron completed trigger=%s local_slot=%s publication=%s",
         trigger_utc_hour,
         local_slot,
-        "planning" in result,
         "publication" in result,
     )
     return result

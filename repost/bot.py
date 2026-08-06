@@ -26,7 +26,7 @@ from telegram import (
     ReplyKeyboardMarkup,
     Update,
 )
-from telegram.error import RetryAfter
+from telegram.error import RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -79,12 +79,13 @@ def _public_error_text(error: BaseException) -> str:
 
 
 async def _send(call, *args, **kwargs):
-    """Respect Telegram's per-chat pace and retry explicit flood limits."""
+    """Respect Telegram pacing and retry connection failures before any bytes were sent."""
     global _LAST_SEND_AT
     async with _SEND_LOCK:
         wait = config.BOT_SEND_DELAY - (time.monotonic() - _LAST_SEND_AT)
         if wait > 0:
             await asyncio.sleep(wait)
+        connect_attempt = 0
         while True:
             for value in kwargs.values():
                 if hasattr(value, "seek"):
@@ -104,6 +105,24 @@ async def _send(call, *args, **kwargs):
                     else float(retry_after)
                 )
                 await asyncio.sleep(seconds + 0.5)
+            except TimedOut as exc:
+                cause = exc
+                is_connect_timeout = False
+                while cause is not None:
+                    if type(cause).__name__ == "ConnectTimeout":
+                        is_connect_timeout = True
+                        break
+                    cause = cause.__cause__ or cause.__context__
+                if not is_connect_timeout or connect_attempt >= 2:
+                    raise
+                connect_attempt += 1
+                delay = 0.5 * (2 ** (connect_attempt - 1))
+                LOGGER.warning(
+                    "Telegram connect timeout; retrying send attempt=%s/3 delay=%.1fs",
+                    connect_attempt + 1,
+                    delay,
+                )
+                await asyncio.sleep(delay)
 
 
 def _draft_body(draft) -> str:
@@ -1700,11 +1719,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if action == "newdb":
         await query.answer("Начинаю отбор")
         await query.edit_message_reply_markup(None)
-        context.application.create_task(
-            start_curation(context.bot),
-            update=update,
-            name="curation-start",
-        )
+        await start_curation(context.bot)
         return
 
     if action == "curstoppost":
@@ -2413,11 +2428,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_curation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_owner(update):
         return
-    context.application.create_task(
-        start_curation(context.bot),
-        update=update,
-        name="curation-start",
-    )
+    await start_curation(context.bot)
 
 
 async def _open_custom_post(bot) -> None:
@@ -2484,11 +2495,7 @@ async def cmd_new_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def cmd_next(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if _is_owner(update):
-        context.application.create_task(
-            start_curation(context.bot),
-            update=update,
-            name="curation-start",
-        )
+        await start_curation(context.bot)
 
 
 async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

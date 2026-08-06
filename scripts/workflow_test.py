@@ -930,8 +930,7 @@ async def test_anytime_database_iteration() -> None:
             SimpleNamespace(callback_query=query, effective_chat=SimpleNamespace(id=123)),
             SimpleNamespace(bot=fake_bot, application=application),
         )
-        assert len(application.tasks) == 1
-        await application.tasks[0]
+        assert application.tasks == []
         assert "Начинаем наполнять полку" in fake_bot.messages[0]["text"]
         assert "Отбор #1" in fake_bot.messages[1]["text"]
         assert "On demand" in fake_bot.messages[-1]["text"]
@@ -996,6 +995,40 @@ async def test_direct_photo_delivery_captures_file_id() -> None:
         config.OWNER_CHAT_ID = old_owner
         config.BOT_SEND_DELAY = old_delay
         Path(tmp.name).unlink(missing_ok=True)
+
+
+async def test_send_retries_connect_timeout() -> None:
+    """A pre-connect Telegram timeout is safe to retry inside the webhook request."""
+    class ConnectTimeout(Exception):
+        pass
+
+    attempts = 0
+    sleeps: list[float] = []
+    original_sleep = bot.asyncio.sleep
+    old_delay = config.BOT_SEND_DELAY
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    async def flaky_send():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            try:
+                raise ConnectTimeout("connect failed")
+            except ConnectTimeout as exc:
+                raise bot.TimedOut("timed out") from exc
+        return "sent"
+
+    try:
+        config.BOT_SEND_DELAY = 0
+        bot.asyncio.sleep = fake_sleep
+        assert await bot._send(flaky_send) == "sent"
+        assert attempts == 2
+        assert sleeps == [0.5]
+    finally:
+        bot.asyncio.sleep = original_sleep
+        config.BOT_SEND_DELAY = old_delay
 
 
 async def main() -> None:
@@ -1236,6 +1269,7 @@ async def main() -> None:
         await test_photo_choice_and_publication()
         await test_anytime_database_iteration()
         await test_direct_photo_delivery_captures_file_id()
+        await test_send_retries_connect_timeout()
 
         waiter = asyncio.get_running_loop().create_future()
         bot._STAGING_WAITERS["unit-token"] = waiter

@@ -192,6 +192,9 @@ async def test_evening_planning_and_next_day_publish() -> None:
             labels = [button.text for row in keyboard for button in row]
             assert labels == [
                 f"✅ Готово на завтра ({position}/3)",
+                "🇬🇧 Только EN",
+                "🗜 До 1500",
+                "✨ EN + до 1500",
                 "✏️ Редактировать руками",
                 "🤖 Редактировать с AI",
                 "🧵 Пересобрать Threads с AI",
@@ -607,7 +610,7 @@ async def test_edit_retry_loop() -> None:
 
 
 async def test_anytime_owner_post() -> None:
-    """Custom text stays raw until the owner explicitly runs Standard Transform."""
+    """Custom text stays raw until the owner explicitly chooses an AI action."""
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     tmp.close()
     old_db_path = config.DB_PATH
@@ -618,7 +621,7 @@ async def test_anytime_owner_post() -> None:
     translate_calls: list[tuple[str, str]] = []
     threadify_calls: list[str] = []
 
-    def fake_translate(source: str, date: str, text: str):
+    def fake_translate(source: str, date: str, text: str, **_kwargs):
         translate_calls.append((source, text))
         return generator.DraftOut(
             linkedin_text="Prepared English owner post.",
@@ -695,7 +698,9 @@ async def test_anytime_owner_post() -> None:
         assert raw_labels == [
             "✅ Опубликовать сейчас",
             "📥 На полку",
-            "✨ Standard Transform",
+            "🇬🇧 Только EN",
+            "🗜 До 1500",
+            "✨ EN + до 1500",
             "✏️ Редактировать руками",
             "🤖 Редактировать с AI",
             "🧵 Пересобрать Threads с AI",
@@ -1031,6 +1036,180 @@ async def test_send_retries_connect_timeout() -> None:
         config.BOT_SEND_DELAY = old_delay
 
 
+async def test_long_draft_controls_and_chunked_preview() -> None:
+    """1500 is optional; oversized previews are lossless and 3000 is the publish gate."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    old_db_path = config.DB_PATH
+    old_owner = config.OWNER_CHAT_ID
+    old_delay = config.BOT_SEND_DELAY
+    original_compress = generator.compress_post
+    original_translate = generator.translate_post
+    original_publish = publisher.publish_all
+    compress_targets: list[int] = []
+    translate_targets: list[int] = []
+    publish_calls = 0
+
+    def fake_compress(text: str, target_chars: int):
+        compress_targets.append(target_chars)
+        result = "C" * target_chars
+        return generator.DraftOut(
+            linkedin_text=result,
+            x_text=result,
+            threads_text=result,
+            notes="",
+            thread_items=["C" * min(config.THREAD_ITEM_CHARS, target_chars)],
+        )
+
+    def fake_translate(source: str, date: str, text: str, *, max_chars: int):
+        translate_targets.append(max_chars)
+        result = "E" * min(2_900, max_chars)
+        return generator.DraftOut(
+            linkedin_text=result,
+            x_text=result,
+            threads_text=result,
+            notes="",
+            thread_items=["English Threads card."],
+        )
+
+    def forbidden_publish(*_args, **_kwargs):
+        nonlocal publish_calls
+        publish_calls += 1
+        raise AssertionError("oversized draft reached Buffer")
+
+    try:
+        config.DB_PATH = tmp.name
+        config.OWNER_CHAT_ID = 123
+        config.BOT_SEND_DELAY = 0
+        generator.compress_post = fake_compress
+        generator.translate_post = fake_translate
+        publisher.publish_all = forbidden_publish
+        conn = db.connect()
+        source_id = db.upsert_source(conn, "manual:123", "Own posts")
+        long_master = "L" * 4_500
+        assert db.insert_post(
+            conn,
+            source_id,
+            1,
+            "2026-08-07T12:00:00+00:00",
+            long_master,
+            None,
+            status="drafted",
+            media_kind="manual",
+        )
+        post = conn.execute("SELECT * FROM post WHERE tg_message_id=1").fetchone()
+        draft_id = db.create_draft(
+            conn,
+            post["id"],
+            "manual/raw",
+            long_master,
+            long_master,
+            long_master,
+            "",
+            [str(index) + ("T" * 470) for index in range(10)],
+        )
+        fake_bot = FakeBot()
+        await bot._send_draft(fake_bot, conn, draft_id)
+        assert all(len(message["text"]) <= 4_000 for message in fake_bot.messages)
+        assert len(fake_bot.messages) >= 4
+        labels = [
+            button.text
+            for row in fake_bot.messages[-1]["reply_markup"].inline_keyboard
+            for button in row
+        ]
+        assert "🗜 До 1500" in labels
+        assert "📐 До 3000" in labels
+
+        publish_query = FakeQuery(f"pub:{draft_id}")
+        await bot.on_callback(
+            SimpleNamespace(callback_query=publish_query, effective_chat=SimpleNamespace(id=123)),
+            SimpleNamespace(bot=fake_bot),
+        )
+        assert publish_calls == 0
+        assert "максимум — 3000" in fake_bot.messages[-1]["text"]
+
+        fit_query = FakeQuery(f"fitplatform:{draft_id}")
+        await bot.on_callback(
+            SimpleNamespace(callback_query=fit_query, effective_chat=SimpleNamespace(id=123)),
+            SimpleNamespace(bot=fake_bot),
+        )
+        assert compress_targets == [config.PLATFORM_SAFE_CHARS]
+        assert len(bot._draft_body(db.get_draft(conn, draft_id))) == config.PLATFORM_SAFE_CHARS
+        fitted_labels = [
+            button.text
+            for row in fake_bot.messages[-1]["reply_markup"].inline_keyboard
+            for button in row
+        ]
+        assert "📐 До 3000" not in fitted_labels
+
+        translate_query = FakeQuery(f"translateonly:{draft_id}")
+        await bot.on_callback(
+            SimpleNamespace(callback_query=translate_query, effective_chat=SimpleNamespace(id=123)),
+            SimpleNamespace(bot=fake_bot),
+        )
+        assert translate_targets == [config.PLATFORM_SAFE_CHARS]
+
+        compact_query = FakeQuery(f"compress1500:{draft_id}")
+        await bot.on_callback(
+            SimpleNamespace(callback_query=compact_query, effective_chat=SimpleNamespace(id=123)),
+            SimpleNamespace(bot=fake_bot),
+        )
+        assert compress_targets == [config.PLATFORM_SAFE_CHARS, config.MAX_POST_CHARS]
+        assert len(bot._draft_body(db.get_draft(conn, draft_id))) == config.MAX_POST_CHARS
+
+        raw_source_id = db.upsert_source(conn, "@raw-compress", "Raw compress")
+        assert db.insert_post(
+            conn,
+            raw_source_id,
+            2,
+            "2026-08-07T13:00:00+00:00",
+            "Русский текст без перевода " * 100,
+            "https://t.me/raw_compress/2",
+        )
+        raw_post = conn.execute("SELECT * FROM post WHERE tg_message_id=2").fetchone()
+        db.set_post_status(conn, raw_post["id"], "offered")
+        raw_compress_query = FakeQuery(f"rawcompress:{raw_post['id']}")
+        await bot.on_callback(
+            SimpleNamespace(
+                callback_query=raw_compress_query,
+                effective_chat=SimpleNamespace(id=123),
+            ),
+            SimpleNamespace(bot=fake_bot),
+        )
+        assert compress_targets[-1] == config.MAX_POST_CHARS
+        assert db.active_draft_for_post(conn, raw_post["id"]) is not None
+
+        assert db.insert_post(
+            conn,
+            raw_source_id,
+            3,
+            "2026-08-07T14:00:00+00:00",
+            "Ещё один полный русский текст " * 100,
+            "https://t.me/raw_compress/3",
+        )
+        translate_post = conn.execute("SELECT * FROM post WHERE tg_message_id=3").fetchone()
+        db.set_post_status(conn, translate_post["id"], "offered")
+        raw_translate_query = FakeQuery(f"translate:{translate_post['id']}")
+        await bot.on_callback(
+            SimpleNamespace(
+                callback_query=raw_translate_query,
+                effective_chat=SimpleNamespace(id=123),
+            ),
+            SimpleNamespace(bot=fake_bot),
+        )
+        assert translate_targets[-1] == config.PLATFORM_SAFE_CHARS
+        assert db.active_draft_for_post(conn, translate_post["id"]) is not None
+        conn.close()
+    finally:
+        generator.compress_post = original_compress
+        generator.translate_post = original_translate
+        publisher.publish_all = original_publish
+        config.DB_PATH = old_db_path
+        config.OWNER_CHAT_ID = old_owner
+        config.BOT_SEND_DELAY = old_delay
+        Path(tmp.name).unlink(missing_ok=True)
+
+
 async def main() -> None:
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     tmp.close()
@@ -1079,7 +1258,12 @@ async def main() -> None:
         assert row["status"] == "offered"
         keyboard = fake.messages[0]["reply_markup"].inline_keyboard
         labels = [button.text for row in keyboard for button in row]
-        assert labels == ["✨ Создать пост", "⏭ Пропустить"]
+        assert labels == [
+            "🇬🇧 Перевести EN",
+            "🗜 До 1500",
+            "✨ EN + до 1500",
+            "⏭ Пропустить",
+        ]
 
         route_calls = {"translate": 0}
 
@@ -1124,6 +1308,9 @@ async def main() -> None:
         assert draft_labels == [
             "✅ Опубликовать сейчас",
             "📥 На полку",
+            "🇬🇧 Только EN",
+            "🗜 До 1500",
+            "✨ EN + до 1500",
             "✏️ Редактировать руками",
             "🤖 Редактировать с AI",
             "🧵 Пересобрать Threads с AI",
@@ -1270,6 +1457,7 @@ async def main() -> None:
         await test_anytime_database_iteration()
         await test_direct_photo_delivery_captures_file_id()
         await test_send_retries_connect_timeout()
+        await test_long_draft_controls_and_chunked_preview()
 
         waiter = asyncio.get_running_loop().create_future()
         bot._STAGING_WAITERS["unit-token"] = waiter

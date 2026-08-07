@@ -22,11 +22,10 @@ Telethon user session ───────────────┐
                                      ▼
                            Telegram bot review UI
                    ┌─────────────────┴─────────────────┐
-             Пропустить                         Создать пост
+             Пропустить                  выбрать AI-действие
                    │                                  │
-          next raw candidate                 gpt-5.6-terra
-          in the same iteration        translate + factual correction
-                                           + compress to ≤1500 chars
+          next raw candidate           EN only / compress to 1500 /
+          in the same iteration          EN + compress to 1500
                                                       │
                                    ┌──────────────────┼──────────────────┐
                              Редактировать    На полку        Закончить отбор
@@ -59,15 +58,15 @@ hands the durable FIFO shelf back to automation.
 3. The owner presses persistent `📚 Наполнить полку` whenever convenient. No review
    flow starts automatically at 21:00.
 4. The bot opens one durable, unbounded curation session and sends one original material with:
-   `✨ Создать пост` and `⏭ Пропустить`.
+   `🇬🇧 Перевести EN`, `🗜 До 1500`, `✨ EN + до 1500`, and `⏭ Пропустить`.
 5. `Пропустить` permanently closes that candidate and immediately sends the next
    one. The owner can keep skipping inside the same iteration without an AI call.
-6. `Создать пост` calls Terra once. It translates the post into natural English,
-   corrects only author/company facts using `AUTHOR_FACTS`, and compresses only when
-   necessary to stay within 1500 Unicode characters.
-7. The reviewed curation draft has five actions: `📥 Сохранить на полку`,
-   `✏️ Редактировать руками`, `🤖 Редактировать с AI`, `⏭ Другой материал`,
-   and `⏹ Закончить отбор`.
+6. `Перевести EN` translates and corrects author/company facts while preserving the
+   complete post up to the cross-platform hard limit of 3000. `До 1500` compresses
+   in the current language without translating. `EN + до 1500` performs both.
+7. Every reviewed draft keeps those three independent AI actions, plus
+   `📥 Сохранить на полку`, manual/AI editing, Threads regeneration, replacement,
+   and stop controls. An oversized draft also gets `📐 До 3000`.
 8. Editing means replying with the complete replacement master text. LinkedIn/X
    keep that text exactly and do not AI-compress it; manual edits may use up to
    3000 characters. Terra only rebuilds the separate Threads sequence.
@@ -95,8 +94,9 @@ It opens two immediate modes:
 
 - `📚 Начать отбор в полку` starts or resumes the same durable curation flow.
 - `✍️ Написать свой текст` stores the submitted text unchanged and without an AI
-  call. The owner can publish it as-is, run `✨ Standard Transform`, edit manually,
-  rebuild Threads with AI, edit with AI, publish now, save to the shelf, or cancel.
+  call. The owner can publish it as-is, translate only, compress only, run the
+  combined EN + 1500 action, edit manually/with AI, rebuild Threads, publish now,
+  save to the shelf, or cancel.
 
 ## Queue semantics
 
@@ -180,12 +180,20 @@ OPENAI_MODEL=gpt-5.6-terra
 MAX_POST_CHARS=1500
 ```
 
+The three explicit transformations are:
+
+- `🇬🇧 Только EN`: English + Mike/Vahue fact correction; preserve the whole post,
+  compressing only if necessary to fit the 3000-character cross-platform limit.
+- `🗜 До 1500`: optional editorial compression in the current language; no
+  translation or fact replacement.
+- `✨ EN + до 1500`: English + fact correction + optional compression to 1500.
+
 Terra must:
 
 - translate the complete post rather than summarize it;
 - preserve first-person voice, structure, reasoning, examples, numbers, jokes,
   irony, profanity, and the ending;
-- keep a natural translation unchanged when it already fits 1500 characters;
+- keep a natural translation unchanged when it already fits the selected target;
 - when necessary, compress by removing repetition and secondary explanation before
   removing concrete examples or punchlines;
 - treat the input as Mike Doroshenko's own post whose personal/company facts may be
@@ -197,10 +205,10 @@ Terra must:
   factual corrections that need review;
 - return a separate ordered `thread_items` sequence: a truthful hook or question,
   one complete story/value point per card, and a final payoff/optional discussion
-  question. Every card is at most 250 characters and never cuts a sentence merely
+  question. Every card is at most 500 characters and never cuts a sentence merely
   to fill the limit.
 
-The response schema also enforces the 1500-character limit. If the model still
+The response schema enforces the selected 1500 or 3000 target. If the model still
 returns a longer string, generation fails visibly instead of silently truncating it.
 
 Current author facts:
@@ -252,12 +260,17 @@ same per-platform mutation.
 | --- | --- |
 | LinkedIn | One post containing the full master text. |
 | X | One long post when `X_PREMIUM=true`; no Buffer thread metadata. |
-| Threads | AI-authored ordered cards of at most 250 characters, sent exactly as previewed through `metadata.threads.thread`. The first card is repeated as top-level `text`, as Buffer requires. |
+| Threads | Up to 10 AI-authored ordered cards of at most 500 characters, sent exactly as previewed through `metadata.threads.thread`. The first card is repeated as top-level `text`, as Buffer requires. |
 
 The bot shows `📄 LinkedIn / X` and a numbered `🧵 Threads preview` separately.
 `🧵 Пересобрать Threads с AI` changes only the Threads sequence; it never changes
 the LinkedIn/X master. Legacy/raw drafts without an AI plan fall back to conservative
-sentence/paragraph splitting at 250 characters.
+sentence/paragraph splitting at 500 characters.
+
+Current text totals are LinkedIn `3000`, X Premium through Buffer `25000`, and
+Threads `10 × 500 = 5000`. Therefore a single master that must publish to all three
+uses `3000` as its hard limit. `1500` is only an optional editorial target. Telegram
+previews are split into multiple messages at 4000 characters without deleting text.
 
 `BUFFER_POST_MODE=shareNow` publishes immediately. `addToQueue` delegates timing to
 the Buffer channel queue. The current production environment uses `shareNow`.
@@ -347,18 +360,17 @@ Copy [`.env.example`](.env.example) to `.env` for local use. Never commit `.env`
 | `BOT_TOKEN` | yes | Telegram Bot API token from BotFather. |
 | `OWNER_CHAT_ID` | yes | Only this private chat may control the bot. |
 | `DATABASE_URL` | Vercel | Neon/PostgreSQL connection. Without it, local SQLite is used. |
-| `OPENAI_API_KEY` | yes | OpenAI API credential used on source transformation, Standard Transform, and AI edit. |
+| `OPENAI_API_KEY` | yes | OpenAI API credential used on explicit translation/compression actions and AI edit. |
 | `OPENAI_MODEL` | yes | `gpt-5.6-terra` in production. |
 | `LLM_PROVIDER` | yes | `openai`; Anthropic remains an optional fallback implementation. |
 | `AUTHOR_FACTS` | yes | Verified Mike/Vahue facts available to the correction prompt. |
 | `BUFFER_ACCESS_TOKEN` | yes | Buffer API token. |
 | `BUFFER_CHANNELS` | yes | `linkedin:id,twitter:id,threads:id`. |
 | `BUFFER_POST_MODE` | yes | `shareNow` or `addToQueue`. |
-| `MAX_POST_CHARS` | yes | Master draft limit; clamped to a maximum of 1500. |
-| `THREAD_ITEM_CHARS` | yes | Target and hard validation limit for each Threads card; `250`. |
+| `MAX_POST_CHARS` | yes | Optional editorial compression target; clamped to `1500`. It is not a publish gate. |
+| `THREAD_ITEM_CHARS` | yes | Target and hard validation limit for each Threads card; `500`. |
 | `THREAD_MAX_ITEMS` | yes | Maximum ordered cards in one Threads thread; `10`. |
-| `MANUAL_MAX_POST_CHARS` | yes | Owner-edited final text limit; 3000 for LinkedIn compatibility. |
-| `X_PREMIUM` | yes | Allows one X post up to 25,000 characters; master limit still applies. |
+| `X_PREMIUM` | yes | Allows one X post up to 25,000 characters through supported Buffer plans. |
 | `PLANNING_TIME` | legacy | Ignored by production; retained only for old configuration compatibility. |
 | `PUBLISH_TIMES` | yes | Daily FIFO publication ticks: `09:00,14:00,19:00`. |
 | `DAILY_POSTS` | yes | Must equal the number of publication ticks; it no longer limits saved drafts. |
@@ -430,9 +442,10 @@ without discarding successful sources, and a failed full backfill exits non-zero
 `📊 Статус` buttons. `Наполнить полку` starts or resumes unlimited curation.
 `Написать свой текст` opens a durable manual input session independently of
 curation. Russian, English, or
-mixed input is first saved byte-for-byte with zero LLM calls. `Standard Transform`
-then explicitly runs the three-stage pipeline: translate to English, correct only
-Mike/Vahue facts, and semantically compress only when needed to fit 1500 characters.
+mixed input is first saved byte-for-byte with zero LLM calls. The owner then chooses
+translation only, current-language compression to 1500, or the combined English +
+fact-correction + 1500 pipeline. Drafts over 3000 also offer minimal compression to
+the common platform limit.
 `✏️ Редактировать руками` accepts a complete owner-written master up to 3000
 characters without rewriting or compressing that master; Terra then rebuilds only
 the Threads sequence. `🤖 Редактировать с AI` opens a durable Terra
@@ -492,7 +505,7 @@ Coverage includes:
 - a persistent FIFO shelf and exactly one claimed item per publication tick;
 - no LLM or Buffer calls before explicit owner actions;
 - custom-text publish-now/save-to-shelf flows independent from curation;
-- explicit Standard Transform with zero AI calls before that button;
+- independent translate-only, compress-only, combined, and platform-fit actions;
 - draft finish behavior without replacement;
 - media staging without transcription;
 - optional photo publication through the stable tokenized Vercel media endpoint;
@@ -516,10 +529,10 @@ Coverage includes:
 ### User-visible progress and runtime logs
 
 Long-running owner actions acknowledge themselves before work starts. Translation
-shows that Terra is translating/checking/compressing, accepted edits show their
+shows exactly which translation/compression mode Terra is running, accepted edits show their
 character count, and publishing lists the Buffer destinations. Validation and
 handler failures always return a Telegram message; an invalid reply is never
-silently ignored. If an edit exceeds the limit, the validation message becomes the
+silently ignored. If a manual edit exceeds the 3000 platform limit, the validation message becomes the
 new ForceReply prompt, so the owner can shorten the text and continue the same
 draft repeatedly.
 

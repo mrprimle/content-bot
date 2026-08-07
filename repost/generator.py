@@ -26,13 +26,13 @@ class ThreadPlanOut(BaseModel):
 _anthropic_client = None
 
 
-def _validate_full_text(text: str) -> str:
+def _validate_full_text(text: str, max_chars: int) -> str:
     text = text.strip()
     if not text:
         raise RuntimeError("Модель вернула пустой текст")
-    if len(text) > config.MAX_POST_CHARS:
+    if len(text) > max_chars:
         raise RuntimeError(
-            f"Модель вернула {len(text)} символов при лимите {config.MAX_POST_CHARS}; "
+            f"Модель вернула {len(text)} символов при лимите {max_chars}; "
             "текст не обрезан, попробуй создать пост ещё раз"
         )
     return text
@@ -59,8 +59,14 @@ def _validate_thread_items(items: list[str]) -> list[str]:
     return clean
 
 
-def _draft(text: str, notes: str = "", thread_items: list[str] | None = None) -> DraftOut:
-    text = _validate_full_text(text)
+def _draft(
+    text: str,
+    notes: str = "",
+    thread_items: list[str] | None = None,
+    *,
+    max_chars: int,
+) -> DraftOut:
+    text = _validate_full_text(text, max_chars)
     items = _validate_thread_items(thread_items or [])
     return DraftOut(
         linkedin_text=text,
@@ -91,7 +97,7 @@ def _anthropic_parse(system: str, user: str) -> TranslationOut:
     return resp.parsed_output
 
 
-def _openai_parse(system: str, user: str) -> TranslationOut:
+def _openai_parse(system: str, user: str, max_chars: int) -> TranslationOut:
     if not config.OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY не задан в .env")
     schema = {
@@ -100,7 +106,7 @@ def _openai_parse(system: str, user: str) -> TranslationOut:
             "full_text": {
                 "type": "string",
                 "minLength": 1,
-                "maxLength": config.MAX_POST_CHARS,
+                "maxLength": max_chars,
             },
             "notes": {"type": "string"},
             "thread_items": {
@@ -140,9 +146,9 @@ def _openai_parse(system: str, user: str) -> TranslationOut:
     return TranslationOut.model_validate_json(msg["content"])
 
 
-def _parse(system: str, user: str) -> TranslationOut:
+def _parse(system: str, user: str, max_chars: int) -> TranslationOut:
     if config.llm_provider() == "openai":
-        return _openai_parse(system, user)
+        return _openai_parse(system, user, max_chars)
     return _anthropic_parse(system, user)
 
 
@@ -225,13 +231,19 @@ def threadify_post(text: str) -> ThreadPlanOut:
     )
 
 
-def translate_post(source: str, date: str, text: str) -> DraftOut:
-    """Create the LinkedIn/X master and a separate Threads-native sequence."""
+def translate_post(
+    source: str,
+    date: str,
+    text: str,
+    max_chars: int = config.PLATFORM_SAFE_CHARS,
+) -> DraftOut:
+    """Translate/correct the full post; compress only above the requested hard limit."""
     out = _parse(
-        prompts.TRANSLATE_SYSTEM,
+        prompts.translation_system(max_chars),
         prompts.user_message(source, date, text),
+        max_chars,
     )
-    return _draft(out.full_text, out.notes, out.thread_items)
+    return _draft(out.full_text, out.notes, out.thread_items, max_chars=max_chars)
 
 
 def generate(source: str, date: str, text: str) -> DraftOut:
@@ -248,10 +260,36 @@ def revise_post(current_text: str, instruction: str) -> DraftOut:
     if not instruction:
         raise RuntimeError("Инструкция для AI пуста")
     out = _parse(
-        prompts.REVISE_SYSTEM,
+        prompts.revise_system(config.PLATFORM_SAFE_CHARS),
         prompts.revise_message(current_text, instruction),
+        config.PLATFORM_SAFE_CHARS,
     )
-    return _draft(out.full_text, out.notes, out.thread_items)
+    return _draft(
+        out.full_text,
+        out.notes,
+        out.thread_items,
+        max_chars=config.PLATFORM_SAFE_CHARS,
+    )
+
+
+def compress_post(current_text: str, target_chars: int) -> DraftOut:
+    """Compress in the current language without translating or changing facts."""
+    current_text = current_text.strip()
+    if not current_text:
+        raise RuntimeError("Пустой текст нельзя сжать")
+    if target_chars not in {config.MAX_POST_CHARS, config.PLATFORM_SAFE_CHARS}:
+        raise ValueError("Неподдерживаемый лимит сжатия")
+    out = _parse(
+        prompts.compression_system(target_chars),
+        prompts.compression_message(current_text),
+        target_chars,
+    )
+    return _draft(
+        out.full_text,
+        out.notes,
+        out.thread_items,
+        max_chars=target_chars,
+    )
 
 
 def adapt(edited_text: str) -> DraftOut:

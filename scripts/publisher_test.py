@@ -100,10 +100,20 @@ def main() -> None:
     _, platform, planned = publisher._publication_payload("threads", thread_items)
     assert platform == "threads" and planned == thread_items
 
-    generated = generator._draft("Master text", "", thread_items)
+    generated = generator._draft(
+        "Master text",
+        "",
+        thread_items,
+        max_chars=config.PLATFORM_SAFE_CHARS,
+    )
     assert generated.thread_items == thread_items
     try:
-        generator._draft("Master text", "", ["x" * (config.THREAD_ITEM_CHARS + 1)])
+        generator._draft(
+            "Master text",
+            "",
+            ["x" * (config.THREAD_ITEM_CHARS + 1)],
+            max_chars=config.PLATFORM_SAFE_CHARS,
+        )
     except RuntimeError as exc:
         assert "превышают лимит" in str(exc)
     else:
@@ -151,6 +161,21 @@ def main() -> None:
     first, thread_platform, thread = publisher._publication_payload("twitter", x_text)
     assert first == x_text
     assert thread_platform is None and thread is None
+
+    try:
+        publisher._publication_payload("twitter", "x" * (config.LIMITS["twitter"] + 1))
+    except ValueError as exc:
+        assert "остановлена без обрезания" in str(exc)
+    else:
+        raise AssertionError("oversized X Premium post was silently threaded")
+
+    too_many_threads = ["part"] * (config.THREAD_MAX_ITEMS + 1)
+    try:
+        publisher._publication_payload("threads", too_many_threads)
+    except ValueError as exc:
+        assert "при лимите" in str(exc)
+    else:
+        raise AssertionError("Threads plan above the ten-item cap was accepted")
     print("Publisher-тест пройден: missing skipped, empty failed, success preserved")
 
 

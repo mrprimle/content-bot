@@ -151,6 +151,35 @@ def _threads_preview(draft) -> str:
     return "\n\n".join(parts)
 
 
+def _ai_transform_rows(draft_id: int, master_chars: int) -> list[list[InlineKeyboardButton]]:
+    rows = [
+        [
+            InlineKeyboardButton(
+                "🇬🇧 Только EN",
+                callback_data=f"translateonly:{draft_id}",
+            ),
+            InlineKeyboardButton(
+                f"🗜 До {config.MAX_POST_CHARS}",
+                callback_data=f"compress1500:{draft_id}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                f"✨ EN + до {config.MAX_POST_CHARS}",
+                callback_data=f"transform:{draft_id}",
+            )
+        ],
+    ]
+    if master_chars > config.PLATFORM_SAFE_CHARS:
+        rows[1].append(
+            InlineKeyboardButton(
+                f"📐 До {config.PLATFORM_SAFE_CHARS}",
+                callback_data=f"fitplatform:{draft_id}",
+            )
+        )
+    return rows
+
+
 def _message_media_file_id(message, media_kind: str) -> str | None:
     """Extract the reusable Bot API file_id from a delivered Telegram message."""
     if media_kind == "photo" and getattr(message, "photo", None):
@@ -167,6 +196,9 @@ def _remember_bot_media(conn, post, file_id: str | None) -> None:
 
 
 def _draft_keyboard(conn, draft_id: int) -> InlineKeyboardMarkup:
+    draft = db.get_draft(conn, draft_id)
+    master_chars = len(_draft_body(draft)) if draft is not None else 0
+    ai_rows = _ai_transform_rows(draft_id, master_chars)
     planning_slot = db.planning_slot_for_draft(conn, draft_id)
     if planning_slot is not None and planning_slot["session_status"] == "active":
         return InlineKeyboardMarkup(
@@ -177,6 +209,7 @@ def _draft_keyboard(conn, draft_id: int) -> InlineKeyboardMarkup:
                         callback_data=f"planready:{draft_id}",
                     ),
                 ],
+                *ai_rows,
                 [
                     InlineKeyboardButton(
                         "✏️ Редактировать руками",
@@ -214,6 +247,7 @@ def _draft_keyboard(conn, draft_id: int) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
             [
                 [InlineKeyboardButton("📥 Сохранить на полку", callback_data=f"shelf:{draft_id}")],
+                *ai_rows,
                 [
                     InlineKeyboardButton("✏️ Редактировать руками", callback_data=f"edit:{draft_id}"),
                     InlineKeyboardButton("🤖 Редактировать с AI", callback_data=f"aiedit:{draft_id}"),
@@ -230,7 +264,6 @@ def _draft_keyboard(conn, draft_id: int) -> InlineKeyboardMarkup:
                 ],
             ]
         )
-    draft = db.get_draft(conn, draft_id)
     post = db.get_post(conn, draft["post_id"]) if draft is not None else None
     final_row = [
         InlineKeyboardButton(
@@ -250,15 +283,7 @@ def _draft_keyboard(conn, draft_id: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton("✅ Опубликовать сейчас", callback_data=f"pub:{draft_id}"),
         InlineKeyboardButton("📥 На полку", callback_data=f"shelf:{draft_id}"),
     ]]
-    if post is not None and post["media_kind"] == "manual":
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    "✨ Standard Transform",
-                    callback_data=f"transform:{draft_id}",
-                )
-            ]
-        )
+    rows.extend(ai_rows)
     rows.extend(
         [
             [
@@ -348,10 +373,22 @@ def _new_post_menu() -> InlineKeyboardMarkup:
 
 
 def _raw_keyboard(post_id: int, *, curation: bool = False) -> InlineKeyboardMarkup:
-    rows = [[
-        InlineKeyboardButton("✨ Создать пост", callback_data=f"make:{post_id}"),
-        InlineKeyboardButton("⏭ Пропустить", callback_data=f"drop:{post_id}"),
-    ]]
+    rows = [
+        [
+            InlineKeyboardButton("🇬🇧 Перевести EN", callback_data=f"translate:{post_id}"),
+            InlineKeyboardButton(
+                f"🗜 До {config.MAX_POST_CHARS}",
+                callback_data=f"rawcompress:{post_id}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                f"✨ EN + до {config.MAX_POST_CHARS}",
+                callback_data=f"make:{post_id}",
+            ),
+            InlineKeyboardButton("⏭ Пропустить", callback_data=f"drop:{post_id}"),
+        ],
+    ]
     if curation:
         rows.append(
             [InlineKeyboardButton("⏹ Закончить отбор", callback_data=f"curstoppost:{post_id}")]
@@ -414,12 +451,14 @@ async def _send_draft(bot, conn, draft_id: int) -> None:
     master = _draft_body(draft)
     for chunk in _text_chunks("📄 LinkedIn / X:\n\n" + master):
         await _send(bot.send_message, config.OWNER_CHAT_ID, chunk)
-    msg = await _send(
-        bot.send_message,
-        config.OWNER_CHAT_ID,
-        _threads_preview(draft),
-        reply_markup=_draft_keyboard(conn, draft_id),
-    )
+    preview_chunks = _text_chunks(_threads_preview(draft)) or ["🧵 Threads preview пуст"]
+    msg = None
+    for index, chunk in enumerate(preview_chunks):
+        kwargs = {}
+        if index == len(preview_chunks) - 1:
+            kwargs["reply_markup"] = _draft_keyboard(conn, draft_id)
+        msg = await _send(bot.send_message, config.OWNER_CHAT_ID, chunk, **kwargs)
+    assert msg is not None
     db.set_draft_message(conn, draft_id, msg.message_id)
     db.set_draft_status(conn, draft_id, "awaiting_review")
 
@@ -997,6 +1036,9 @@ async def _generate_from_post(
     conn,
     post,
     source_text: str,
+    *,
+    target_chars: int,
+    translate: bool,
 ) -> bool:
     started_at = time.monotonic()
     LOGGER.info(
@@ -1029,12 +1071,20 @@ async def _generate_from_post(
                 pass
             return False
     try:
-        out = await asyncio.to_thread(
-            generator.translate_post,
-            post["title"] or post["username"],
-            post["posted_at"][:10],
-            source_text,
-        )
+        if translate:
+            out = await asyncio.to_thread(
+                generator.translate_post,
+                post["title"] or post["username"],
+                post["posted_at"][:10],
+                source_text,
+                max_chars=target_chars,
+            )
+        else:
+            out = await asyncio.to_thread(
+                generator.compress_post,
+                source_text,
+                target_chars,
+            )
         draft_id = db.create_draft(
             conn,
             post["id"],
@@ -1103,6 +1153,47 @@ def _texts_for_publish(draft) -> dict[str, str | list[str]]:
     }
 
 
+def _platform_limit_error(draft) -> str | None:
+    master = _draft_body(draft)
+    if len(master) > config.PLATFORM_SAFE_CHARS:
+        return (
+            f"Master содержит {len(master)} символов. Для одновременной публикации "
+            f"в LinkedIn, X Premium и Threads максимум — {config.PLATFORM_SAFE_CHARS} "
+            "(ограничивает LinkedIn). Текст не обрезан."
+        )
+    items = _thread_items_for_draft(draft)
+    if len(items) > config.THREAD_MAX_ITEMS:
+        return (
+            f"Threads-план содержит {len(items)} частей; разрешено максимум "
+            f"{config.THREAD_MAX_ITEMS}. Master не изменён."
+        )
+    too_long = [index for index, item in enumerate(items, 1) if len(item) > config.THREAD_ITEM_CHARS]
+    if too_long:
+        return (
+            f"Threads-части {too_long} длиннее {config.THREAD_ITEM_CHARS} символов. "
+            "Master не изменён."
+        )
+    return None
+
+
+async def _require_platform_fit(bot, conn, draft) -> bool:
+    error = _platform_limit_error(draft)
+    if error is None:
+        return True
+    markup = (
+        _draft_keyboard(conn, draft["id"])
+        if draft["status"] in {"awaiting_review", "approved", "delivery_failed"}
+        else None
+    )
+    await _send(
+        bot.send_message,
+        config.OWNER_CHAT_ID,
+        f"⚠️ {error}\n\nНажми «📐 До {config.PLATFORM_SAFE_CHARS}» или отредактируй вручную 💜",
+        reply_markup=markup,
+    )
+    return False
+
+
 def _image_url_for_draft(conn, draft) -> str | None:
     if not draft["include_media"]:
         return None
@@ -1125,6 +1216,11 @@ def _ok_platforms(conn, draft_id: int) -> set[str]:
 
 
 async def _publish(bot, conn, draft_id: int, *, notify: bool = True) -> None:
+    draft = db.get_draft(conn, draft_id)
+    if draft is None:
+        return
+    if not await _require_platform_fit(bot, conn, draft):
+        return
     if not db.claim_draft_publish(conn, draft_id):
         if notify:
             await _send(
@@ -1425,6 +1521,10 @@ async def _finalize_planning_draft(query, context, conn, draft_id: int, include_
     if draft is None:
         await query.answer("Черновик не найден", show_alert=True)
         return
+    if _platform_limit_error(draft) is not None:
+        await query.answer("Сначала подгони текст под лимиты", show_alert=True)
+        await _require_platform_fit(context.bot, conn, draft)
+        return
     if not draft["threads_json"]:
         try:
             await query.answer("Готовлю Threads-план")
@@ -1474,6 +1574,10 @@ async def _finalize_shelf_draft(query, context, conn, draft_id: int, include_med
     draft = db.get_draft(conn, draft_id)
     if draft is None:
         await query.answer("Черновик не найден", show_alert=True)
+        return
+    if _platform_limit_error(draft) is not None:
+        await query.answer("Сначала подгони текст под лимиты", show_alert=True)
+        await _require_platform_fit(context.bot, conn, draft)
         return
     if not draft["threads_json"]:
         try:
@@ -1556,7 +1660,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     object_id = int(raw_id)
     conn = db.connect()
 
-    if action in {"make", "drop"}:
+    if action in {"make", "translate", "rawcompress", "drop"}:
         post = db.get_post(conn, object_id)
         if post is None:
             await query.answer("Материал не найден", show_alert=True)
@@ -1646,7 +1750,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             post["media_kind"] in {"voice", "audio", "video", "video_note"}
             or not post["text"]
         )
-        if action == "make" and needs_manual_text:
+        if action in {"make", "translate", "rawcompress"} and needs_manual_text:
             await query.answer()
             if not db.transition_post(conn, post["id"], ("offered",), "awaiting_manual"):
                 return
@@ -1656,7 +1760,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     config.OWNER_CHAT_ID,
                     "✍️ Напиши свой текст поста ответом на это сообщение 💜 Не спеши — "
                     "я рядом и потом помогу всё красиво собрать. "
-                    f"Финальная версия будет не длиннее {config.MAX_POST_CHARS} символов.",
+                    f"Hard limit для всех площадок — {config.PLATFORM_SAFE_CHARS} символов; "
+                    f"{config.MAX_POST_CHARS} остаётся добровольной опцией.",
                     reply_markup=ForceReply(selective=True),
                 )
             except Exception as exc:
@@ -1681,14 +1786,27 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if not source_text:
             await query.answer("Нет текста для генерации", show_alert=True)
             return
-        await query.answer("Создаю пост")
+        target_chars = (
+            config.MAX_POST_CHARS
+            if action in {"make", "rawcompress"}
+            else config.PLATFORM_SAFE_CHARS
+        )
+        await query.answer("Перевожу и готовлю пост")
         if not db.transition_post(conn, post["id"], ("offered", "awaiting_manual"), "generating"):
             return
         await _send(
             context.bot.send_message,
             config.OWNER_CHAT_ID,
-            f"⏳ Пост #{post['id']}: отличный выбор, Нео ✨ Перевожу на английский, проверяю факты и "
-            f"укладываю master в {config.MAX_POST_CHARS} символов; отдельно собираю "
+            f"⏳ Пост #{post['id']}: отличный выбор, Нео ✨ "
+            + (
+                f"сжимаю текущий язык до {config.MAX_POST_CHARS} без перевода; "
+                if action == "rawcompress"
+                else f"перевожу на английский, проверяю факты и сжимаю до {config.MAX_POST_CHARS}; "
+                if action == "make"
+                else f"перевожу на английский, проверяю факты и сохраняю полноту текста "
+                f"до общего hard limit {config.PLATFORM_SAFE_CHARS}; "
+            )
+            + "отдельно собираю "
             f"Threads-карточки до {config.THREAD_ITEM_CHARS}. Обычно это занимает 10–30 секунд. "
             "Я всё сделаю бережно 💗",
         )
@@ -1697,6 +1815,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             conn,
             post,
             source_text,
+            target_chars=target_chars,
+            translate=action != "rawcompress",
         )
         if success:
             await query.edit_message_reply_markup(None)
@@ -1895,6 +2015,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "aiedit",
         "threadify",
         "transform",
+        "translateonly",
+        "compress1500",
+        "fitplatform",
     } and _ok_platforms(
         conn,
         object_id,
@@ -2012,13 +2135,21 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 "Текущая версия сохранена. Никакой драмы — Матрица иногда моргает 💗",
                 reply_markup=_draft_keyboard(conn, object_id),
             )
-    elif action == "transform":
+    elif action in {"transform", "translateonly", "compress1500", "fitplatform"}:
         post = db.get_post(conn, draft["post_id"])
-        if post is None or post["media_kind"] != "manual":
+        source_name = (
+            "Собственный пост"
+            if post is None or post["media_kind"] == "manual"
+            else post["title"] or post["username"]
+        )
+        current_text = _draft_body(draft)
+        if action == "fitplatform" and len(current_text) <= config.PLATFORM_SAFE_CHARS:
             await _send(
                 context.bot.send_message,
                 config.OWNER_CHAT_ID,
-                "Standard Transform доступен только для собственного текста.",
+                f"✅ Текст уже помещается: {len(current_text)}/{config.PLATFORM_SAFE_CHARS}. "
+                "Ничего не меняла 💜",
+                reply_markup=_draft_keyboard(conn, object_id),
             )
             return
         if not db.transition_draft(
@@ -2028,28 +2159,60 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "ai_editing",
         ):
             return
+        operation_label = {
+            "translateonly": (
+                "перевод на английский без редакторского сжатия; сжатие включится только "
+                f"если перевод превысит hard limit {config.PLATFORM_SAFE_CHARS}"
+            ),
+            "compress1500": (
+                f"сжатие текущего языка до {config.MAX_POST_CHARS} без перевода и замены фактов"
+            ),
+            "fitplatform": (
+                f"минимальное сжатие текущего языка до platform-safe {config.PLATFORM_SAFE_CHARS}"
+            ),
+            "transform": (
+                f"English → факты Mike/Vahue → добровольное сжатие до {config.MAX_POST_CHARS}"
+            ),
+        }[action]
         await _send(
             context.bot.send_message,
             config.OWNER_CHAT_ID,
-            f"⏳ Standard Transform для поста #{object_id}: English → факты Mike/Vahue → "
-            f"смысловое сжатие только при необходимости до {config.MAX_POST_CHARS} → "
-            f"Threads-план по {config.THREAD_ITEM_CHARS} символов. "
+            f"⏳ Пост #{object_id}: {operation_label}; затем Threads-план по "
+            f"{config.THREAD_ITEM_CHARS} символов. "
             "Обычно это занимает 10–30 секунд. Расслабься, Нео — я всё бережно соберу 💜",
         )
         try:
-            out = await asyncio.to_thread(
-                generator.translate_post,
-                "Собственный пост",
-                datetime.now(ZoneInfo(config.TIMEZONE)).date().isoformat(),
-                _draft_body(draft),
-            )
+            if action in {"translateonly", "transform"}:
+                target_chars = (
+                    config.MAX_POST_CHARS
+                    if action == "transform"
+                    else config.PLATFORM_SAFE_CHARS
+                )
+                out = await asyncio.to_thread(
+                    generator.translate_post,
+                    source_name,
+                    datetime.now(ZoneInfo(config.TIMEZONE)).date().isoformat(),
+                    current_text,
+                    max_chars=target_chars,
+                )
+            else:
+                target_chars = (
+                    config.MAX_POST_CHARS
+                    if action == "compress1500"
+                    else config.PLATFORM_SAFE_CHARS
+                )
+                out = await asyncio.to_thread(
+                    generator.compress_post,
+                    current_text,
+                    target_chars,
+                )
             db.update_draft_texts(
                 conn,
                 object_id,
                 out.linkedin_text,
                 out.x_text,
                 out.threads_text,
-                None,
+                out.linkedin_text,
                 out.thread_items,
             )
             db.set_draft_status(conn, object_id, "awaiting_review")
@@ -2057,12 +2220,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await _send_generation_note(context.bot, transformed)
             await _send_draft(context.bot, conn, object_id)
         except Exception as exc:  # noqa: BLE001
-            LOGGER.exception("standard transform failed draft_id=%s", object_id)
+            LOGGER.exception("draft transform failed action=%s draft_id=%s", action, object_id)
             db.set_draft_status(conn, object_id, "awaiting_review")
             await _send(
                 context.bot.send_message,
                 config.OWNER_CHAT_ID,
-                f"⚠️ Standard Transform не завершён: {_public_error_text(exc)}. "
+                f"⚠️ Обработка не завершена: {_public_error_text(exc)}. "
                 "Исходная версия сохранена, так что ничего не потерялось 💗",
                 reply_markup=_draft_keyboard(conn, object_id),
             )
@@ -2128,7 +2291,7 @@ async def _apply_ai_instruction(update, context, conn, draft, instruction: str) 
         return
     await update.message.reply_text(
         f"⏳ Terra редактирует пост #{draft['id']} по твоей инструкции и проверяет "
-        f"лимит {config.MAX_POST_CHARS}; затем обновляет Threads-план. "
+        f"общий platform-safe лимит {config.PLATFORM_SAFE_CHARS}; затем обновляет Threads-план. "
         "Обычно это занимает 10–30 секунд. Ты точно чувствуешь свой голос — я помогу его сохранить 💜"
     )
     current_text = _draft_body(draft)
@@ -2439,8 +2602,9 @@ async def _open_custom_post(bot) -> None:
             bot.send_message,
             config.OWNER_CHAT_ID,
             "✍️ Пришли свой текст ответом на это сообщение, Нео 💜 Я сначала бережно сохраню его как есть — "
-            "без AI и без автоматического перевода. Затем можно сразу опубликовать, применить "
-            "Standard Transform, отредактировать вручную или через AI. Пиши свободно — я рядом.",
+            "без AI и без автоматического перевода. Затем можно сразу опубликовать, "
+            "перевести, отдельно сжать до 1500, сделать оба шага, отредактировать вручную "
+            "или через AI. Пиши свободно — я рядом.",
             reply_markup=ForceReply(selective=True),
         )
         if existing is not None:

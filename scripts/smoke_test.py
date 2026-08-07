@@ -698,6 +698,10 @@ def main() -> None:
     assert config.OPENAI_MODEL == "gpt-5.6-terra"
     assert config.MAX_POST_CHARS == 1500
     assert config.MANUAL_MAX_POST_CHARS == 3000
+    assert config.PLATFORM_SAFE_CHARS == 3000
+    assert config.THREAD_ITEM_CHARS == 500
+    assert config.THREAD_MAX_ITEMS == 10
+    assert config.THREADS_TOTAL_CHARS == 5000
     assert config.LIMITS == {"linkedin": 3000, "twitter": 25000, "threads": 500}
     assert config.X_PREMIUM is True
     sources = config.read_sources()
@@ -713,6 +717,8 @@ def main() -> None:
     assert "STAGE 2 — TRUTH" in prompts.TRANSLATE_SYSTEM
     assert "STAGE 3 — COMPRESSION" in prompts.TRANSLATE_SYSTEM
     assert "Mike lives in London" in prompts.TRANSLATE_SYSTEM
+    assert "fit 3000 characters" in prompts.translation_system(config.PLATFORM_SAFE_CHARS)
+    assert "Preserve its current language: do not translate" in prompts.compression_system(1500)
     assert "Mike is a man" in prompts.TRANSLATE_SYSTEM
     assert "building SMM automation" in prompts.TRANSLATE_SYSTEM
     assert "third-party fact is content" in prompts.TRANSLATE_SYSTEM

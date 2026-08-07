@@ -113,6 +113,11 @@ def _publication_payload(
         chunks = [item.strip() for item in text if item and item.strip()]
         if not chunks:
             raise ValueError("Threads-план пуст")
+        if len(chunks) > config.THREAD_MAX_ITEMS:
+            raise ValueError(
+                f"Threads-план содержит {len(chunks)} частей при лимите "
+                f"{config.THREAD_MAX_ITEMS}"
+            )
         too_long = [
             index
             for index, item in enumerate(chunks, start=1)
@@ -132,10 +137,17 @@ def _publication_payload(
         if len(text) <= config.LIMITS["twitter"]:
             # X Basic/Premium/Premium+ accepts one long post (Show more).
             return text, None, None
-        chunks = split_for_thread(text, 280)
-        return chunks[0], "twitter", chunks
+        raise ValueError(
+            f"Текст для X содержит {len(text)} символов при лимите "
+            f"{config.LIMITS['twitter']}; публикация остановлена без обрезания"
+        )
     if platform == "threads":
         chunks = split_for_thread(text, config.THREAD_ITEM_CHARS)
+        if len(chunks) > config.THREAD_MAX_ITEMS:
+            raise ValueError(
+                f"Threads требует {len(chunks)} частей при лимите "
+                f"{config.THREAD_MAX_ITEMS}; публикация остановлена без обрезания"
+            )
         return chunks[0], "threads" if len(chunks) > 1 else None, chunks if len(chunks) > 1 else None
     limit = config.LIMITS.get(platform)
     if limit and len(text) > limit:

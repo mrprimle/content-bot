@@ -50,7 +50,8 @@ _STAGING_PREFIX = "repost-staging:"
 _STARTUP_RECOVERY_NOTICE_KEY = "startup_recovery_notice_pending"
 _BOT_PROCESS_LOCK = None
 NEW_POST_BUTTON = "✍️ Создать пост"
-CURATION_BUTTON = "📚 Наполнить полку"
+CURATION_BUTTON = "📚 Начать накидывать"
+LEGACY_CURATION_BUTTON = "📚 Наполнить полку"
 STATS_BUTTON = "📊 Статус"
 
 
@@ -247,7 +248,10 @@ def _draft_keyboard(conn, draft_id: int) -> InlineKeyboardMarkup:
                 ],
                 [
                     InlineKeyboardButton("⏭ Другой материал", callback_data=f"curdiscard:{draft_id}"),
-                    InlineKeyboardButton("⏹ Закончить отбор", callback_data=f"curstop:{draft_id}"),
+                    InlineKeyboardButton(
+                        "⏹ Закончить накидывать",
+                        callback_data=f"curstop:{draft_id}",
+                    ),
                 ],
             ]
         )
@@ -352,7 +356,7 @@ def _main_keyboard() -> ReplyKeyboardMarkup:
 def _new_post_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("📚 Начать отбор в полку", callback_data="newdb:0")],
+            [InlineKeyboardButton("📚 Начать накидывать", callback_data="newdb:0")],
             [InlineKeyboardButton("✍️ Написать свой текст", callback_data="newcustom:0")],
             [InlineKeyboardButton("❌ Отменить", callback_data="newcancel:0")],
         ]
@@ -363,21 +367,22 @@ def _raw_keyboard(post_id: int, *, curation: bool = False) -> InlineKeyboardMark
     rows = [
         [
             InlineKeyboardButton(
-                f"✨ Короткий · EN ≤{config.MAX_POST_CHARS}",
-                callback_data=f"make1500:{post_id}",
-            ),
-            InlineKeyboardButton(
-                f"📖 Длинный · EN ≤{config.PLATFORM_SAFE_CHARS}",
-                callback_data=f"make3000:{post_id}",
+                "➡️ Двигаемся с этим постом",
+                callback_data=f"select:{post_id}",
             ),
         ],
         [
-            InlineKeyboardButton("⏭ Пропустить", callback_data=f"drop:{post_id}"),
+            InlineKeyboardButton("⏭ Скипнуть", callback_data=f"drop:{post_id}"),
         ],
     ]
     if curation:
         rows.append(
-            [InlineKeyboardButton("⏹ Закончить отбор", callback_data=f"curstoppost:{post_id}")]
+            [
+                InlineKeyboardButton(
+                    "⏹ Закончить накидывать",
+                    callback_data=f"curstoppost:{post_id}",
+                )
+            ]
         )
     return InlineKeyboardMarkup(rows)
 
@@ -401,13 +406,10 @@ def _text_chunks(text: str, limit: int = 4000) -> list[str]:
 
 
 def _raw_parts(post) -> list[str]:
-    """Keep the source text byte-for-byte visible instead of silently truncating it."""
+    """Send metadata separately so every following content message is copy-clean."""
     header = _raw_body(post, include_text=False)
     text = post["text"] or ""
-    combined = f"{header}\n\n{text}" if text else header
-    if len(combined) <= 4000:
-        return [combined]
-    return [header, *_text_chunks(text)]
+    return [header, *_text_chunks(text)] if text else [header]
 
 
 def _finish_delivery(conn, post, bot_message_id: int) -> None:
@@ -435,15 +437,39 @@ async def _send_raw_parts(bot, post, *, keyboard_on_last: bool, curation: bool =
 async def _send_draft(bot, conn, draft_id: int) -> None:
     draft = db.get_draft(conn, draft_id)
     master = _draft_body(draft)
-    for chunk in _text_chunks("📄 LinkedIn / X:\n\n" + master):
+    await _send(
+        bot.send_message,
+        config.OWNER_CHAT_ID,
+        f"📄 LinkedIn / X · {len(master)} символов",
+    )
+    for chunk in _text_chunks(master):
         await _send(bot.send_message, config.OWNER_CHAT_ID, chunk)
-    preview_chunks = _text_chunks(_threads_preview(draft)) or ["🧵 Threads preview пуст"]
-    msg = None
-    for index, chunk in enumerate(preview_chunks):
-        kwargs = {}
-        if index == len(preview_chunks) - 1:
-            kwargs["reply_markup"] = _draft_keyboard(conn, draft_id)
-        msg = await _send(bot.send_message, config.OWNER_CHAT_ID, chunk, **kwargs)
+    stored_threads = bool(draft["threads_json"])
+    items = _thread_items_for_draft(draft) if stored_threads else []
+    if not items:
+        msg = await _send(
+            bot.send_message,
+            config.OWNER_CHAT_ID,
+            "🧵 Threads-версия появится после стандартной трансформации или редактирования.",
+            reply_markup=_draft_keyboard(conn, draft_id),
+        )
+    else:
+        await _send(
+            bot.send_message,
+            config.OWNER_CHAT_ID,
+            f"🧵 Threads preview · {len(items)} частей · до {config.THREAD_ITEM_CHARS} символов",
+        )
+        msg = None
+        for index, item in enumerate(items, start=1):
+            await _send(
+                bot.send_message,
+                config.OWNER_CHAT_ID,
+                f"🧵 {index}/{len(items)} · {len(item)} символов",
+            )
+            kwargs = {}
+            if index == len(items):
+                kwargs["reply_markup"] = _draft_keyboard(conn, draft_id)
+            msg = await _send(bot.send_message, config.OWNER_CHAT_ID, item, **kwargs)
     assert msg is not None
     db.set_draft_message(conn, draft_id, msg.message_id)
     db.set_draft_status(conn, draft_id, "awaiting_review")
@@ -896,7 +922,7 @@ async def _continue_curation(bot, session_id: int) -> int:
     await _send(
         bot.send_message,
         config.OWNER_CHAT_ID,
-        f"💞 Отбор #{position}. На полке уже {shelf_count} готовых постов. "
+        f"💞 Накидывание #{position}. На полке уже {shelf_count} готовых постов. "
         "Можно пропускать сколько угодно — я буду показывать следующие, пока ты сам не остановишься 💗",
     )
     sent = await propose_batch(
@@ -916,7 +942,7 @@ async def _continue_curation(bot, session_id: int) -> int:
             await _send(
                 bot.send_message,
                 config.OWNER_CHAT_ID,
-                "🤍 Новых материалов сейчас нет, поэтому я закрыла отбор. "
+                "🤍 Новых материалов сейчас нет, поэтому я закончила накидывать. "
                 "Все уже сохранённые посты остались на полке 💗",
                 reply_markup=_main_keyboard(),
             )
@@ -946,15 +972,15 @@ async def start_curation(bot) -> dict:
         await _send(
             bot.send_message,
             config.OWNER_CHAT_ID,
-            f"📚 Начинаем наполнять полку, Нео 💜 Сейчас на ней {shelf_count} готовых постов. "
+            f"📚 Начинаем накидывать, Нео 💜 Сейчас на полке {shelf_count} готовых постов. "
             "Сохраняй столько, сколько захочешь; после каждого я сразу покажу следующий. "
-            "Когда закончишь — нажми «⏹ Закончить отбор».",
+            "Когда закончишь — нажми «⏹ Закончить накидывать».",
         )
     elif current_draft is not None:
         await _send(
             bot.send_message,
             config.OWNER_CHAT_ID,
-            "💗 Отбор уже был открыт. Возвращаю текущий готовый draft — продолжим с него.",
+            "💗 Накидывание уже было открыто. Возвращаю текущий готовый draft — продолжим с него.",
         )
         conn = db.connect()
         try:
@@ -966,7 +992,7 @@ async def start_curation(bot) -> dict:
         await _send(
             bot.send_message,
             config.OWNER_CHAT_ID,
-            "💗 Отбор уже был открыт. Возвращаю текущий материал.",
+            "💗 Накидывание уже было открыто. Возвращаю текущий материал.",
         )
         await _send_raw_parts(bot, current_post, keyboard_on_last=True, curation=True)
         return {"created": False, "resumed": True, "sent": 1, "session_id": session["id"]}
@@ -1174,7 +1200,8 @@ async def _require_platform_fit(bot, conn, draft) -> bool:
     await _send(
         bot.send_message,
         config.OWNER_CHAT_ID,
-        f"⚠️ {error}\n\nНажми «📐 До {config.PLATFORM_SAFE_CHARS}» или отредактируй вручную 💜",
+        f"⚠️ {error}\n\nНажми «📖 Длинный · EN ≤{config.PLATFORM_SAFE_CHARS}» "
+        "или отредактируй вручную 💜",
         reply_markup=markup,
     )
     return False
@@ -1611,10 +1638,10 @@ async def _finalize_shelf_draft(query, context, conn, draft_id: int, include_med
 async def _stop_curation(query, context, conn, session_id: int) -> None:
     result = db.stop_curation_session(conn, session_id)
     if result is None:
-        await query.answer("Отбор уже завершён", show_alert=True)
+        await query.answer("Накидывание уже завершено", show_alert=True)
         return
     try:
-        await query.answer("Отбор завершён")
+        await query.answer("Закончили накидывать")
         await query.edit_message_reply_markup(None)
     except Exception:
         pass
@@ -1622,7 +1649,7 @@ async def _stop_curation(query, context, conn, session_id: int) -> None:
     await _send(
         context.bot.send_message,
         config.OWNER_CHAT_ID,
-        f"💖 Отбор завершён. За эту сессию сохранено {result['saved_count']} постов; "
+        f"💖 Закончили накидывать. За эту сессию сохранено {result['saved_count']} постов; "
         f"всего на полке сейчас {shelf_count}. Можно спокойно возвращаться к своим делам — "
         "я буду публиковать их по одному в 09:00, 14:00 и 19:00 💗",
         reply_markup=_main_keyboard(),
@@ -1650,7 +1677,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     object_id = int(raw_id)
     conn = db.connect()
 
-    if action in {"make", "translate", "rawcompress", "make1500", "make3000", "drop"}:
+    if action in {
+        "select",
+        "make",
+        "translate",
+        "rawcompress",
+        "make1500",
+        "make3000",
+        "drop",
+    }:
         post = db.get_post(conn, object_id)
         if post is None:
             await query.answer("Материал не найден", show_alert=True)
@@ -1711,7 +1746,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     await _send(
                         context.bot.send_message,
                         config.OWNER_CHAT_ID,
-                        "🤍 Не твоё — спокойно отпускаем. Отбор продолжается, уже ищу следующий вариант 💗",
+                        "🤍 Не твоё — спокойно отпускаем. Продолжаю накидывать следующий вариант 💗",
                     )
                     await _continue_curation(context.bot, curation_item["session_id"])
                     return
@@ -1740,7 +1775,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             post["media_kind"] in {"voice", "audio", "video", "video_note"}
             or not post["text"]
         )
-        if action in {"make", "translate", "rawcompress", "make1500", "make3000"} and needs_manual_text:
+        if action in {
+            "select",
+            "make",
+            "translate",
+            "rawcompress",
+            "make1500",
+            "make3000",
+        } and needs_manual_text:
             await query.answer()
             if not db.transition_post(conn, post["id"], ("offered",), "awaiting_manual"):
                 return
@@ -1775,6 +1817,51 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         source_text = post["text"]
         if not source_text:
             await query.answer("Нет текста для генерации", show_alert=True)
+            return
+        if action == "select":
+            await query.answer("Переходим к редактуре")
+            if not db.transition_post(
+                conn,
+                post["id"],
+                ("offered", "awaiting_manual"),
+                "generating",
+            ):
+                return
+            try:
+                draft_id = db.create_draft(
+                    conn,
+                    post["id"],
+                    "selected/raw",
+                    source_text,
+                    source_text,
+                    source_text,
+                    "",
+                )
+                db.attach_planning_draft(conn, post["id"], draft_id)
+                db.attach_curation_draft(conn, post["id"], draft_id)
+                await _send(
+                    context.bot.send_message,
+                    config.OWNER_CHAT_ID,
+                    "💜 Отлично, с этим постом двигаемся дальше. Теперь можно выбрать "
+                    "короткую или длинную стандартную трансформацию, отредактировать его "
+                    "руками либо вместе с AI.",
+                )
+                await _send_draft(context.bot, conn, draft_id)
+                db.set_post_status(conn, post["id"], "drafted")
+                await query.edit_message_reply_markup(None)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.exception("raw selection failed post_id=%s", post["id"])
+                db.set_post_status(conn, post["id"], "offered")
+                await _send(
+                    context.bot.send_message,
+                    config.OWNER_CHAT_ID,
+                    f"⚠️ Не удалось открыть редактуру: {_public_error_text(exc)}\n"
+                    "Материал сохранён — можно нажать ещё раз 💗",
+                    reply_markup=_raw_keyboard(
+                        post["id"],
+                        curation=curation_item is not None,
+                    ),
+                )
             return
         target_chars = (
             config.MAX_POST_CHARS
@@ -1832,7 +1919,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _open_custom_post(context.bot)
         return
     if action == "newdb":
-        await query.answer("Начинаю отбор")
+        await query.answer("Начинаю накидывать")
         await query.edit_message_reply_markup(None)
         await start_curation(context.bot)
         return
@@ -1840,7 +1927,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if action == "curstoppost":
         item = db.curation_item_for_post(conn, object_id)
         if item is None:
-            await query.answer("Активный отбор не найден", show_alert=True)
+            await query.answer("Активное накидывание не найдено", show_alert=True)
             return
         await _stop_curation(query, context, conn, item["session_id"])
         return
@@ -1920,7 +2007,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if action == "curdiscard":
         result = db.discard_curation_draft(conn, object_id)
         if result is None:
-            await query.answer("Черновик уже закрыт или отбор завершён", show_alert=True)
+            await query.answer("Черновик уже закрыт или накидывание завершено", show_alert=True)
             return
         try:
             await query.answer("Ищу другой материал")
@@ -1930,14 +2017,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _send(
             context.bot.send_message,
             config.OWNER_CHAT_ID,
-            "🤍 Этот draft отпускаем. Отбор продолжается — уже несу следующий материал 💗",
+            "🤍 Этот draft отпускаем. Продолжаю накидывать — уже несу следующий материал 💗",
         )
         await _continue_curation(context.bot, result["session_id"])
         return
     if action == "curstop":
         item = db.curation_item_for_draft(conn, object_id)
         if item is None:
-            await query.answer("Активный отбор не найден", show_alert=True)
+            await query.answer("Активное накидывание не найдено", show_alert=True)
             return
         await _stop_curation(query, context, conn, item["session_id"])
         return
@@ -2228,6 +2315,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 out.threads_text,
                 out.linkedin_text,
                 out.thread_items,
+                out.notes,
             )
             db.set_draft_status(conn, object_id, "awaiting_review")
             transformed = db.get_draft(conn, object_id)
@@ -2802,7 +2890,7 @@ def _status_report(conn, *, now: datetime | None = None) -> str:
                 f"  {index}. {_status_excerpt(row['edited_text'] or row['linkedin_text'])}"
             )
     else:
-        lines.append("• Полка пуста — нажми «📚 Наполнить полку», когда будет удобно.")
+        lines.append("• Полка пуста — нажми «📚 Начать накидывать», когда будет удобно.")
     if shelf.get("failed", 0):
         issues.append(f"на полке публикаций с ошибкой: {shelf['failed']}")
     if shelf.get("publish_unknown", 0):
@@ -2810,12 +2898,73 @@ def _status_report(conn, *, now: datetime | None = None) -> str:
 
     today = local_now.date().isoformat()
     session, slots = db.planning_status_for_date(conn, today)
-    lines.extend(["", f"📅 Фиксированный план на сегодня · {today}:"])
     if session is None:
-        lines.append(
-            "Отдельного плана нет — публикационные слоты берут посты напрямую с FIFO-полки."
+        lines.extend(["", f"📅 План публикаций на сегодня · {today}:"])
+        tz = ZoneInfo(config.TIMEZONE)
+        slot_datetimes: list[datetime] = []
+        for slot_text in config.PUBLISH_TIMES:
+            hour, minute = map(int, slot_text.split(":", 1))
+            slot_datetimes.append(
+                datetime.combine(local_now.date(), dtime(hour, minute), tzinfo=tz)
+            )
+        day_start_utc = datetime.combine(local_now.date(), dtime.min, tzinfo=tz).astimezone(
+            timezone.utc
         )
+        day_end_utc = datetime.combine(
+            local_now.date() + timedelta(days=1),
+            dtime.min,
+            tzinfo=tz,
+        ).astimezone(timezone.utc)
+        published_today = db.ready_queue_published_between(
+            conn,
+            day_start_utc.replace(tzinfo=None).isoformat(sep=" "),
+            day_end_utc.replace(tzinfo=None).isoformat(sep=" "),
+        )
+        published_by_slot: dict[int, object] = {}
+        for row in published_today:
+            try:
+                published_at = datetime.fromisoformat(row["published_at"])
+                if published_at.tzinfo is None:
+                    published_at = published_at.replace(tzinfo=timezone.utc)
+                published_local = published_at.astimezone(tz)
+            except (TypeError, ValueError):
+                issues.append(f"публикация с полки #{row['id']}: некорректное время")
+                continue
+            eligible = [
+                index
+                for index, slot_at in enumerate(slot_datetimes)
+                if index not in published_by_slot
+                and slot_at <= published_local + timedelta(minutes=15)
+            ]
+            if eligible:
+                published_by_slot[max(eligible)] = row
+
+        future_ready = iter(db.ready_queue_preview(conn, len(slot_datetimes)))
+        missing_future = 0
+        for index, (slot_text, slot_at) in enumerate(
+            zip(config.PUBLISH_TIMES, slot_datetimes, strict=True)
+        ):
+            published_row = published_by_slot.get(index)
+            if published_row is not None:
+                body = published_row["edited_text"] or published_row["linkedin_text"]
+                lines.append(f"✅ {slot_text} · опубликован — {_status_excerpt(body)}")
+                continue
+            if slot_at <= local_now:
+                lines.append(f"⚪ {slot_text} · не опубликован — слот уже прошёл")
+                continue
+            ready_row = next(future_ready, None)
+            if ready_row is None:
+                missing_future += 1
+                lines.append(f"⚪ {slot_text} · поста не хватает — полка пуста")
+                continue
+            body = ready_row["edited_text"] or ready_row["linkedin_text"]
+            lines.append(f"🕒 {slot_text} · запланирован — {_status_excerpt(body)}")
+        if missing_future:
+            lines.append(
+                f"• Не хватает готовых постов на будущие слоты: {missing_future}."
+            )
     else:
+        lines.extend(["", f"📅 Legacy-план на сегодня · {today}:"])
         target = int(session["target_count"])
         prepared = sum(
             1
@@ -3186,7 +3335,10 @@ def create_application() -> Application:
     app.add_handler(CommandHandler("stats", cmd_stats, filters.ChatType.PRIVATE))
     app.add_handler(
         MessageHandler(
-            filters.ChatType.PRIVATE & filters.Regex(f"^{re.escape(CURATION_BUTTON)}$"),
+            filters.ChatType.PRIVATE
+            & filters.Regex(
+                f"^(?:{re.escape(CURATION_BUTTON)}|{re.escape(LEGACY_CURATION_BUTTON)})$"
+            ),
             cmd_curation,
         )
     )

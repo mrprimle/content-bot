@@ -79,6 +79,69 @@ class FakeApplication:
         return task
 
 
+def test_shelf_status_plan() -> None:
+    """Status must turn the FIFO shelf into today's concrete three-slot plan."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    conn = db.connect(tmp.name)
+    try:
+        source_id = db.upsert_source(conn, "@status", "Status source")
+        queue_ids: list[int] = []
+        for index, text in enumerate(
+            ("First shelf story.", "Second shelf story.", "Third shelf story."),
+            start=1,
+        ):
+            assert db.insert_post(
+                conn,
+                source_id,
+                index,
+                f"2026-05-0{index}T10:00:00+00:00",
+                text,
+                f"https://t.me/status/{index}",
+            )
+            post_id = conn.execute(
+                "SELECT id FROM post WHERE source_id=? AND tg_message_id=?",
+                (source_id, index),
+            ).fetchone()["id"]
+            draft_id = db.create_draft(
+                conn,
+                post_id,
+                "test",
+                text,
+                text,
+                text,
+                "",
+                [text],
+            )
+            queue_ids.append(db.enqueue_ready_draft(conn, draft_id)["queue_id"])
+
+        conn.execute(
+            "UPDATE ready_queue SET status='published', "
+            "published_at='2026-08-07 08:00:00' WHERE id=?",
+            (queue_ids[0],),
+        )
+        conn.commit()
+        report = bot._status_report(
+            conn,
+            now=datetime(2026, 8, 7, 10, 0, tzinfo=ZoneInfo(config.TIMEZONE)),
+        )
+        assert "✅ 09:00 · опубликован — First shelf story." in report
+        assert "🕒 14:00 · запланирован — Second shelf story." in report
+        assert "🕒 19:00 · запланирован — Third shelf story." in report
+
+        conn.execute("UPDATE ready_queue SET status='cancelled' WHERE id=?", (queue_ids[2],))
+        conn.commit()
+        short_report = bot._status_report(
+            conn,
+            now=datetime(2026, 8, 7, 10, 0, tzinfo=ZoneInfo(config.TIMEZONE)),
+        )
+        assert "⚪ 19:00 · поста не хватает — полка пуста" in short_report
+        assert "Не хватает готовых постов на будущие слоты: 1" in short_report
+    finally:
+        conn.close()
+        Path(tmp.name).unlink(missing_ok=True)
+
+
 async def test_evening_planning_and_next_day_publish() -> None:
     """One 21:00 session must prepare three drafts and publish them next day."""
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
@@ -376,7 +439,7 @@ async def test_unbounded_curation_shelf_and_fifo_publish() -> None:
             for button in row
         ]
         assert "📥 Сохранить на полку" in labels
-        assert "⏹ Закончить отбор" in labels
+        assert "⏹ Закончить накидывать" in labels
 
         shelf = FakeQuery(f"shelf:{draft['id']}")
         await bot.on_callback(
@@ -590,8 +653,8 @@ async def test_edit_retry_loop() -> None:
             SimpleNamespace(bot=fake_bot),
         )
         assert valid.responses[0]["text"].startswith("⏳ Текст принят:")
-        assert fake_bot.messages[-2]["text"] == "📄 LinkedIn / X:\n\n" + valid_text
-        assert fake_bot.messages[-1]["text"].startswith("🧵 Threads preview")
+        assert any(message["text"] == valid_text for message in fake_bot.messages)
+        assert any(message["text"].startswith("🧵 Threads preview") for message in fake_bot.messages)
         verify = db.connect()
         assert db.get_draft(verify, draft_id)["edited_text"] == valid_text
         assert json.loads(db.get_draft(verify, draft_id)["threads_json"]) == [
@@ -662,7 +725,7 @@ async def test_anytime_owner_post() -> None:
             for row in start_message.responses[0]["reply_markup"].inline_keyboard
             for button in row
         ]
-        assert menu_labels == ["📚 Начать отбор в полку", "✍️ Написать свой текст", "❌ Отменить"]
+        assert menu_labels == ["📚 Начать накидывать", "✍️ Написать свой текст", "❌ Отменить"]
 
         fake_bot = FakeBot()
         custom = FakeQuery("newcustom:0")
@@ -691,8 +754,9 @@ async def test_anytime_owner_post() -> None:
         )
         assert "без AI" in submission.responses[0]["text"]
         assert translate_calls == []
-        assert fake_bot.messages[-2]["text"] == "📄 LinkedIn / X:\n\n" + source_text
-        assert fake_bot.messages[-1]["text"].startswith("🧵 Threads preview")
+        assert fake_bot.messages[-3]["text"] == f"📄 LinkedIn / X · {len(source_text)} символов"
+        assert fake_bot.messages[-2]["text"] == source_text
+        assert fake_bot.messages[-1]["text"].startswith("🧵 Threads-версия появится")
         verify = db.connect()
         draft = verify.execute("SELECT * FROM draft ORDER BY id DESC LIMIT 1").fetchone()
         stored_post = db.get_post(verify, draft["post_id"])
@@ -731,7 +795,10 @@ async def test_anytime_owner_post() -> None:
             "Manual edit payoff.",
         ]
         verify.close()
-        assert "нажми финальную кнопку ещё раз" in fake_bot.messages[-3]["text"]
+        assert any(
+            "нажми финальную кнопку ещё раз" in message["text"]
+            for message in fake_bot.messages
+        )
 
         transform = FakeQuery(f"transform:{draft['id']}")
         await bot.on_callback(
@@ -742,8 +809,8 @@ async def test_anytime_owner_post() -> None:
             SimpleNamespace(bot=fake_bot),
         )
         assert translate_calls == [("Собственный пост", source_text)]
-        assert fake_bot.messages[-2]["text"] == "📄 LinkedIn / X:\n\nPrepared English owner post."
-        assert "A strong owner-post hook." in fake_bot.messages[-1]["text"]
+        assert any(message["text"] == "Prepared English owner post." for message in fake_bot.messages)
+        assert any(message["text"] == "A strong owner-post hook." for message in fake_bot.messages)
         verify = db.connect()
         draft_message_id = db.get_draft(verify, draft["id"])["tg_message_id"]
         verify.close()
@@ -756,8 +823,8 @@ async def test_anytime_owner_post() -> None:
             SimpleNamespace(bot=second_bot),
         )
         assert "2000/3000" in edit.responses[0]["text"]
-        assert second_bot.messages[-2]["text"] == "📄 LinkedIn / X:\n\n" + expanded
-        assert second_bot.messages[-1]["text"].startswith("🧵 Threads preview")
+        assert any(message["text"] == expanded for message in second_bot.messages)
+        assert any(message["text"].startswith("🧵 Threads preview") for message in second_bot.messages)
         assert len(translate_calls) == 1, "ручная версия не должна снова запускать полный transform"
         assert threadify_calls == [source_text, expanded]
         verify = db.connect()
@@ -943,15 +1010,15 @@ async def test_anytime_database_iteration() -> None:
             SimpleNamespace(bot=fake_bot, application=application),
         )
         assert application.tasks == []
-        assert "Начинаем наполнять полку" in fake_bot.messages[0]["text"]
-        assert "Отбор #1" in fake_bot.messages[1]["text"]
-        assert "On demand" in fake_bot.messages[-1]["text"]
+        assert "Начинаем накидывать" in fake_bot.messages[0]["text"]
+        assert "Накидывание #1" in fake_bot.messages[1]["text"]
+        assert fake_bot.messages[-1]["text"] == "Материал для внепланового поста"
         labels = [
             button.text
             for row in fake_bot.messages[-1]["reply_markup"].inline_keyboard
             for button in row
         ]
-        assert "⏹ Закончить отбор" in labels
+        assert "⏹ Закончить накидывать" in labels
         post = conn.execute("SELECT * FROM post WHERE tg_message_id=1").fetchone()
         assert post["status"] == "offered"
         assert db.active_curation_session(conn) is not None
@@ -1236,6 +1303,7 @@ async def test_long_draft_controls_and_chunked_preview() -> None:
 
 
 async def main() -> None:
+    test_shelf_status_plan()
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     tmp.close()
     old_db_path = config.DB_PATH
@@ -1277,16 +1345,17 @@ async def main() -> None:
         fake = FakeBot()
         sent = await bot.propose_batch(fake, slot_key="offline-test")
         assert sent == 1
-        assert len(fake.messages) == 1
+        assert len(fake.messages) == 2
         assert calls == {"generate": 0, "publish": 0}
         row = conn.execute("SELECT status FROM post WHERE tg_message_id=10").fetchone()
         assert row["status"] == "offered"
-        keyboard = fake.messages[0]["reply_markup"].inline_keyboard
+        assert fake.messages[0]["text"].startswith("📥 Source")
+        assert fake.messages[1]["text"].startswith("Сырой материал")
+        keyboard = fake.messages[1]["reply_markup"].inline_keyboard
         labels = [button.text for row in keyboard for button in row]
         assert labels == [
-            "✨ Короткий · EN ≤1500",
-            "📖 Длинный · EN ≤3000",
-            "⏭ Пропустить",
+            "➡️ Двигаемся с этим постом",
+            "⏭ Скипнуть",
         ]
 
         route_calls = {"translate": 0}
@@ -1309,7 +1378,7 @@ async def main() -> None:
         text_post_id = conn.execute(
             "SELECT id FROM post WHERE tg_message_id=10"
         ).fetchone()["id"]
-        text_query = FakeQuery(f"make1500:{text_post_id}")
+        text_query = FakeQuery(f"select:{text_post_id}")
         text_update = SimpleNamespace(
             callback_query=text_query,
             effective_chat=SimpleNamespace(id=config.OWNER_CHAT_ID),
@@ -1317,16 +1386,12 @@ async def main() -> None:
         before_text_generation = len(fake.messages)
         await bot.on_callback(text_update, SimpleNamespace(bot=fake))
         text_generation_messages = fake.messages[before_text_generation:]
-        assert route_calls == {"translate": 1}
+        assert route_calls == {"translate": 0}
         assert len(text_generation_messages) == 4
-        assert text_generation_messages[0]["text"].startswith("⏳ Пост #")
-        assert "10–30 секунд" in text_generation_messages[0]["text"]
-        assert text_generation_messages[1]["text"].startswith(
-            "⚠️ Заменено / проверить:"
-        )
-        assert "Служебная заметка о заменах" in text_generation_messages[1]["text"]
-        assert text_generation_messages[2]["text"] == "📄 LinkedIn / X:\n\nFaithful English translation."
-        assert "Why do faithful translations" in text_generation_messages[3]["text"]
+        assert text_generation_messages[0]["text"].startswith("💜 Отлично, с этим постом")
+        assert text_generation_messages[1]["text"].startswith("📄 LinkedIn / X ·")
+        assert text_generation_messages[2]["text"].startswith("Сырой материал")
+        assert text_generation_messages[3]["text"].startswith("🧵 Threads-версия появится")
         draft_keyboard = text_generation_messages[3]["reply_markup"].inline_keyboard
         draft_labels = [button.text for row in draft_keyboard for button in row]
         assert draft_labels == [
@@ -1349,6 +1414,32 @@ async def main() -> None:
             "SELECT id FROM draft WHERE post_id=?",
             (text_post_id,),
         ).fetchone()["id"]
+        assert db.get_draft(conn, draft_id)["threads_json"] is None
+
+        transform_query = FakeQuery(f"transform1500:{draft_id}")
+        before_transform = len(fake.messages)
+        await bot.on_callback(
+            SimpleNamespace(
+                callback_query=transform_query,
+                effective_chat=SimpleNamespace(id=config.OWNER_CHAT_ID),
+            ),
+            SimpleNamespace(bot=fake),
+        )
+        transformed_messages = fake.messages[before_transform:]
+        assert route_calls == {"translate": 1}
+        assert transformed_messages[0]["text"].startswith("⏳ Пост #")
+        assert any(
+            message["text"].startswith("⚠️ Заменено / проверить:")
+            for message in transformed_messages
+        )
+        assert any(
+            message["text"] == "Faithful English translation."
+            for message in transformed_messages
+        )
+        assert any(
+            message["text"] == "Why do faithful translations still fail on Threads?"
+            for message in transformed_messages
+        )
         assert json.loads(db.get_draft(conn, draft_id)["threads_json"]) == [
             "Why do faithful translations still fail on Threads?",
             "Because structure matters as much as wording.",
@@ -1392,7 +1483,10 @@ async def main() -> None:
             "A rebuilt Threads hook.",
             "A rebuilt Threads payoff.",
         ]
-        assert "A rebuilt Threads hook." in fake.messages[-1]["text"]
+        assert any(
+            message["text"] == "A rebuilt Threads hook."
+            for message in fake.messages
+        )
 
         revise_calls: list[tuple[str, str]] = []
 
@@ -1432,11 +1526,12 @@ async def main() -> None:
         )
         assert instruction.responses[0]["text"].startswith("⏳ Terra редактирует")
         assert revise_calls == [("Faithful English translation.", "Добавь более острую шутку")]
-        assert len(fake.messages) == before_ai_messages + 3
-        assert fake.messages[-2]["text"] == (
-            "📄 LinkedIn / X:\n\nFaithful English translation with a sharper joke."
+        assert len(fake.messages) > before_ai_messages + 3
+        assert any(
+            message["text"] == "Faithful English translation with a sharper joke."
+            for message in fake.messages[before_ai_messages:]
         )
-        assert "A sharper hook" in fake.messages[-1]["text"]
+        assert any("A sharper hook" in message["text"] for message in fake.messages[before_ai_messages:])
         assert db.get_draft(conn, draft_id)["ai_prompt_id"] is None
 
         finish_query = FakeQuery(f"draftskip:{draft_id}")

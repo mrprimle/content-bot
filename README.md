@@ -18,17 +18,17 @@ Telethon user session ───────────────┐
                          sources, posts, queue, drafts,
                          publications, idempotency state
                                      │
-                         owner presses «Наполнить полку»
+                       owner presses «Начать накидывать»
                                      ▼
                            Telegram bot review UI
                    ┌─────────────────┴─────────────────┐
-             Пропустить                  выбрать AI-действие
+               Скипнуть                 Двигаемся с этим постом
                    │                                  │
           next raw candidate          short standard transform (1500) /
           in the same iteration         long standard transform (3000)
                                                       │
                                    ┌──────────────────┼──────────────────┐
-                             Редактировать    На полку        Закончить отбор
+                             Редактировать    На полку    Закончить накидывать
                                                       │
                                       repeat without a limit
                                                       │
@@ -55,12 +55,15 @@ hands the durable FIFO shelf back to automation.
 2. The initial import stores the last three **calendar** months of messages in the
    database. Text and media metadata are stored; media itself is fetched only when
    it is about to be shown.
-3. The owner presses persistent `📚 Наполнить полку` whenever convenient. No review
+3. The owner presses persistent `📚 Начать накидывать` whenever convenient. No review
    flow starts automatically at 21:00.
-4. The bot opens one durable, unbounded curation session and sends one original material with:
-   `✨ Короткий · EN ≤1500`, `📖 Длинный · EN ≤3000`, and `⏭ Пропустить`.
-5. `Пропустить` permanently closes that candidate and immediately sends the next
-   one. The owner can keep skipping inside the same iteration without an AI call.
+4. The bot opens one durable, unbounded curation session. For each candidate it
+   first sends a metadata/source label and then the original content as a separate,
+   copy-clean Telegram message. The only selection controls are
+   `➡️ Двигаемся с этим постом`, `⏭ Скипнуть`, and `⏹ Закончить накидывать`.
+   No AI call or Threads preview happens at this stage.
+5. `Скипнуть` permanently closes that candidate and immediately sends the next
+   one. `Двигаемся с этим постом` opens the full draft/editor controls.
 6. Both modes perform the same standard transformation: English translation,
    Mike/Vahue fact correction, and editorial compression only when needed. The short
    mode targets 1500 characters; the long mode preserves more material up to the
@@ -74,7 +77,7 @@ hands the durable FIFO shelf back to automation.
 9. `Сохранить на полку` appends the draft to a durable FIFO `ready_queue` and immediately starts
    the next iteration, with no per-session or total limit. If the source has a photo, this step
    asks `С картинкой` or `Без картинки`; no media question appears for text-only
-   sources. `Закончить отбор` closes only the active selection and keeps every saved post.
+   sources. `Закончить накидывать` closes only the active selection and keeps every saved post.
 10. Three daily cron ticks publish one oldest ready post each through Buffer at
     09:00, 14:00, and 19:00 London time. Successful platforms are recorded
     individually, so a retry targets only failed platforms. Every slot sends one
@@ -85,10 +88,11 @@ hands the durable FIFO shelf back to automation.
 
 The persistent `📊 Статус` button shows an auditable content-pool partition
 (`total = remaining + already sent to the owner`), shelf totals, and the next three
-FIFO drafts. Legacy fixed-date slots remain visible until the pre-migration plan is
-fully published. Failed/unknown shelf or legacy publications are surfaced in a
-dedicated error section; the status
-handler is read-only and reports database failures without changing state.
+FIFO drafts. It also projects the real London-day publication plan at 09:00, 14:00,
+and 19:00: already-published slots get a checkmark and excerpt, future slots show
+the exact FIFO draft they will consume, and missing drafts are called out explicitly.
+Failed/unknown shelf or still-active legacy publications are surfaced in a dedicated
+error section; the handler is read-only and never changes database state.
 
 The persistent main keyboard is explicitly reattached after terminal actions such
 as saving a custom post to the shelf, cancelling a flow, finishing an iteration,
@@ -98,7 +102,7 @@ time without restarting the service or changing any database state.
 The persistent `✍️ Создать пост` action remains independent from curation.
 It opens two immediate modes:
 
-- `📚 Начать отбор в полку` starts or resumes the same durable curation flow.
+- `📚 Начать накидывать` starts or resumes the same durable curation flow.
 - `✍️ Написать свой текст` stores the submitted text unchanged and without an AI
   call. The raw owner input remains stored separately from every mutable AI draft,
   so a failed transform can always be retried from the original. The owner can
@@ -141,14 +145,14 @@ created before this migration.
 ## Telegram interaction state machine
 
 ```text
-owner presses «Наполнить полку»
+owner presses «Начать накидывать»
    │ create/resume one curation_session
    ▼
 curation_item:selecting ──► post:offered
                                 │
                     ┌───────────┴───────────┐
                     │                       │
-                  drop                    make
+                 skip                   select
                     │                       │
           same item, next candidate   Terra pipeline
                                             │
@@ -271,7 +275,9 @@ same per-platform mutation.
 | X | One long post when `X_PREMIUM=true`; no Buffer thread metadata. |
 | Threads | Up to 10 AI-authored ordered cards of at most 500 characters, sent exactly as previewed through `metadata.threads.thread`. The first card is repeated as top-level `text`, as Buffer requires. |
 
-The bot shows `📄 LinkedIn / X` and a numbered `🧵 Threads preview` separately.
+After selection, the bot shows a service-only `📄 LinkedIn / X` label and then the
+master text as a separate copy-clean message. A numbered `🧵 Threads preview` is
+shown only after a standard transform, manual/AI edit, or explicit Threads rebuild.
 `🧵 Пересобрать Threads с AI` changes only the Threads sequence; it never changes
 the LinkedIn/X master. Legacy/raw drafts without an AI plan fall back to conservative
 sentence/paragraph splitting at 500 characters.
@@ -444,11 +450,11 @@ without discarding successful sources, and a failed full backfill exits non-zero
 | `/id` | Show the current private chat id and whether it matches `OWNER_CHAT_ID`. |
 | `/test @channel` | Deliver one candidate from a specific source without calling AI. |
 | `/next` | Start or resume unlimited curation into the FIFO shelf. |
-| `/stats` | Show pool arithmetic, shelf size/preview, legacy plan, and errors. |
+| `/stats` | Show pool arithmetic, shelf preview, today's three real FIFO slots, and errors. |
 | `/resend <draft_id>` | Re-deliver a saved, unpublished draft after a Telegram/UI delivery failure. |
 
-`/start` installs persistent `📚 Наполнить полку`, `✍️ Создать пост`, and
-`📊 Статус` buttons. `Наполнить полку` starts or resumes unlimited curation.
+`/start` installs persistent `📚 Начать накидывать`, `✍️ Создать пост`, and
+`📊 Статус` buttons. `Начать накидывать` starts or resumes unlimited curation.
 `Написать свой текст` opens a durable manual input session independently of
 curation. Russian, English, or
 mixed input is first saved byte-for-byte with zero LLM calls. The owner then chooses

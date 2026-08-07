@@ -1211,19 +1211,27 @@ def update_draft_texts(
     threads: str,
     edited: str | None = None,
     thread_items: list[str] | None = None,
+    notes: str | None = None,
 ) -> None:
-    conn.execute(
-        "UPDATE draft SET linkedin_text=?, x_text=?, threads_text=?, edited_text=?, "
-        "threads_json=? WHERE id=?",
-        (
-            linkedin,
-            x,
-            threads,
-            edited,
-            json.dumps(thread_items, ensure_ascii=False) if thread_items else None,
-            draft_id,
-        ),
+    values = (
+        linkedin,
+        x,
+        threads,
+        edited,
+        json.dumps(thread_items, ensure_ascii=False) if thread_items else None,
     )
+    if notes is None:
+        conn.execute(
+            "UPDATE draft SET linkedin_text=?, x_text=?, threads_text=?, edited_text=?, "
+            "threads_json=? WHERE id=?",
+            (*values, draft_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE draft SET linkedin_text=?, x_text=?, threads_text=?, edited_text=?, "
+            "threads_json=?, notes=? WHERE id=?",
+            (*values, notes, draft_id),
+        )
     conn.commit()
 
 
@@ -1884,6 +1892,17 @@ def ready_queue_preview(conn, limit: int = 3):
         "JOIN draft d ON d.id=rq.draft_id "
         "WHERE rq.status='ready' ORDER BY rq.id LIMIT ?",
         (limit,),
+    ).fetchall()
+
+
+def ready_queue_published_between(conn, start_utc: str, end_utc: str):
+    """Return shelf publications in one UTC window with their final master text."""
+    return conn.execute(
+        "SELECT rq.*, d.edited_text, d.linkedin_text FROM ready_queue rq "
+        "JOIN draft d ON d.id=rq.draft_id "
+        "WHERE rq.status='published' AND rq.published_at>=? AND rq.published_at<? "
+        "ORDER BY rq.published_at, rq.id",
+        (start_utc, end_utc),
     ).fetchall()
 
 

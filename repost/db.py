@@ -1076,6 +1076,15 @@ def set_post_status(conn, post_id: int, status: str) -> None:
     conn.commit()
 
 
+def set_post_text(conn, post_id: int, text: str) -> None:
+    """Persist the authoritative raw owner input separately from mutable drafts."""
+    conn.execute(
+        "UPDATE post SET text=?, text_hash=? WHERE id=?",
+        (text, text_hash(text), post_id),
+    )
+    conn.commit()
+
+
 def set_post_bot_media(conn, post_id: int, file_id: str, access_token: str) -> None:
     """Persist a reusable Bot API file id and an unguessable public media token."""
     conn.execute(

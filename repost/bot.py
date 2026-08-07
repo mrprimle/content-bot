@@ -2424,6 +2424,8 @@ async def on_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
 
         if post is not None:
+            if post["media_kind"] == "manual":
+                db.set_post_text(conn, post["id"], text)
             if not db.transition_post(conn, post["id"], ("awaiting_manual",), "generating"):
                 await update.message.reply_text(
                     "⚠️ Этот материал уже обрабатывается или закрыт. Я берегу тебя от дублей 💗"

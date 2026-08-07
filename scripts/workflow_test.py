@@ -688,6 +688,8 @@ async def test_anytime_owner_post() -> None:
         assert fake_bot.messages[-1]["text"].startswith("🧵 Threads preview")
         verify = db.connect()
         draft = verify.execute("SELECT * FROM draft ORDER BY id DESC LIMIT 1").fetchone()
+        stored_post = db.get_post(verify, draft["post_id"])
+        assert stored_post["text"] == source_text
         assert draft["status"] == "awaiting_review"
         raw_labels = [
             button.text

@@ -95,7 +95,9 @@ It opens two immediate modes:
 
 - `📚 Начать отбор в полку` starts or resumes the same durable curation flow.
 - `✍️ Написать свой текст` stores the submitted text unchanged and without an AI
-  call. The owner can publish it as-is, run the short or long standard transform,
+  call. The raw owner input remains stored separately from every mutable AI draft,
+  so a failed transform can always be retried from the original. The owner can
+  publish it as-is, run the short or long standard transform,
   edit manually/with AI, rebuild Threads, publish now,
   save to the shelf, or cancel.
 

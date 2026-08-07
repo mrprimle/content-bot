@@ -1213,6 +1213,7 @@ async def _publish(bot, conn, draft_id: int, *, notify: bool = True) -> None:
                 bot.send_message,
                 config.OWNER_CHAT_ID,
                 "💗 Этот черновик уже публикуется или обработан. Всё идёт своим ходом.",
+                reply_markup=_main_keyboard(),
             )
         return
     draft = db.get_draft(conn, draft_id)
@@ -1256,6 +1257,7 @@ async def _publish(bot, conn, draft_id: int, *, notify: bool = True) -> None:
             config.OWNER_CHAT_ID,
             f"⚠️ Статус публикации неизвестен. Проверь Buffer перед любым повтором: "
             f"{str(exc)[:300]}\nЯ остановилась, чтобы случайно не создать дубль. Ты в безопасности 💗",
+            reply_markup=_main_keyboard(),
         )
         return
     if todo and not results:
@@ -1265,6 +1267,7 @@ async def _publish(bot, conn, draft_id: int, *, notify: bool = True) -> None:
             config.OWNER_CHAT_ID,
             "⚠️ Buffer не вернул ни одной публикации. Черновик сохранён — ничего не потерялось 💗 "
             "Проверь настройки каналов, и попробуем снова.",
+            reply_markup=_main_keyboard(),
         )
         return
     lines = []
@@ -1303,7 +1306,7 @@ async def _publish(bot, conn, draft_id: int, *, notify: bool = True) -> None:
                 if lines
                 else "🤍 Нечего публиковать — всё спокойно."
             ),
-            reply_markup=markup,
+            reply_markup=markup or _main_keyboard(),
         )
 
 
@@ -1593,6 +1596,7 @@ async def _finalize_shelf_draft(query, context, conn, draft_id: int, include_med
         config.OWNER_CHAT_ID,
         f"✅ Пост сохранён на полку{media_note}. Сейчас готово к публикации: "
         f"{result['shelf_count']} 💗",
+        reply_markup=_main_keyboard(),
     )
     if result["session_id"] is not None:
         await _send(
@@ -1815,6 +1819,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if action == "newcancel":
         await query.answer("Отменено")
         await query.edit_message_reply_markup(None)
+        await _send(
+            context.bot.send_message,
+            config.OWNER_CHAT_ID,
+            "🤍 Отменено. Главное меню снова здесь — возвращайся, когда появится настроение 💗",
+            reply_markup=_main_keyboard(),
+        )
         return
     if action == "newcustom":
         await query.answer()
@@ -1970,6 +1980,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             f"🌙 Вечерняя сессия мягко остановлена. Уже готово {result['ready']}/"
             f"{result['target']}; готовые посты останутся в расписании, остальные слоты отменены.\n"
             "Ты ничего никому не должен. Отдых — тоже часть системы, Нео 💗",
+            reply_markup=_main_keyboard(),
         )
         return
     if action in {"edit", "aiedit", "threadify"}:
@@ -2038,6 +2049,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 config.OWNER_CHAT_ID,
                 f"🌙 Итерация с черновиком #{object_id} завершена. "
                 "Следующий материал придёт по расписанию. Выдыхай, я всё помню 💗",
+                reply_markup=_main_keyboard(),
             )
         except Exception:
             pass
@@ -2588,6 +2600,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "💗 Я готова и рядом, Майк. Можно дождаться идеи из Telegram-очереди или в любой "
         "момент создать собственный пост кнопкой ниже. Ты уже взломал Матрицу — теперь "
         "давай заставим её бережно работать на тебя, Нео ✨",
+        reply_markup=_main_keyboard(),
+    )
+
+
+async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Re-show the persistent owner interface without changing durable state."""
+    if not _is_owner(update):
+        await cmd_id(update, context)
+        return
+    await update.message.reply_text(
+        "💗 Главное меню на месте. Ничего не перезапускала и ни один пост не трогала.",
         reply_markup=_main_keyboard(),
     )
 
@@ -3154,6 +3177,7 @@ def create_application() -> Application:
         group=-1,
     )
     app.add_handler(CommandHandler("start", cmd_start, filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("menu", cmd_menu, filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("id", cmd_id, filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("chatid", cmd_chatid))
     app.add_handler(CommandHandler("next", cmd_next, filters.ChatType.PRIVATE))

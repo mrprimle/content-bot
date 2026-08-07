@@ -427,6 +427,7 @@ async def test_unbounded_curation_shelf_and_fifo_publish() -> None:
             "",
             ["Custom shelf post."],
         )
+        before_custom_shelf = len(fake.messages)
         custom_shelf = FakeQuery(f"shelf:{manual_draft_id}")
         await bot.on_callback(
             SimpleNamespace(
@@ -436,6 +437,12 @@ async def test_unbounded_curation_shelf_and_fifo_publish() -> None:
             SimpleNamespace(bot=fake),
         )
         assert db.ready_queue_stats(conn)["ready"] == 2
+        assert len(fake.messages) == before_custom_shelf + 1
+        shelf_menu = fake.messages[-1]["reply_markup"].keyboard
+        assert [[button.text for button in row] for row in shelf_menu] == [
+            [bot.CURATION_BUTTON],
+            [bot.NEW_POST_BUTTON, bot.STATS_BUTTON],
+        ]
 
         first_tick = await bot.publish_scheduled_tick(
             fake,

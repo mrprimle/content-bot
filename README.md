@@ -90,6 +90,11 @@ fully published. Failed/unknown shelf or legacy publications are surfaced in a
 dedicated error section; the status
 handler is read-only and reports database failures without changing state.
 
+The persistent main keyboard is explicitly reattached after terminal actions such
+as saving a custom post to the shelf, cancelling a flow, finishing an iteration,
+or completing an immediate publication. `/menu` and `/start` can re-show it at any
+time without restarting the service or changing any database state.
+
 The persistent `✍️ Создать пост` action remains independent from curation.
 It opens two immediate modes:
 

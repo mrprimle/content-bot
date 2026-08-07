@@ -22,13 +22,13 @@ Telethon user session ───────────────┐
                                      ▼
                            Telegram bot review UI
                    ┌─────────────────┴─────────────────┐
-               Скипнуть                 Двигаемся с этим постом
+             🟡 Скипнуть              🟢 Двигаемся с этим постом
                    │                                  │
           next raw candidate          short standard transform (1500) /
           in the same iteration         long standard transform (3000)
                                                       │
                                    ┌──────────────────┼──────────────────┐
-                             Редактировать    На полку    Закончить накидывать
+                             Редактировать    На полку    🔴 Закончить накидывать
                                                       │
                                       repeat without a limit
                                                       │
@@ -63,7 +63,7 @@ hands the durable FIFO shelf back to automation.
 4. The bot opens one durable, unbounded curation session. For each candidate it
    first sends a metadata/source label and then the original content as a separate,
    copy-clean Telegram message. The only selection controls are
-   `➡️ Двигаемся с этим постом`, `⏭ Скипнуть`, and `⏹ Закончить накидывать`.
+   `🟢 Двигаемся с этим постом`, `🟡 Скипнуть`, and `🔴 Закончить накидывать`.
    No AI call or Threads preview happens at this stage.
 5. `Скипнуть` permanently closes that candidate and immediately sends the next
    one. `Двигаемся с этим постом` opens the full draft/editor controls.

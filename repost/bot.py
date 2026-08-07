@@ -249,7 +249,7 @@ def _draft_keyboard(conn, draft_id: int) -> InlineKeyboardMarkup:
                 [
                     InlineKeyboardButton("⏭ Другой материал", callback_data=f"curdiscard:{draft_id}"),
                     InlineKeyboardButton(
-                        "⏹ Закончить накидывать",
+                        "🔴 Закончить накидывать",
                         callback_data=f"curstop:{draft_id}",
                     ),
                 ],
@@ -367,19 +367,19 @@ def _raw_keyboard(post_id: int, *, curation: bool = False) -> InlineKeyboardMark
     rows = [
         [
             InlineKeyboardButton(
-                "➡️ Двигаемся с этим постом",
+                "🟢 Двигаемся с этим постом",
                 callback_data=f"select:{post_id}",
             ),
         ],
         [
-            InlineKeyboardButton("⏭ Скипнуть", callback_data=f"drop:{post_id}"),
+            InlineKeyboardButton("🟡 Скипнуть", callback_data=f"drop:{post_id}"),
         ],
     ]
     if curation:
         rows.append(
             [
                 InlineKeyboardButton(
-                    "⏹ Закончить накидывать",
+                    "🔴 Закончить накидывать",
                     callback_data=f"curstoppost:{post_id}",
                 )
             ]
@@ -988,7 +988,7 @@ async def start_curation(bot) -> dict:
             config.OWNER_CHAT_ID,
             f"📚 Начинаем накидывать, Нео 💜 Сейчас на полке {shelf_count} готовых постов. "
             "Сохраняй столько, сколько захочешь; после каждого я сразу покажу следующий. "
-            "Когда закончишь — нажми «⏹ Закончить накидывать».",
+            "Когда закончишь — нажми «🔴 Закончить накидывать».",
         )
     elif current_draft is not None:
         await _send(

@@ -439,7 +439,7 @@ async def test_unbounded_curation_shelf_and_fifo_publish() -> None:
             for button in row
         ]
         assert "📥 Сохранить на полку" in labels
-        assert "⏹ Закончить накидывать" in labels
+        assert "🔴 Закончить накидывать" in labels
 
         shelf = FakeQuery(f"shelf:{draft['id']}")
         await bot.on_callback(
@@ -1018,7 +1018,7 @@ async def test_anytime_database_iteration() -> None:
             for row in fake_bot.messages[-1]["reply_markup"].inline_keyboard
             for button in row
         ]
-        assert "⏹ Закончить накидывать" in labels
+        assert "🔴 Закончить накидывать" in labels
         post = conn.execute("SELECT * FROM post WHERE tg_message_id=1").fetchone()
         assert post["status"] == "offered"
         assert db.active_curation_session(conn) is not None
@@ -1354,8 +1354,8 @@ async def main() -> None:
         keyboard = fake.messages[1]["reply_markup"].inline_keyboard
         labels = [button.text for row in keyboard for button in row]
         assert labels == [
-            "➡️ Двигаемся с этим постом",
-            "⏭ Скипнуть",
+            "🟢 Двигаемся с этим постом",
+            "🟡 Скипнуть",
         ]
 
         route_calls = {"translate": 0}

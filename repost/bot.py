@@ -575,6 +575,20 @@ async def _send_raw(bot, conn, post) -> None:
         _finish_delivery(conn, post, message_id)
         return
 
+    # Video is intentionally text-only in the editorial flow. Telegram link
+    # previews (notably YouTube) can look like native videos to Telethon; trying
+    # to stage or download them is slow, wasteful, and produces noisy fallback
+    # errors. Preserve the source label/caption and never touch the video bytes.
+    if post["media_kind"] in {"video", "video_note"}:
+        message_id = await _send_raw_parts(
+            bot,
+            post,
+            keyboard_on_last=True,
+            curation=curation,
+        )
+        _finish_delivery(conn, post, message_id)
+        return
+
     # Photos are small enough for a direct Bot API upload. This avoids relying
     # on an in-memory staging waiter across separate Vercel webhook instances
     # and guarantees that the reusable file_id is durable before review starts.
@@ -1771,10 +1785,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 except Exception:
                     pass
             return
-        needs_manual_text = (
-            post["media_kind"] in {"voice", "audio", "video", "video_note"}
-            or not post["text"]
-        )
+        # A video caption is valid source text even though video bytes are never
+        # downloaded. Voice/audio still need owner-supplied text because this bot
+        # intentionally has no transcription step.
+        needs_manual_text = post["media_kind"] in {"voice", "audio"} or not post["text"]
         if action in {
             "select",
             "make",

@@ -55,6 +55,9 @@ hands the durable FIFO shelf back to automation.
 2. The initial import stores the last three **calendar** months of messages in the
    database. Text and media metadata are stored; media itself is fetched only when
    it is about to be shown.
+   Photos can be delivered and later published with the post. Videos and video
+   notes—including YouTube-style Telegram previews—are always text-only: the bot
+   preserves their caption/link but never stages, downloads, or forwards video bytes.
 3. The owner presses persistent `📚 Начать накидывать` whenever convenient. No review
    flow starts automatically at 21:00.
 4. The bot opens one durable, unbounded curation session. For each candidate it

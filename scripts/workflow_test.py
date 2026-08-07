@@ -1614,11 +1614,13 @@ async def main() -> None:
         bot._STAGING_WAITERS.pop("photo-token", None)
 
         cleanup_calls: list[tuple[str, list[int]]] = []
+        stage_calls: list[int] = []
 
         async def fake_bot_username(_bot):
             return "test_bot"
 
         async def fake_stage(post, username, token):
+            stage_calls.append(post["id"])
             sender_id = 123 if post["username"] == "@media-owner" else 999
             inbound = SimpleNamespace(
                 effective_chat=SimpleNamespace(id=sender_id),
@@ -1646,7 +1648,7 @@ async def main() -> None:
                 source_id,
                 message_id,
                 "2026-05-01T10:00:00+00:00",
-                "",
+                f"YouTube caption {message_id}",
                 f"https://t.me/{username[1:]}/{message_id}",
                 media_kind="video",
                 media_mime="video/mp4",
@@ -1658,10 +1660,31 @@ async def main() -> None:
                 source_username=username,
                 max_items=1,
             ) == 1
-        assert len(fake.copies) == 1
-        assert fake.copies[0]["from_chat_id"] == 999
-        assert len(cleanup_calls[0][1]) == 1
-        assert len(cleanup_calls[1][1]) == 2
+        assert stage_calls == [], "video must never enter Telethon staging"
+        assert fake.copies == [], "video must never be copied through Telegram"
+        assert cleanup_calls == [], "no video staging means no media cleanup"
+        assert any(message["text"] == "YouTube caption 21" for message in fake.messages)
+        assert any(message["text"] == "YouTube caption 22" for message in fake.messages)
+        assert all("Медиа пока не удалось переслать" not in message["text"] for message in fake.messages)
+
+        video_post = conn.execute(
+            "SELECT * FROM post WHERE tg_message_id=21"
+        ).fetchone()
+        before_select = len(fake.messages)
+        await bot.on_callback(
+            SimpleNamespace(
+                callback_query=FakeQuery(f"select:{video_post['id']}"),
+                effective_chat=SimpleNamespace(id=config.OWNER_CHAT_ID),
+            ),
+            SimpleNamespace(bot=fake),
+        )
+        selected_messages = fake.messages[before_select:]
+        video_draft = conn.execute(
+            "SELECT * FROM draft WHERE post_id=? ORDER BY id DESC LIMIT 1",
+            (video_post["id"],),
+        ).fetchone()
+        assert video_draft["linkedin_text"] == "YouTube caption 21"
+        assert all("Напиши свой текст" not in message["text"] for message in selected_messages)
         print("Workflow-тест пройден: raw → выбор, без LLM и Buffer")
     finally:
         generator.translate_post = original_translate

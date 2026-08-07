@@ -255,6 +255,38 @@ def test_legacy_delivery_constraint_migration() -> None:
         Path(tmp.name).unlink(missing_ok=True)
 
 
+def test_generation_retries_incomplete_boundary_text() -> None:
+    """A schema-boundary result must be regenerated, never stored as a cut tail."""
+    original_parse = generator._parse
+    targets: list[int] = []
+
+    def fake_parse(_system: str, _user: str, max_chars: int):
+        targets.append(max_chars)
+        if len(targets) == 1:
+            full_text = ("A" * (max_chars - 5)) + ", but"
+        else:
+            full_text = ("B" * (max_chars - 20)) + " Complete ending."
+        return generator.TranslationOut(
+            full_text=full_text,
+            thread_items=["A complete Threads item."],
+            notes="",
+        )
+
+    try:
+        generator._parse = fake_parse
+        result = generator.translate_post(
+            "Test source",
+            "2026-08-07",
+            "Полный исходный текст",
+            max_chars=config.PLATFORM_SAFE_CHARS,
+        )
+        assert targets == [config.PLATFORM_SAFE_CHARS, 2_850]
+        assert result.linkedin_text.endswith("Complete ending.")
+        assert len(result.linkedin_text) < 2_850
+    finally:
+        generator._parse = original_parse
+
+
 def test_stranded_work_recovery() -> None:
     """Startup recovery is idempotent and never retries an uncertain publish."""
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
@@ -550,6 +582,7 @@ def main() -> None:
     test_pool_boundary_top_up()
     test_stranded_work_recovery()
     test_cleanup_is_disabled_and_non_destructive()
+    test_generation_retries_incomplete_boundary_text()
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     tmp.close()
     conn = db.connect(tmp.name)

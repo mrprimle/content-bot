@@ -24,8 +24,8 @@ Telethon user session ───────────────┐
                    ┌─────────────────┴─────────────────┐
              Пропустить                  выбрать AI-действие
                    │                                  │
-          next raw candidate           EN only / compress to 1500 /
-          in the same iteration          EN + compress to 1500
+          next raw candidate          short standard transform (1500) /
+          in the same iteration         long standard transform (3000)
                                                       │
                                    ┌──────────────────┼──────────────────┐
                              Редактировать    На полку        Закончить отбор
@@ -58,15 +58,16 @@ hands the durable FIFO shelf back to automation.
 3. The owner presses persistent `📚 Наполнить полку` whenever convenient. No review
    flow starts automatically at 21:00.
 4. The bot opens one durable, unbounded curation session and sends one original material with:
-   `🇬🇧 Перевести EN`, `🗜 До 1500`, `✨ EN + до 1500`, and `⏭ Пропустить`.
+   `✨ Короткий · EN ≤1500`, `📖 Длинный · EN ≤3000`, and `⏭ Пропустить`.
 5. `Пропустить` permanently closes that candidate and immediately sends the next
    one. The owner can keep skipping inside the same iteration without an AI call.
-6. `Перевести EN` translates and corrects author/company facts while preserving the
-   complete post up to the cross-platform hard limit of 3000. `До 1500` compresses
-   in the current language without translating. `EN + до 1500` performs both.
-7. Every reviewed draft keeps those three independent AI actions, plus
+6. Both modes perform the same standard transformation: English translation,
+   Mike/Vahue fact correction, and editorial compression only when needed. The short
+   mode targets 1500 characters; the long mode preserves more material up to the
+   3000-character cross-platform limit.
+7. Every reviewed draft keeps those two explicit AI actions, plus
    `📥 Сохранить на полку`, manual/AI editing, Threads regeneration, replacement,
-   and stop controls. An oversized draft also gets `📐 До 3000`.
+   and stop controls. There are no separate translate-only or compress-only buttons.
 8. Editing means replying with the complete replacement master text. LinkedIn/X
    keep that text exactly and do not AI-compress it; manual edits may use up to
    3000 characters. Terra only rebuilds the separate Threads sequence.
@@ -94,8 +95,8 @@ It opens two immediate modes:
 
 - `📚 Начать отбор в полку` starts or resumes the same durable curation flow.
 - `✍️ Написать свой текст` stores the submitted text unchanged and without an AI
-  call. The owner can publish it as-is, translate only, compress only, run the
-  combined EN + 1500 action, edit manually/with AI, rebuild Threads, publish now,
+  call. The owner can publish it as-is, run the short or long standard transform,
+  edit manually/with AI, rebuild Threads, publish now,
   save to the shelf, or cancel.
 
 ## Queue semantics
@@ -180,13 +181,12 @@ OPENAI_MODEL=gpt-5.6-terra
 MAX_POST_CHARS=1500
 ```
 
-The three explicit transformations are:
+The two explicit transformations are:
 
-- `🇬🇧 Только EN`: English + Mike/Vahue fact correction; preserve the whole post,
-  compressing only if necessary to fit the 3000-character cross-platform limit.
-- `🗜 До 1500`: optional editorial compression in the current language; no
-  translation or fact replacement.
-- `✨ EN + до 1500`: English + fact correction + optional compression to 1500.
+- `✨ Короткий · EN ≤1500`: English + Mike/Vahue fact correction + editorial
+  compression only when needed to fit 1500 characters.
+- `📖 Длинный · EN ≤3000`: the same transformation with a 3000-character ceiling,
+  preserving substantially more of a strong long post.
 
 Terra must:
 
@@ -196,6 +196,8 @@ Terra must:
 - keep a natural translation unchanged when it already fits the selected target;
 - when necessary, compress by removing repetition and secondary explanation before
   removing concrete examples or punchlines;
+- never truncate the bottom to satisfy a limit: a boundary-hitting or grammatically
+  incomplete result is rejected and regenerated with extra editorial headroom;
 - treat the input as Mike Doroshenko's own post whose personal/company facts may be
   wrong or outdated;
 - use `AUTHOR_FACTS` as the only source of truth for Mike/Vahue corrections;

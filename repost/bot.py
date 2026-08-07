@@ -151,33 +151,20 @@ def _threads_preview(draft) -> str:
     return "\n\n".join(parts)
 
 
-def _ai_transform_rows(draft_id: int, master_chars: int) -> list[list[InlineKeyboardButton]]:
-    rows = [
+def _ai_transform_rows(draft_id: int, _master_chars: int) -> list[list[InlineKeyboardButton]]:
+    """Two explicit standard transforms; legacy callbacks remain handler-compatible."""
+    return [
         [
             InlineKeyboardButton(
-                "🇬🇧 Только EN",
-                callback_data=f"translateonly:{draft_id}",
+                f"✨ Короткий · EN ≤{config.MAX_POST_CHARS}",
+                callback_data=f"transform1500:{draft_id}",
             ),
             InlineKeyboardButton(
-                f"🗜 До {config.MAX_POST_CHARS}",
-                callback_data=f"compress1500:{draft_id}",
+                f"📖 Длинный · EN ≤{config.PLATFORM_SAFE_CHARS}",
+                callback_data=f"transform3000:{draft_id}",
             ),
-        ],
-        [
-            InlineKeyboardButton(
-                f"✨ EN + до {config.MAX_POST_CHARS}",
-                callback_data=f"transform:{draft_id}",
-            )
-        ],
+        ]
     ]
-    if master_chars > config.PLATFORM_SAFE_CHARS:
-        rows[1].append(
-            InlineKeyboardButton(
-                f"📐 До {config.PLATFORM_SAFE_CHARS}",
-                callback_data=f"fitplatform:{draft_id}",
-            )
-        )
-    return rows
 
 
 def _message_media_file_id(message, media_kind: str) -> str | None:
@@ -375,17 +362,16 @@ def _new_post_menu() -> InlineKeyboardMarkup:
 def _raw_keyboard(post_id: int, *, curation: bool = False) -> InlineKeyboardMarkup:
     rows = [
         [
-            InlineKeyboardButton("🇬🇧 Перевести EN", callback_data=f"translate:{post_id}"),
             InlineKeyboardButton(
-                f"🗜 До {config.MAX_POST_CHARS}",
-                callback_data=f"rawcompress:{post_id}",
+                f"✨ Короткий · EN ≤{config.MAX_POST_CHARS}",
+                callback_data=f"make1500:{post_id}",
+            ),
+            InlineKeyboardButton(
+                f"📖 Длинный · EN ≤{config.PLATFORM_SAFE_CHARS}",
+                callback_data=f"make3000:{post_id}",
             ),
         ],
         [
-            InlineKeyboardButton(
-                f"✨ EN + до {config.MAX_POST_CHARS}",
-                callback_data=f"make:{post_id}",
-            ),
             InlineKeyboardButton("⏭ Пропустить", callback_data=f"drop:{post_id}"),
         ],
     ]
@@ -1660,7 +1646,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     object_id = int(raw_id)
     conn = db.connect()
 
-    if action in {"make", "translate", "rawcompress", "drop"}:
+    if action in {"make", "translate", "rawcompress", "make1500", "make3000", "drop"}:
         post = db.get_post(conn, object_id)
         if post is None:
             await query.answer("Материал не найден", show_alert=True)
@@ -1750,7 +1736,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             post["media_kind"] in {"voice", "audio", "video", "video_note"}
             or not post["text"]
         )
-        if action in {"make", "translate", "rawcompress"} and needs_manual_text:
+        if action in {"make", "translate", "rawcompress", "make1500", "make3000"} and needs_manual_text:
             await query.answer()
             if not db.transition_post(conn, post["id"], ("offered",), "awaiting_manual"):
                 return
@@ -1788,7 +1774,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         target_chars = (
             config.MAX_POST_CHARS
-            if action in {"make", "rawcompress"}
+            if action in {"make", "rawcompress", "make1500"}
             else config.PLATFORM_SAFE_CHARS
         )
         await query.answer("Перевожу и готовлю пост")
@@ -1801,10 +1787,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             + (
                 f"сжимаю текущий язык до {config.MAX_POST_CHARS} без перевода; "
                 if action == "rawcompress"
-                else f"перевожу на английский, проверяю факты и сжимаю до {config.MAX_POST_CHARS}; "
-                if action == "make"
-                else f"перевожу на английский, проверяю факты и сохраняю полноту текста "
-                f"до общего hard limit {config.PLATFORM_SAFE_CHARS}; "
+                else f"делаю стандартную короткую трансформацию: English → факты → бережное сжатие до {config.MAX_POST_CHARS}; "
+                if action in {"make", "make1500"}
+                else f"делаю стандартную длинную трансформацию: English → факты → бережное сжатие только при необходимости до {config.PLATFORM_SAFE_CHARS}; "
             )
             + "отдельно собираю "
             f"Threads-карточки до {config.THREAD_ITEM_CHARS}. Обычно это занимает 10–30 секунд. "
@@ -2015,6 +2000,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "aiedit",
         "threadify",
         "transform",
+        "transform1500",
+        "transform3000",
         "translateonly",
         "compress1500",
         "fitplatform",
@@ -2135,7 +2122,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 "Текущая версия сохранена. Никакой драмы — Матрица иногда моргает 💗",
                 reply_markup=_draft_keyboard(conn, object_id),
             )
-    elif action in {"transform", "translateonly", "compress1500", "fitplatform"}:
+    elif action in {
+        "transform",
+        "transform1500",
+        "transform3000",
+        "translateonly",
+        "compress1500",
+        "fitplatform",
+    }:
         post = db.get_post(conn, draft["post_id"])
         source_name = (
             "Собственный пост"
@@ -2173,6 +2167,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "transform": (
                 f"English → факты Mike/Vahue → добровольное сжатие до {config.MAX_POST_CHARS}"
             ),
+            "transform1500": (
+                f"стандартная короткая трансформация: English → факты Mike/Vahue → "
+                f"бережное сжатие до {config.MAX_POST_CHARS}"
+            ),
+            "transform3000": (
+                f"стандартная длинная трансформация: English → факты Mike/Vahue → "
+                f"бережное сжатие только при необходимости до {config.PLATFORM_SAFE_CHARS}"
+            ),
         }[action]
         await _send(
             context.bot.send_message,
@@ -2182,10 +2184,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "Обычно это занимает 10–30 секунд. Расслабься, Нео — я всё бережно соберу 💜",
         )
         try:
-            if action in {"translateonly", "transform"}:
+            if action in {"translateonly", "transform", "transform1500", "transform3000"}:
                 target_chars = (
                     config.MAX_POST_CHARS
-                    if action == "transform"
+                    if action in {"transform", "transform1500"}
                     else config.PLATFORM_SAFE_CHARS
                 )
                 out = await asyncio.to_thread(

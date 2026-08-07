@@ -175,7 +175,7 @@ async def test_evening_planning_and_next_day_publish() -> None:
                 "SELECT * FROM planning_slot WHERE session_id=? AND position=?",
                 (session["id"], position),
             ).fetchone()
-            make = FakeQuery(f"make:{slot['post_id']}")
+            make = FakeQuery(f"make1500:{slot['post_id']}")
             await bot.on_callback(
                 SimpleNamespace(
                     callback_query=make,
@@ -192,9 +192,8 @@ async def test_evening_planning_and_next_day_publish() -> None:
             labels = [button.text for row in keyboard for button in row]
             assert labels == [
                 f"✅ Готово на завтра ({position}/3)",
-                "🇬🇧 Только EN",
-                "🗜 До 1500",
-                "✨ EN + до 1500",
+                "✨ Короткий · EN ≤1500",
+                "📖 Длинный · EN ≤3000",
                 "✏️ Редактировать руками",
                 "🤖 Редактировать с AI",
                 "🧵 Пересобрать Threads с AI",
@@ -698,9 +697,8 @@ async def test_anytime_owner_post() -> None:
         assert raw_labels == [
             "✅ Опубликовать сейчас",
             "📥 На полку",
-            "🇬🇧 Только EN",
-            "🗜 До 1500",
-            "✨ EN + до 1500",
+            "✨ Короткий · EN ≤1500",
+            "📖 Длинный · EN ≤3000",
             "✏️ Редактировать руками",
             "🤖 Редактировать с AI",
             "🧵 Пересобрать Threads с AI",
@@ -1117,8 +1115,8 @@ async def test_long_draft_controls_and_chunked_preview() -> None:
             for row in fake_bot.messages[-1]["reply_markup"].inline_keyboard
             for button in row
         ]
-        assert "🗜 До 1500" in labels
-        assert "📐 До 3000" in labels
+        assert "✨ Короткий · EN ≤1500" in labels
+        assert "📖 Длинный · EN ≤3000" in labels
 
         publish_query = FakeQuery(f"pub:{draft_id}")
         await bot.on_callback(
@@ -1140,14 +1138,32 @@ async def test_long_draft_controls_and_chunked_preview() -> None:
             for row in fake_bot.messages[-1]["reply_markup"].inline_keyboard
             for button in row
         ]
-        assert "📐 До 3000" not in fitted_labels
+        assert "📖 Длинный · EN ≤3000" in fitted_labels
+
+        long_query = FakeQuery(f"transform3000:{draft_id}")
+        await bot.on_callback(
+            SimpleNamespace(callback_query=long_query, effective_chat=SimpleNamespace(id=123)),
+            SimpleNamespace(bot=fake_bot),
+        )
+        assert translate_targets == [config.PLATFORM_SAFE_CHARS]
+
+        short_query = FakeQuery(f"transform1500:{draft_id}")
+        await bot.on_callback(
+            SimpleNamespace(callback_query=short_query, effective_chat=SimpleNamespace(id=123)),
+            SimpleNamespace(bot=fake_bot),
+        )
+        assert translate_targets[-1] == config.MAX_POST_CHARS
 
         translate_query = FakeQuery(f"translateonly:{draft_id}")
         await bot.on_callback(
             SimpleNamespace(callback_query=translate_query, effective_chat=SimpleNamespace(id=123)),
             SimpleNamespace(bot=fake_bot),
         )
-        assert translate_targets == [config.PLATFORM_SAFE_CHARS]
+        assert translate_targets == [
+            config.PLATFORM_SAFE_CHARS,
+            config.MAX_POST_CHARS,
+            config.PLATFORM_SAFE_CHARS,
+        ]
 
         compact_query = FakeQuery(f"compress1500:{draft_id}")
         await bot.on_callback(
@@ -1189,7 +1205,7 @@ async def test_long_draft_controls_and_chunked_preview() -> None:
         )
         translate_post = conn.execute("SELECT * FROM post WHERE tg_message_id=3").fetchone()
         db.set_post_status(conn, translate_post["id"], "offered")
-        raw_translate_query = FakeQuery(f"translate:{translate_post['id']}")
+        raw_translate_query = FakeQuery(f"make3000:{translate_post['id']}")
         await bot.on_callback(
             SimpleNamespace(
                 callback_query=raw_translate_query,
@@ -1259,9 +1275,8 @@ async def main() -> None:
         keyboard = fake.messages[0]["reply_markup"].inline_keyboard
         labels = [button.text for row in keyboard for button in row]
         assert labels == [
-            "🇬🇧 Перевести EN",
-            "🗜 До 1500",
-            "✨ EN + до 1500",
+            "✨ Короткий · EN ≤1500",
+            "📖 Длинный · EN ≤3000",
             "⏭ Пропустить",
         ]
 
@@ -1285,7 +1300,7 @@ async def main() -> None:
         text_post_id = conn.execute(
             "SELECT id FROM post WHERE tg_message_id=10"
         ).fetchone()["id"]
-        text_query = FakeQuery(f"make:{text_post_id}")
+        text_query = FakeQuery(f"make1500:{text_post_id}")
         text_update = SimpleNamespace(
             callback_query=text_query,
             effective_chat=SimpleNamespace(id=config.OWNER_CHAT_ID),
@@ -1308,9 +1323,8 @@ async def main() -> None:
         assert draft_labels == [
             "✅ Опубликовать сейчас",
             "📥 На полку",
-            "🇬🇧 Только EN",
-            "🗜 До 1500",
-            "✨ EN + до 1500",
+            "✨ Короткий · EN ≤1500",
+            "📖 Длинный · EN ≤3000",
             "✏️ Редактировать руками",
             "🤖 Редактировать с AI",
             "🧵 Пересобрать Threads с AI",

@@ -162,6 +162,26 @@ def _parse(system: str, user: str, max_chars: int) -> TranslationOut:
     return _anthropic_parse(system, user)
 
 
+def _parse_complete_with_retry(system_factory, user: str, max_chars: int) -> DraftOut:
+    """Reject boundary-shaped/incomplete prose and retry with editorial headroom."""
+    retry_headroom = max(120, max_chars // 20)
+    targets = (max_chars, max(500, max_chars - retry_headroom))
+    validation_error: RuntimeError | None = None
+    for attempt, target in enumerate(targets, start=1):
+        system = system_factory(target)
+        if attempt > 1:
+            system += prompts.COMPLETE_RETRY_SUFFIX
+        out = _parse(system, user, target)
+        try:
+            return _draft(out.full_text, out.notes, out.thread_items, max_chars=target)
+        except RuntimeError as exc:
+            validation_error = exc
+    raise RuntimeError(
+        "Модель дважды вернула текст с оборванной границей; исходник сохранён, "
+        "попробуй трансформацию ещё раз"
+    ) from validation_error
+
+
 def _anthropic_thread_parse(system: str, user: str) -> ThreadPlanOut:
     global _anthropic_client
     if _anthropic_client is None:
@@ -248,26 +268,11 @@ def translate_post(
     max_chars: int = config.PLATFORM_SAFE_CHARS,
 ) -> DraftOut:
     """Translate/correct the full post; compress only above the requested hard limit."""
-    retry_headroom = max(120, max_chars // 20)
-    targets = (max_chars, max(500, max_chars - retry_headroom))
-    validation_error: RuntimeError | None = None
-    for attempt, target in enumerate(targets, start=1):
-        system = prompts.translation_system(target)
-        if attempt > 1:
-            system += prompts.COMPLETE_RETRY_SUFFIX
-        out = _parse(
-            system,
-            prompts.user_message(source, date, text),
-            target,
-        )
-        try:
-            return _draft(out.full_text, out.notes, out.thread_items, max_chars=target)
-        except RuntimeError as exc:
-            validation_error = exc
-    raise RuntimeError(
-        "Модель дважды вернула текст с оборванной границей; исходник сохранён, "
-        "попробуй трансформацию ещё раз"
-    ) from validation_error
+    return _parse_complete_with_retry(
+        prompts.translation_system,
+        prompts.user_message(source, date, text),
+        max_chars,
+    )
 
 
 def generate(source: str, date: str, text: str) -> DraftOut:
@@ -283,16 +288,10 @@ def revise_post(current_text: str, instruction: str) -> DraftOut:
         raise RuntimeError("Активный черновик пуст")
     if not instruction:
         raise RuntimeError("Инструкция для AI пуста")
-    out = _parse(
-        prompts.revise_system(config.PLATFORM_SAFE_CHARS),
+    return _parse_complete_with_retry(
+        prompts.revise_system,
         prompts.revise_message(current_text, instruction),
         config.PLATFORM_SAFE_CHARS,
-    )
-    return _draft(
-        out.full_text,
-        out.notes,
-        out.thread_items,
-        max_chars=config.PLATFORM_SAFE_CHARS,
     )
 
 
@@ -303,31 +302,11 @@ def compress_post(current_text: str, target_chars: int) -> DraftOut:
         raise RuntimeError("Пустой текст нельзя сжать")
     if target_chars not in {config.MAX_POST_CHARS, config.PLATFORM_SAFE_CHARS}:
         raise ValueError("Неподдерживаемый лимит сжатия")
-    retry_headroom = max(120, target_chars // 20)
-    targets = (target_chars, max(500, target_chars - retry_headroom))
-    validation_error: RuntimeError | None = None
-    for attempt, target in enumerate(targets, start=1):
-        system = prompts.compression_system(target)
-        if attempt > 1:
-            system += prompts.COMPLETE_RETRY_SUFFIX
-        out = _parse(
-            system,
-            prompts.compression_message(current_text),
-            target,
-        )
-        try:
-            return _draft(
-                out.full_text,
-                out.notes,
-                out.thread_items,
-                max_chars=target,
-            )
-        except RuntimeError as exc:
-            validation_error = exc
-    raise RuntimeError(
-        "Модель дважды вернула текст с оборванной границей; исходник сохранён, "
-        "попробуй трансформацию ещё раз"
-    ) from validation_error
+    return _parse_complete_with_retry(
+        prompts.compression_system,
+        prompts.compression_message(current_text),
+        target_chars,
+    )
 
 
 def adapt(edited_text: str) -> DraftOut:

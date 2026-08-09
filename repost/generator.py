@@ -1,7 +1,13 @@
+import logging
+import time
+
 import httpx
 from pydantic import BaseModel, Field
 
 from . import config, prompts
+
+
+LOGGER = logging.getLogger("repost.generator")
 
 
 class DraftOut(BaseModel):
@@ -133,24 +139,49 @@ def _openai_parse(system: str, user: str, max_chars: int) -> TranslationOut:
         "required": ["full_text", "thread_items", "notes"],
         "additionalProperties": False,
     }
-    r = httpx.post(
-        "https://api.openai.com/v1/chat/completions",
-        headers={"Authorization": f"Bearer {config.OPENAI_API_KEY}"},
-        json={
-            "model": config.OPENAI_MODEL,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {"name": "translation", "strict": True, "schema": schema},
+    started = time.monotonic()
+    try:
+        r = httpx.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {config.OPENAI_API_KEY}"},
+            json={
+                "model": config.OPENAI_MODEL,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"name": "translation", "strict": True, "schema": schema},
+                },
             },
-        },
-        timeout=180,
+            timeout=180,
+        )
+        r.raise_for_status()
+    except httpx.HTTPError as exc:
+        response = getattr(exc, "response", None)
+        LOGGER.exception(
+            "llm_http_error provider=openai model=%s status=%s request_id=%s elapsed_ms=%s",
+            config.OPENAI_MODEL,
+            getattr(response, "status_code", None),
+            response.headers.get("x-request-id") if response is not None else None,
+            round((time.monotonic() - started) * 1000),
+        )
+        raise
+    payload = r.json()
+    choice = payload["choices"][0]
+    msg = choice["message"]
+    usage = payload.get("usage") or {}
+    LOGGER.info(
+        "llm_response provider=openai model=%s request_id=%s finish_reason=%s "
+        "prompt_tokens=%s completion_tokens=%s elapsed_ms=%s",
+        config.OPENAI_MODEL,
+        r.headers.get("x-request-id"),
+        choice.get("finish_reason"),
+        usage.get("prompt_tokens"),
+        usage.get("completion_tokens"),
+        round((time.monotonic() - started) * 1000),
     )
-    r.raise_for_status()
-    msg = r.json()["choices"][0]["message"]
     if msg.get("refusal"):
         raise RuntimeError(f"Модель отказалась: {msg['refusal']}")
     return TranslationOut.model_validate_json(msg["content"])
@@ -162,23 +193,75 @@ def _parse(system: str, user: str, max_chars: int) -> TranslationOut:
     return _anthropic_parse(system, user)
 
 
-def _parse_complete_with_retry(system_factory, user: str, max_chars: int) -> DraftOut:
-    """Reject boundary-shaped/incomplete prose and retry with editorial headroom."""
-    retry_headroom = max(120, max_chars // 20)
-    targets = (max_chars, max(500, max_chars - retry_headroom))
+def _parse_complete_with_retry(
+    system_factory,
+    user: str,
+    max_chars: int,
+    *,
+    operation: str,
+) -> DraftOut:
+    """Keep schema/validation at the hard cap while prompting below it with retries."""
+    targets = tuple(
+        dict.fromkeys(
+            (
+                max(500, max_chars - max(25, max_chars // 100)),
+                max(500, int(max_chars * 0.90)),
+                max(500, int(max_chars * 0.80)),
+            )
+        )
+    )
+    LOGGER.info(
+        "llm_pipeline_start operation=%s provider=%s model=%s input_chars=%s "
+        "hard_limit=%s targets=%s",
+        operation,
+        config.llm_provider(),
+        config.llm_model(),
+        len(user),
+        max_chars,
+        ",".join(map(str, targets)),
+    )
     validation_error: RuntimeError | None = None
     for attempt, target in enumerate(targets, start=1):
-        system = system_factory(target)
+        system = system_factory(target, max_chars)
         if attempt > 1:
             system += prompts.COMPLETE_RETRY_SUFFIX
-        out = _parse(system, user, target)
+        LOGGER.info(
+            "llm_pipeline_attempt operation=%s attempt=%s/%s editorial_target=%s hard_limit=%s",
+            operation,
+            attempt,
+            len(targets),
+            target,
+            max_chars,
+        )
+        # The JSON schema allows the true platform limit. The prompt deliberately
+        # targets below it, so a complete response is not forced onto the same
+        # boundary that the validator treats as suspicious.
+        out = _parse(system, user, max_chars)
         try:
-            return _draft(out.full_text, out.notes, out.thread_items, max_chars=target)
+            draft = _draft(out.full_text, out.notes, out.thread_items, max_chars=max_chars)
+            LOGGER.info(
+                "llm_pipeline_success operation=%s attempt=%s output_chars=%s thread_items=%s",
+                operation,
+                attempt,
+                len(draft.linkedin_text),
+                len(draft.thread_items),
+            )
+            return draft
         except RuntimeError as exc:
             validation_error = exc
+            LOGGER.warning(
+                "llm_pipeline_validation_failed operation=%s attempt=%s "
+                "output_chars=%s editorial_target=%s hard_limit=%s reason=%s",
+                operation,
+                attempt,
+                len(out.full_text or ""),
+                target,
+                max_chars,
+                str(exc),
+            )
     raise RuntimeError(
-        "Модель дважды вернула текст с оборванной границей; исходник сохранён, "
-        "попробуй трансформацию ещё раз"
+        "Модель трижды вернула незавершённый текст; исходник сохранён, "
+        "можно безопасно повторить трансформацию"
     ) from validation_error
 
 
@@ -272,6 +355,7 @@ def translate_post(
         prompts.translation_system,
         prompts.user_message(source, date, text),
         max_chars,
+        operation="translate_transform",
     )
 
 
@@ -292,6 +376,7 @@ def revise_post(current_text: str, instruction: str) -> DraftOut:
         prompts.revise_system,
         prompts.revise_message(current_text, instruction),
         config.PLATFORM_SAFE_CHARS,
+        operation="ai_revision",
     )
 
 
@@ -306,6 +391,7 @@ def compress_post(current_text: str, target_chars: int) -> DraftOut:
         prompts.compression_system,
         prompts.compression_message(current_text),
         target_chars,
+        operation="compression",
     )
 
 

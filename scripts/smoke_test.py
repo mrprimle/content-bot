@@ -1,5 +1,6 @@
 """Offline smoke test: DB migration, round-robin pool, workflow and hard limits."""
 import asyncio
+import json
 import sys
 import sqlite3
 import tempfile
@@ -258,14 +259,17 @@ def test_legacy_delivery_constraint_migration() -> None:
 def test_generation_retries_incomplete_boundary_text() -> None:
     """A schema-boundary result must be regenerated, never stored as a cut tail."""
     original_parse = generator._parse
-    targets: list[int] = []
+    schema_limits: list[int] = []
+    editorial_targets: list[int] = []
 
-    def fake_parse(_system: str, _user: str, max_chars: int):
-        targets.append(max_chars)
-        if len(targets) == 1:
+    def fake_parse(system: str, _user: str, max_chars: int):
+        schema_limits.append(max_chars)
+        marker = "editorial target of "
+        editorial_targets.append(int(system.split(marker, 1)[1].split(" ", 1)[0]))
+        if len(schema_limits) == 1:
             full_text = ("A" * (max_chars - 5)) + ", but"
         else:
-            full_text = ("B" * (max_chars - 20)) + " Complete ending."
+            full_text = ("B" * (editorial_targets[-1] - 20)) + " Complete ending."
         return generator.TranslationOut(
             full_text=full_text,
             thread_items=["A complete Threads item."],
@@ -280,9 +284,42 @@ def test_generation_retries_incomplete_boundary_text() -> None:
             "Полный исходный текст",
             max_chars=config.PLATFORM_SAFE_CHARS,
         )
-        assert targets == [config.PLATFORM_SAFE_CHARS, 2_850]
+        assert schema_limits == [config.PLATFORM_SAFE_CHARS, config.PLATFORM_SAFE_CHARS]
+        assert editorial_targets == [2_970, 2_700]
         assert result.linkedin_text.endswith("Complete ending.")
-        assert len(result.linkedin_text) < 2_850
+        assert len(result.linkedin_text) < 2_700
+    finally:
+        generator._parse = original_parse
+
+
+def test_generation_accepts_complete_text_at_editorial_target() -> None:
+    """The soft target is not the schema boundary and must not cause false failure."""
+    original_parse = generator._parse
+    calls = 0
+
+    def fake_parse(system: str, _user: str, max_chars: int):
+        nonlocal calls
+        calls += 1
+        marker = "editorial target of "
+        target = int(system.split(marker, 1)[1].split(" ", 1)[0])
+        ending = " Complete ending."
+        return generator.TranslationOut(
+            full_text=("A" * (target - len(ending))) + ending,
+            thread_items=["A complete Threads item."],
+            notes="",
+        )
+
+    try:
+        generator._parse = fake_parse
+        result = generator.translate_post(
+            "Test source",
+            "2026-08-09",
+            "Полный исходный текст",
+            max_chars=config.PLATFORM_SAFE_CHARS,
+        )
+        assert calls == 1
+        assert len(result.linkedin_text) == 2_970
+        assert result.linkedin_text.endswith("Complete ending.")
     finally:
         generator._parse = original_parse
 
@@ -583,9 +620,25 @@ def main() -> None:
     test_stranded_work_recovery()
     test_cleanup_is_disabled_and_non_destructive()
     test_generation_retries_incomplete_boundary_text()
+    test_generation_accepts_complete_text_at_editorial_target()
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     tmp.close()
     conn = db.connect(tmp.name)
+
+    diagnostic_id = db.record_diagnostic_event(
+        conn,
+        level="error",
+        component="smoke",
+        event="test_failure",
+        entity_type="draft",
+        entity_id=42,
+        error=RuntimeError("sanitized test error"),
+        details={"action": "transform3000", "source_chars": 4_058},
+    )
+    diagnostic = db.recent_diagnostic_events(conn, 1)[0]
+    assert diagnostic["id"] == diagnostic_id
+    assert diagnostic["error_type"] == "RuntimeError"
+    assert json.loads(diagnostic["details_json"])["source_chars"] == 4_058
 
     s1 = db.upsert_source(conn, "@one", "One")
     s2 = db.upsert_source(conn, "@two", "Two")
@@ -742,15 +795,15 @@ def main() -> None:
     assert "Do NOT summarize" in prompts.TRANSLATE_SYSTEM
     assert "Preserve book titles" in prompts.TRANSLATE_SYSTEM
     assert "must not be replaced" in prompts.TRANSLATE_SYSTEM
-    assert "no longer than 1500" in prompts.TRANSLATE_SYSTEM
-    assert "hard API acceptance limit" in prompts.TRANSLATE_SYSTEM
+    assert "editorial target of 1500" in prompts.TRANSLATE_SYSTEM
+    assert "absolute platform limit is 1500" in prompts.TRANSLATE_SYSTEM
     assert "Preserve the original first-person perspective" in prompts.TRANSLATE_SYSTEM
     assert "company is Vahue" in prompts.TRANSLATE_SYSTEM
     assert "STAGE 1 — ENGLISH" in prompts.TRANSLATE_SYSTEM
     assert "STAGE 2 — TRUTH" in prompts.TRANSLATE_SYSTEM
     assert "STAGE 3 — COMPRESSION" in prompts.TRANSLATE_SYSTEM
     assert "Mike lives in London" in prompts.TRANSLATE_SYSTEM
-    assert "fit 3000 characters" in prompts.translation_system(config.PLATFORM_SAFE_CHARS)
+    assert "editorial target of 3000" in prompts.translation_system(config.PLATFORM_SAFE_CHARS)
     assert "Preserve its current language: do not translate" in prompts.compression_system(1500)
     assert "Mike is a man" in prompts.TRANSLATE_SYSTEM
     assert "building SMM automation" in prompts.TRANSLATE_SYSTEM

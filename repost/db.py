@@ -154,6 +154,20 @@ CREATE TABLE IF NOT EXISTS app_meta(
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS diagnostic_event(
+  id INTEGER PRIMARY KEY,
+  level TEXT NOT NULL,
+  component TEXT NOT NULL,
+  event TEXT NOT NULL,
+  entity_type TEXT,
+  entity_id INTEGER,
+  error_type TEXT,
+  error_message TEXT,
+  details_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_diagnostic_event_created ON diagnostic_event(created_at, id);
 """
 
 POSTGRES_SCHEMA = """
@@ -313,6 +327,20 @@ CREATE TABLE IF NOT EXISTS app_meta(
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS diagnostic_event(
+  id BIGSERIAL PRIMARY KEY,
+  level TEXT NOT NULL,
+  component TEXT NOT NULL,
+  event TEXT NOT NULL,
+  entity_type TEXT,
+  entity_id BIGINT,
+  error_type TEXT,
+  error_message TEXT,
+  details_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT ((CURRENT_TIMESTAMP AT TIME ZONE 'UTC')::text)
+);
+CREATE INDEX IF NOT EXISTS idx_diagnostic_event_created ON diagnostic_event(created_at, id);
 """
 
 _PG_SCHEMA_READY = False
@@ -2112,6 +2140,44 @@ def stats(conn) -> dict:
     for row in conn.execute("SELECT status, COUNT(*) n FROM ready_queue GROUP BY status"):
         out[f"shelf:{row['status']}"] = row["n"]
     return out
+
+
+def record_diagnostic_event(
+    conn,
+    *,
+    level: str,
+    component: str,
+    event: str,
+    entity_type: str | None = None,
+    entity_id: int | None = None,
+    error: BaseException | None = None,
+    details: dict | None = None,
+) -> int:
+    """Persist sanitized operational diagnostics without message bodies or secrets."""
+    row = conn.execute(
+        "INSERT INTO diagnostic_event(level, component, event, entity_type, entity_id, "
+        "error_type, error_message, details_json) VALUES(?,?,?,?,?,?,?,?) RETURNING id",
+        (
+            level[:20],
+            component[:100],
+            event[:100],
+            entity_type[:50] if entity_type else None,
+            entity_id,
+            type(error).__name__ if error is not None else None,
+            str(error)[:2_000] if error is not None else None,
+            json.dumps(details or {}, ensure_ascii=False, default=str)[:8_000],
+        ),
+    ).fetchone()
+    conn.commit()
+    return int(row["id"])
+
+
+def recent_diagnostic_events(conn, limit: int = 100):
+    safe_limit = max(1, min(int(limit), 500))
+    return conn.execute(
+        "SELECT * FROM diagnostic_event ORDER BY id DESC LIMIT ?",
+        (safe_limit,),
+    ).fetchall()
 
 
 def content_pool_progress(conn) -> dict[str, int]:

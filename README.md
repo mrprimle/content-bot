@@ -102,6 +102,21 @@ as saving a custom post to the shelf, cancelling a flow, finishing an iteration,
 or completing an immediate publication. `/menu` and `/start` can re-show it at any
 time without restarting the service or changing any database state.
 
+### Diagnostics
+
+Runtime activity and stack traces are available in Vercel function logs. LLM
+transformations additionally log provider/model, request id, latency, token counts,
+input/output character counts, hard limit, soft editorial target, retry number, and
+validation reason—never the post body or API credentials. Transform and uncaught
+Telegram-handler failures are also stored durably in PostgreSQL `diagnostic_event`,
+so an error remains inspectable after Vercel's log-retention window.
+
+The 1500/3000 transformation uses one normal model call for translation, Mike/Vahue
+fact correction, whole-post editorial compression, and the Threads plan. The JSON
+schema enforces the real platform hard cap, while the prompt aims slightly below it.
+If the result still looks boundary-cut, up to two progressively shorter full rewrites
+are attempted; the code never slices characters from the bottom.
+
 The persistent `✍️ Создать пост` action remains independent from curation.
 It opens two immediate modes:
 
@@ -361,6 +376,7 @@ production path relies on refetch-on-exhaustion.
 | `planning_slot` | Legacy exact-time draft and retry/unknown state. |
 | `delivery_item` | Reserved post, send lease token, bot message id, delivery timestamps. |
 | `app_meta` | Refetch leases, recovery notices, and optional sync metadata. |
+| `diagnostic_event` | Sanitized persistent transform/handler failures and debugging context. |
 
 PostgreSQL advisory locks serialize Telethon session access and queue formation
 across concurrent serverless invocations. SQLite uses file/process locks for local

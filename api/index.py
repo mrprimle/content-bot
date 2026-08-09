@@ -61,7 +61,8 @@ async def health() -> dict:
             "status": "ok",
             "database": "postgres" if db.is_postgres(conn) else "sqlite",
             "queue": db.stats(conn),
-            "model": config.OPENAI_MODEL,
+            "provider": config.llm_provider(),
+            "model": config.llm_model(),
         }
     finally:
         conn.close()

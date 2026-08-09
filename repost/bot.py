@@ -2338,6 +2338,25 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         except Exception as exc:  # noqa: BLE001
             LOGGER.exception("draft transform failed action=%s draft_id=%s", action, object_id)
             db.set_draft_status(conn, object_id, "awaiting_review")
+            try:
+                db.record_diagnostic_event(
+                    conn,
+                    level="error",
+                    component="bot.transform",
+                    event="draft_transform_failed",
+                    entity_type="draft",
+                    entity_id=object_id,
+                    error=exc,
+                    details={
+                        "action": action,
+                        "provider": config.llm_provider(),
+                        "model": config.llm_model(),
+                        "source_chars": len(current_text),
+                        "target_chars": target_chars,
+                    },
+                )
+            except Exception:  # diagnostics must never mask the original failure
+                LOGGER.exception("failed to persist transform diagnostic draft_id=%s", object_id)
             await _send(
                 context.bot.send_message,
                 config.OWNER_CHAT_ID,
@@ -3159,6 +3178,22 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         type(error).__name__,
         exc_info=(type(error), error, error.__traceback__),
     )
+    diagnostic_conn = None
+    try:
+        diagnostic_conn = db.connect()
+        db.record_diagnostic_event(
+            diagnostic_conn,
+            level="error",
+            component="bot.handler",
+            event="telegram_update_failed",
+            error=error,
+            details={"update_id": update_id},
+        )
+    except Exception:
+        LOGGER.exception("failed to persist Telegram handler diagnostic update_id=%s", update_id)
+    finally:
+        if diagnostic_conn is not None:
+            diagnostic_conn.close()
     effective_chat = getattr(update, "effective_chat", None)
     if getattr(effective_chat, "id", None) == config.OWNER_CHAT_ID:
         try:

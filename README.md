@@ -97,6 +97,15 @@ the exact FIFO draft they will consume, and missing drafts are called out explic
 Failed/unknown shelf or still-active legacy publications are surfaced in a dedicated
 error section; the handler is read-only and never changes database state.
 
+The persistent `📈 Источники` button (or `/source_stats [days]`) reports a durable
+source funnel for the last 30 days by default. `proposed` is a unique imported post
+whose raw card was successfully delivered to the owner; `shelved` is that same post
+later entering `ready_queue`. The report ranks every active non-manual channel by
+`shelved / proposed`, also shows how many shelf items have actually published, and
+separates channels with no proposal sample. Because it derives the counters from
+immutable delivery and queue rows, retries, repeated AI edits, and multi-platform
+publication records cannot inflate the conversion rate.
+
 The persistent main keyboard is explicitly reattached after terminal actions such
 as saving a custom post to the shelf, cancelling a flow, finishing an iteration,
 or completing an immediate publication. `/menu` and `/start` can re-show it at any
@@ -470,10 +479,11 @@ without discarding successful sources, and a failed full backfill exits non-zero
 | `/test @channel` | Deliver one candidate from a specific source without calling AI. |
 | `/next` | Start or resume unlimited curation into the FIFO shelf. |
 | `/stats` | Show pool arithmetic, shelf preview, today's three real FIFO slots, and errors. |
+| `/source_stats [days]` | Rank every source by proposal-to-shelf conversion (30 days by default, up to 365). |
 | `/resend <draft_id>` | Re-deliver a saved, unpublished draft after a Telegram/UI delivery failure. |
 
-`/start` installs persistent `📚 Начать накидывать`, `✍️ Создать пост`, and
-`📊 Статус` buttons. `Начать накидывать` starts or resumes unlimited curation.
+`/start` installs persistent `📚 Начать накидывать`, `✍️ Создать пост`,
+`📊 Статус`, and `📈 Источники` buttons. `Начать накидывать` starts or resumes unlimited curation.
 `Написать свой текст` opens a durable manual input session independently of
 curation. Russian, English, or
 mixed input is first saved byte-for-byte with zero LLM calls. The owner then chooses

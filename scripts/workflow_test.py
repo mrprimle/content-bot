@@ -89,6 +89,116 @@ class FakeApplication:
         return task
 
 
+def test_source_selection_funnel() -> None:
+    """Source conversion is a distinct proposal cohort, not a mutable counter."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    conn = db.connect(tmp.name)
+    try:
+        alpha = db.upsert_source(conn, "@alpha", "Alpha")
+        beta = db.upsert_source(conn, "@beta", "Beta")
+        db.upsert_source(conn, "@gamma", "Gamma")
+        manual = db.upsert_source(conn, "manual:123", "Own posts")
+        posts: dict[str, list[int]] = {"alpha": [], "beta": [], "manual": []}
+        message_id = 1
+        for label, source_id, count in (
+            ("alpha", alpha, 4),
+            ("beta", beta, 2),
+            ("manual", manual, 1),
+        ):
+            for index in range(count):
+                db.insert_post(
+                    conn,
+                    source_id,
+                    message_id,
+                    "2026-08-01T12:00:00+00:00",
+                    f"{label} post {index}",
+                    None,
+                    media_kind="manual" if label == "manual" else "text",
+                )
+                post_id = conn.execute(
+                    "SELECT id FROM post WHERE source_id=? AND tg_message_id=?",
+                    (source_id, message_id),
+                ).fetchone()["id"]
+                posts[label].append(post_id)
+                message_id += 1
+
+        batch_id = conn.execute(
+            "INSERT INTO delivery_batch(slot_key) VALUES(?) RETURNING id",
+            ("source-funnel-test",),
+        ).fetchone()["id"]
+        for label, source_id in (("alpha", alpha), ("beta", beta), ("manual", manual)):
+            for index, post_id in enumerate(posts[label]):
+                sent_at = (
+                    "2026-06-01 12:00:00"
+                    if label == "alpha" and index == 3
+                    else "2026-08-01 12:00:00"
+                )
+                conn.execute(
+                    "INSERT INTO delivery_item(batch_id,source_id,post_id,status,sent_at) "
+                    "VALUES(?,?,?,?,?)",
+                    (batch_id, source_id, post_id, "sent", sent_at),
+                )
+        conn.commit()
+
+        alpha_queue_ids: list[int] = []
+        for post_id in posts["alpha"][:2]:
+            draft_id = db.create_draft(
+                conn,
+                post_id,
+                "test",
+                "Alpha draft",
+                "Alpha draft",
+                "Alpha draft",
+                "",
+                ["Alpha draft"],
+            )
+            alpha_queue_ids.append(db.enqueue_ready_draft(conn, draft_id)["queue_id"])
+        conn.execute(
+            "UPDATE ready_queue SET status='published', published_at='2026-08-05 12:00:00' WHERE id=?",
+            (alpha_queue_ids[0],),
+        )
+        manual_draft = db.create_draft(
+            conn,
+            posts["manual"][0],
+            "manual/raw",
+            "Own post",
+            "Own post",
+            "Own post",
+            "",
+            ["Own post"],
+        )
+        db.enqueue_ready_draft(conn, manual_draft)
+        conn.commit()
+
+        rows = db.source_selection_stats(
+            conn,
+            "2026-07-12 12:00:00",
+            "2026-08-11 12:00:00",
+        )
+        by_username = {row["username"]: row for row in rows}
+        assert set(by_username) == {"@alpha", "@beta", "@gamma"}
+        assert dict(by_username["@alpha"])["proposed"] == 3
+        assert dict(by_username["@alpha"])["shelved"] == 2
+        assert dict(by_username["@alpha"])["published"] == 1
+        assert dict(by_username["@beta"])["proposed"] == 2
+        assert dict(by_username["@beta"])["shelved"] == 0
+        assert dict(by_username["@gamma"])["proposed"] == 0
+
+        report = bot._source_stats_report(
+            conn,
+            days=30,
+            now=datetime(2026, 8, 11, 13, 0, tzinfo=ZoneInfo(config.TIMEZONE)),
+        )
+        assert "Предложено: 5 · На полке: 2 · Конверсия: 40.0%" in report
+        assert "1. @alpha — 2/3 · 66.7% · опубликовано 1" in report
+        assert "2. @beta — 0/2 · 0.0% · опубликовано 0" in report
+        assert "@gamma" in report and "manual:123" not in report
+    finally:
+        conn.close()
+        Path(tmp.name).unlink(missing_ok=True)
+
+
 def test_shelf_status_plan() -> None:
     """Status must turn the FIFO shelf into today's concrete three-slot plan."""
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
@@ -515,6 +625,7 @@ async def test_unbounded_curation_shelf_and_fifo_publish() -> None:
         assert [[button.text for button in row] for row in shelf_menu] == [
             [bot.CURATION_BUTTON],
             [bot.NEW_POST_BUTTON, bot.STATS_BUTTON],
+            [bot.SOURCE_STATS_BUTTON],
         ]
 
         first_tick = await bot.publish_scheduled_tick(
@@ -1389,6 +1500,7 @@ async def test_long_draft_controls_and_chunked_preview() -> None:
 
 async def main() -> None:
     test_shelf_status_plan()
+    test_source_selection_funnel()
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     tmp.close()
     old_db_path = config.DB_PATH

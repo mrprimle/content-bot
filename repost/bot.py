@@ -53,6 +53,7 @@ NEW_POST_BUTTON = "✍️ Создать пост"
 CURATION_BUTTON = "📚 Начать накидывать"
 LEGACY_CURATION_BUTTON = "📚 Наполнить полку"
 STATS_BUTTON = "📊 Статус"
+SOURCE_STATS_BUTTON = "📈 Источники"
 
 
 def _is_owner(update: Update) -> bool:
@@ -358,6 +359,7 @@ def _main_keyboard() -> ReplyKeyboardMarkup:
         [
             [KeyboardButton(CURATION_BUTTON)],
             [KeyboardButton(NEW_POST_BUTTON), KeyboardButton(STATS_BUTTON)],
+            [KeyboardButton(SOURCE_STATS_BUTTON)],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -3116,6 +3118,99 @@ def _status_report(conn, *, now: datetime | None = None) -> str:
     return "\n".join(lines)
 
 
+def _source_stats_report(
+    conn,
+    *,
+    days: int = 30,
+    now: datetime | None = None,
+) -> str:
+    """Build a complete rolling source proposal-to-shelf conversion report."""
+    local_now = now or datetime.now(ZoneInfo(config.TIMEZONE))
+    if local_now.tzinfo is None:
+        local_now = local_now.replace(tzinfo=ZoneInfo(config.TIMEZONE))
+    end_utc = local_now.astimezone(timezone.utc)
+    start_utc = end_utc - timedelta(days=days)
+    rows = list(
+        db.source_selection_stats(
+            conn,
+            start_utc.replace(tzinfo=None).isoformat(sep=" "),
+            end_utc.replace(tzinfo=None).isoformat(sep=" "),
+        )
+    )
+    sampled = [row for row in rows if int(row["proposed"])]
+    sampled.sort(
+        key=lambda row: (
+            -int(row["shelved"]),
+            -(int(row["shelved"]) / int(row["proposed"])),
+            -int(row["proposed"]),
+            str(row["username"]).casefold(),
+        )
+    )
+    unsampled = sorted(
+        (row for row in rows if not int(row["proposed"])),
+        key=lambda row: str(row["username"]).casefold(),
+    )
+    total_proposed = sum(int(row["proposed"]) for row in rows)
+    total_shelved = sum(int(row["shelved"]) for row in rows)
+    total_published = sum(int(row["published"]) for row in rows)
+    total_rate = (100 * total_shelved / total_proposed) if total_proposed else 0.0
+    lines = [
+        f"📈 Источники · последние {days} дней",
+        f"Период: {start_utc.astimezone(ZoneInfo(config.TIMEZONE)).date()} — {local_now.date()}",
+        "",
+        f"Предложено: {total_proposed} · На полке: {total_shelved} · "
+        f"Конверсия: {total_rate:.1f}% · Уже опубликовано: {total_published}",
+        "Конверсия = уникальные предложенные посты, которые ты положил на полку.",
+        "",
+        "🏆 Рейтинг каналов:",
+    ]
+    if sampled:
+        for index, row in enumerate(sampled, start=1):
+            proposed = int(row["proposed"])
+            shelved = int(row["shelved"])
+            rate = 100 * shelved / proposed
+            lines.append(
+                f"{index}. {row['username']} — {shelved}/{proposed} · {rate:.1f}%"
+                f" · опубликовано {int(row['published'])}"
+            )
+    else:
+        lines.append("Пока нет предложенных постов в этом периоде.")
+    if unsampled:
+        lines.extend(
+            [
+                "",
+                "⚪ Пока без выборки — бот ещё ничего не предлагал:",
+                ", ".join(str(row["username"]) for row in unsampled),
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "💡 Смотри не только на процент, но и на объём выборки: 1/1 ещё не сильнее 8/20.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _report_chunks(report: str, limit: int = 3900) -> list[str]:
+    """Split a Telegram report between lines, never in the middle of a metric row."""
+    chunks: list[str] = []
+    current: list[str] = []
+    current_size = 0
+    for line in report.splitlines():
+        added = len(line) + (1 if current else 0)
+        if current and current_size + added > limit:
+            chunks.append("\n".join(current))
+            current = [line]
+            current_size = len(line)
+        else:
+            current.append(line)
+            current_size += added
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_owner(update):
         return
@@ -3134,6 +3229,43 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if conn is not None:
             conn.close()
     await update.message.reply_text(report, reply_markup=_main_keyboard())
+
+
+async def cmd_source_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_owner(update):
+        return
+    days = 30
+    args = getattr(context, "args", None) or []
+    if args:
+        try:
+            days = int(args[0])
+        except ValueError:
+            days = 0
+    if not 1 <= days <= 365:
+        await update.message.reply_text(
+            "Использование: /source_stats [дни], от 1 до 365.",
+            reply_markup=_main_keyboard(),
+        )
+        return
+    conn = None
+    try:
+        conn = db.connect()
+        report = _source_stats_report(conn, days=days)
+        chunks = _report_chunks(report)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("source stats report failed")
+        chunks = [
+            "🚨 Не удалось собрать статистику источников:\n"
+            f"{_public_error_text(exc)}\n\nДанные не изменены 💗"
+        ]
+    finally:
+        if conn is not None:
+            conn.close()
+    for index, chunk in enumerate(chunks):
+        await update.message.reply_text(
+            chunk,
+            reply_markup=_main_keyboard() if index == len(chunks) - 1 else None,
+        )
 
 
 async def propose_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3424,6 +3556,7 @@ def create_application() -> Application:
     app.add_handler(CommandHandler("test", cmd_test, filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("resend", cmd_resend, filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("stats", cmd_stats, filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("source_stats", cmd_source_stats, filters.ChatType.PRIVATE))
     app.add_handler(
         MessageHandler(
             filters.ChatType.PRIVATE
@@ -3443,6 +3576,12 @@ def create_application() -> Application:
         MessageHandler(
             filters.ChatType.PRIVATE & filters.Regex(f"^{re.escape(STATS_BUTTON)}$"),
             cmd_stats,
+        )
+    )
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE & filters.Regex(f"^{re.escape(SOURCE_STATS_BUTTON)}$"),
+            cmd_source_stats,
         )
     )
     app.add_handler(CallbackQueryHandler(on_callback))

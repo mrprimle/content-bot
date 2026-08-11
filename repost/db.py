@@ -1943,6 +1943,31 @@ def ready_queue_published_between(conn, start_utc: str, end_utc: str):
     ).fetchall()
 
 
+def source_selection_stats(conn, start_utc: str, end_utc: str):
+    """Return a proposal cohort and its shelf conversion for every active source.
+
+    A proposal is a unique source post successfully delivered to the owner in
+    the requested window. A success is that same post later entering the durable
+    ready queue. Keeping the denominator as a delivery cohort prevents retries,
+    AI edits, or multiple platform publications from inflating the rate.
+    """
+    return conn.execute(
+        "SELECT s.id source_id, s.username, s.title, "
+        "COUNT(DISTINCT CASE WHEN di.id IS NOT NULL THEN di.post_id END) proposed, "
+        "COUNT(DISTINCT CASE WHEN rq.id IS NOT NULL THEN di.post_id END) shelved, "
+        "COUNT(DISTINCT CASE WHEN rq.status='published' THEN di.post_id END) published "
+        "FROM source s "
+        "LEFT JOIN delivery_item di ON di.source_id=s.id AND di.status='sent' "
+        "AND di.sent_at>=? AND di.sent_at<? "
+        "LEFT JOIN draft d ON d.post_id=di.post_id "
+        "LEFT JOIN ready_queue rq ON rq.draft_id=d.id "
+        "WHERE s.active=1 AND s.username NOT LIKE 'manual:%%' "
+        "GROUP BY s.id, s.username, s.title "
+        "ORDER BY shelved DESC, proposed DESC, s.username",
+        (start_utc, end_utc),
+    ).fetchall()
+
+
 def claim_next_ready_queue(conn, now_iso: str):
     """Lease exactly one oldest shelf item for one publication cron tick."""
     _begin_write(conn)

@@ -76,7 +76,7 @@ async def public_media(access_token: str) -> Response:
         post = db.post_by_media_token(conn, access_token)
     finally:
         conn.close()
-    if post is None or post["media_kind"] != "photo":
+    if post is None or post["media_kind"] not in {"photo", "manual"}:
         raise HTTPException(404, "Media not found")
     await _ensure_initialized()
     try:

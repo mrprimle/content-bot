@@ -19,8 +19,18 @@ class FakeMessage:
 
 
 class FakeIncomingMessage:
-    def __init__(self, text: str, reply_to_id: int, first_response_id: int = 9_000):
+    def __init__(
+        self,
+        text: str | None,
+        reply_to_id: int,
+        first_response_id: int = 9_000,
+        *,
+        caption: str | None = None,
+        photo: list | None = None,
+    ):
         self.text = text
+        self.caption = caption
+        self.photo = photo or []
         self.reply_to_message = SimpleNamespace(message_id=reply_to_id)
         self.first_response_id = first_response_id
         self.responses: list[dict] = []
@@ -839,6 +849,81 @@ async def test_anytime_owner_post() -> None:
         Path(tmp.name).unlink(missing_ok=True)
 
 
+async def test_anytime_owner_post_with_photo_caption() -> None:
+    """A custom Telegram photo+caption must create a media-aware raw draft."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    old_db_path = config.DB_PATH
+    old_owner = config.OWNER_CHAT_ID
+    old_delay = config.BOT_SEND_DELAY
+    old_public_url = config.PUBLIC_BASE_URL
+    try:
+        config.DB_PATH = tmp.name
+        config.OWNER_CHAT_ID = 123
+        config.BOT_SEND_DELAY = 0
+        config.PUBLIC_BASE_URL = "https://content.example"
+        fake_bot = FakeBot()
+        await bot._open_custom_post(fake_bot)
+        prompt_id = fake_bot.messages[-1]["chat_id"] and 1
+        caption = "software engineers before vs after agents"
+        submission = FakeIncomingMessage(
+            None,
+            prompt_id,
+            caption=caption,
+            photo=[SimpleNamespace(file_id="owner-photo-large", file_size=456_789)],
+        )
+        await bot.on_reply(
+            SimpleNamespace(message=submission, effective_chat=SimpleNamespace(id=123)),
+            SimpleNamespace(bot=fake_bot),
+        )
+
+        conn = db.connect()
+        draft = conn.execute("SELECT * FROM draft ORDER BY id DESC LIMIT 1").fetchone()
+        assert draft is not None and draft["linkedin_text"] == caption
+        post = db.get_post(conn, draft["post_id"])
+        assert post["media_kind"] == "manual"
+        assert post["bot_media_file_id"] == "owner-photo-large"
+        assert post["media_size"] == 456_789
+        assert post["media_mime"] == "image/jpeg"
+        assert post["media_access_token"]
+        assert bot._draft_has_photo(conn, draft)
+        assert bot._photo_publish_error(conn, draft) is None
+        conn.close()
+        assert submission.responses[0]["text"].startswith("✅ Текст принят")
+
+        await bot._open_custom_post(fake_bot)
+        second_prompt_id = len(fake_bot.messages)
+        photo_only = FakeIncomingMessage(
+            None,
+            second_prompt_id,
+            first_response_id=9_500,
+            photo=[SimpleNamespace(file_id="owner-photo-first", file_size=123_456)],
+        )
+        await bot.on_reply(
+            SimpleNamespace(message=photo_only, effective_chat=SimpleNamespace(id=123)),
+            SimpleNamespace(bot=fake_bot),
+        )
+        assert photo_only.responses[0]["text"].startswith("🖼 Картинку сохранила")
+        text_after_photo = FakeIncomingMessage("Text sent after the photo.", 9_501)
+        await bot.on_reply(
+            SimpleNamespace(message=text_after_photo, effective_chat=SimpleNamespace(id=123)),
+            SimpleNamespace(bot=fake_bot),
+        )
+        conn = db.connect()
+        staged_draft = conn.execute("SELECT * FROM draft ORDER BY id DESC LIMIT 1").fetchone()
+        staged_post = db.get_post(conn, staged_draft["post_id"])
+        assert staged_draft["linkedin_text"] == "Text sent after the photo."
+        assert staged_post["bot_media_file_id"] == "owner-photo-first"
+        assert bot._draft_has_photo(conn, staged_draft)
+        conn.close()
+    finally:
+        config.DB_PATH = old_db_path
+        config.OWNER_CHAT_ID = old_owner
+        config.BOT_SEND_DELAY = old_delay
+        config.PUBLIC_BASE_URL = old_public_url
+        Path(tmp.name).unlink(missing_ok=True)
+
+
 async def test_photo_choice_and_publication() -> None:
     """A source photo is optional and the chosen mode survives until publication."""
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
@@ -1571,6 +1656,7 @@ async def main() -> None:
         await test_refetch_after_queue_exhaustion()
         await test_edit_retry_loop()
         await test_anytime_owner_post()
+        await test_anytime_owner_post_with_photo_caption()
         await test_photo_choice_and_publication()
         await test_anytime_database_iteration()
         await test_direct_photo_delivery_captures_file_id()

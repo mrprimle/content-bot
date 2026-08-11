@@ -183,6 +183,11 @@ def _remember_bot_media(conn, post, file_id: str | None) -> None:
     db.set_post_bot_media(conn, post["id"], file_id, access_token)
 
 
+def _is_owner_post(post) -> bool:
+    """Manual owner input is an origin, independent from attached media type."""
+    return post is not None and str(post["username"] or "").startswith("manual:")
+
+
 def _draft_keyboard(conn, draft_id: int) -> InlineKeyboardMarkup:
     draft = db.get_draft(conn, draft_id)
     master_chars = len(_draft_body(draft)) if draft is not None else 0
@@ -258,11 +263,11 @@ def _draft_keyboard(conn, draft_id: int) -> InlineKeyboardMarkup:
     post = db.get_post(conn, draft["post_id"]) if draft is not None else None
     final_row = [
         InlineKeyboardButton(
-            "❌ Отменить" if post is not None and post["media_kind"] == "manual" else "⏹ Закончить итерацию",
+            "❌ Отменить" if _is_owner_post(post) else "⏹ Закончить итерацию",
             callback_data=f"draftskip:{draft_id}",
         )
     ]
-    if post is not None and post["media_kind"] != "manual":
+    if post is not None and not _is_owner_post(post):
         final_row.insert(
             0,
             InlineKeyboardButton(
@@ -326,12 +331,18 @@ def _media_choice_keyboard(
 
 def _draft_has_photo(conn, draft) -> bool:
     post = db.get_post(conn, draft["post_id"])
-    return post is not None and post["media_kind"] == "photo"
+    return post is not None and (
+        post["media_kind"] == "photo"
+        or (_is_owner_post(post) and bool(post["bot_media_file_id"]))
+    )
 
 
 def _photo_publish_error(conn, draft) -> str | None:
     post = db.get_post(conn, draft["post_id"])
-    if post is None or post["media_kind"] != "photo":
+    if post is None or not (
+        post["media_kind"] == "photo"
+        or (_is_owner_post(post) and bool(post["bot_media_file_id"]))
+    ):
         return "У этого поста нет исходной картинки"
     if not post["bot_media_file_id"] or not post["media_access_token"]:
         return "Фото не удалось сохранить. Можно опубликовать без картинки."
@@ -1225,7 +1236,10 @@ def _image_url_for_draft(conn, draft) -> str | None:
     if not draft["include_media"]:
         return None
     post = db.get_post(conn, draft["post_id"])
-    if post is None or post["media_kind"] != "photo":
+    if post is None or not (
+        post["media_kind"] == "photo"
+        or (_is_owner_post(post) and bool(post["bot_media_file_id"]))
+    ):
         raise RuntimeError("Для черновика выбрана картинка, но исходное фото не найдено")
     if not post["bot_media_file_id"] or not post["media_access_token"]:
         raise RuntimeError("Фото не удалось сохранить в Telegram Bot API; выбери публикацию без картинки")
@@ -2246,7 +2260,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         post = db.get_post(conn, draft["post_id"])
         source_name = (
             "Собственный пост"
-            if post is None or post["media_kind"] == "manual"
+            if post is None or _is_owner_post(post)
             else post["title"] or post["username"]
         )
         current_text = _draft_body(draft)
@@ -2477,15 +2491,41 @@ async def on_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     conn = db.connect()
     try:
         reply_to = update.message.reply_to_message.message_id
-        text = (update.message.text or "").strip()
-        if not text:
-            return
-
         post = db.post_by_manual_prompt(conn, reply_to)
         if post is not None and post["status"] != "awaiting_manual":
             post = None
         ai_draft = None if post is not None else db.draft_by_ai_prompt(conn, reply_to)
         draft = None if post is not None or ai_draft is not None else db.draft_by_message(conn, reply_to)
+        text = (update.message.text or update.message.caption or "").strip()
+        photo_sizes = getattr(update.message, "photo", None) or []
+        if post is not None and _is_owner_post(post) and photo_sizes:
+            photo = photo_sizes[-1]
+            access_token = post["media_access_token"] or secrets.token_urlsafe(32)
+            db.set_post_bot_media(
+                conn,
+                post["id"],
+                photo.file_id,
+                access_token,
+                media_size=getattr(photo, "file_size", None),
+                media_mime="image/jpeg",
+            )
+            post = db.get_post(conn, post["id"])
+            LOGGER.info(
+                "owner post photo captured post_id=%s has_caption=%s size=%s",
+                post["id"],
+                bool(text),
+                getattr(photo, "file_size", None),
+            )
+            if not text:
+                retry_prompt = await update.message.reply_text(
+                    "🖼 Картинку сохранила 💗 Теперь пришли текст поста ответом на это "
+                    "сообщение — фото останется прикреплённым.",
+                    reply_markup=ForceReply(selective=True),
+                )
+                db.set_manual_prompt(conn, post["id"], retry_prompt.message_id)
+                return
+        if not text:
+            return
         LOGGER.info(
             "reply received reply_to=%s chars=%s target=%s target_id=%s",
             reply_to,
@@ -2520,7 +2560,7 @@ async def on_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         target_limit = (
             None
-            if post is not None and post["media_kind"] == "manual"
+            if post is not None and _is_owner_post(post)
             else config.MANUAL_MAX_POST_CHARS
         )
         if target_limit is not None and len(text) > target_limit:
@@ -2544,7 +2584,7 @@ async def on_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             return
 
-        if post is not None and post["media_kind"] == "manual":
+        if post is not None and _is_owner_post(post):
             await update.message.reply_text(
                 f"✅ Текст принят: {len(text)} символов 💗 Сохраняю как есть, без AI. "
                 "Отличная работа, Нео."
@@ -2557,7 +2597,7 @@ async def on_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
 
         if post is not None:
-            if post["media_kind"] == "manual":
+            if _is_owner_post(post):
                 db.set_post_text(conn, post["id"], text)
             if not db.transition_post(conn, post["id"], ("awaiting_manual",), "generating"):
                 await update.message.reply_text(
@@ -2581,7 +2621,7 @@ async def on_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     )
                 return
             try:
-                if post["media_kind"] == "manual":
+                if _is_owner_post(post):
                     draft_id = db.create_draft(
                         conn,
                         post["id"],
@@ -2749,7 +2789,9 @@ async def _open_custom_post(bot) -> None:
         prompt = await _send(
             bot.send_message,
             config.OWNER_CHAT_ID,
-            "✍️ Пришли свой текст ответом на это сообщение, Нео 💜 Я сначала бережно сохраню его как есть — "
+            "✍️ Пришли текст или фото с подписью ответом на это сообщение, Нео 💜 "
+            "Если сначала отправишь только фото, я сохраню его и отдельно попрошу текст. "
+            "Я сначала бережно сохраню всё как есть — "
             "без AI и без автоматического перевода. Затем можно сразу опубликовать, "
             "перевести, отдельно сжать до 1500, сделать оба шага, отредактировать вручную "
             "или через AI. Пиши свободно — я рядом.",
@@ -3406,7 +3448,13 @@ def create_application() -> Application:
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_error_handler(on_error)
     app.add_handler(
-        MessageHandler(filters.ChatType.PRIVATE & filters.REPLY & filters.TEXT & ~filters.COMMAND, on_reply)
+        MessageHandler(
+            filters.ChatType.PRIVATE
+            & filters.REPLY
+            & (filters.TEXT | filters.PHOTO)
+            & ~filters.COMMAND,
+            on_reply,
+        )
     )
     return app
 

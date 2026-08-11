@@ -1113,11 +1113,20 @@ def set_post_text(conn, post_id: int, text: str) -> None:
     conn.commit()
 
 
-def set_post_bot_media(conn, post_id: int, file_id: str, access_token: str) -> None:
+def set_post_bot_media(
+    conn,
+    post_id: int,
+    file_id: str,
+    access_token: str,
+    *,
+    media_size: int | None = None,
+    media_mime: str | None = None,
+) -> None:
     """Persist a reusable Bot API file id and an unguessable public media token."""
     conn.execute(
-        "UPDATE post SET bot_media_file_id=?, media_access_token=? WHERE id=?",
-        (file_id, access_token, post_id),
+        "UPDATE post SET bot_media_file_id=?, media_access_token=?, "
+        "media_size=COALESCE(?, media_size), media_mime=COALESCE(?, media_mime) WHERE id=?",
+        (file_id, access_token, media_size, media_mime, post_id),
     )
     conn.commit()
 

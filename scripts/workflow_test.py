@@ -18,20 +18,32 @@ class FakeMessage:
         self.message_id = message_id
 
 
+_INCOMING_IDS = iter(range(50_000, 60_000))
+
+
 class FakeIncomingMessage:
     def __init__(
         self,
         text: str | None,
-        reply_to_id: int,
+        reply_to_id: int | None,
         first_response_id: int = 9_000,
         *,
         caption: str | None = None,
         photo: list | None = None,
+        message_id: int | None = None,
+        forward_origin=None,
+        media_group_id: str | None = None,
     ):
         self.text = text
         self.caption = caption
         self.photo = photo or []
-        self.reply_to_message = SimpleNamespace(message_id=reply_to_id)
+        self.message_id = message_id if message_id is not None else next(_INCOMING_IDS)
+        self.forward_origin = forward_origin
+        self.forward_date = None
+        self.media_group_id = media_group_id
+        self.reply_to_message = (
+            SimpleNamespace(message_id=reply_to_id) if reply_to_id is not None else None
+        )
         self.first_response_id = first_response_id
         self.responses: list[dict] = []
 
@@ -714,7 +726,7 @@ async def test_edit_retry_loop() -> None:
     old_delay = config.BOT_SEND_DELAY
     original_threadify = generator.threadify_post
 
-    def fake_threadify(text: str):
+    def fake_threadify(text: str, **_kwargs):
         return generator.ThreadPlanOut(
             thread_items=["Edited hook.", f"Edited payoff: {text}"],
             notes="Тестовый Threads-план",
@@ -790,7 +802,8 @@ async def test_edit_retry_loop() -> None:
             SimpleNamespace(message=unknown, effective_chat=SimpleNamespace(id=123)),
             SimpleNamespace(bot=FakeBot()),
         )
-        assert "не нашла активное редактирование" in unknown.responses[0]["text"]
+        # A reply to nothing that expects input is simply a new post now.
+        assert unknown.responses[0]["text"].startswith("✅ Пост принят")
     finally:
         generator.threadify_post = original_threadify
         config.DB_PATH = old_db_path
@@ -821,7 +834,7 @@ async def test_anytime_owner_post() -> None:
             thread_items=["A strong owner-post hook.", "The owner-post payoff."],
         )
 
-    def fake_threadify(text: str):
+    def fake_threadify(text: str, **_kwargs):
         threadify_calls.append(text)
         return generator.ThreadPlanOut(
             thread_items=["Manual edit hook.", "Manual edit payoff."],
@@ -875,9 +888,10 @@ async def test_anytime_owner_post() -> None:
         )
         assert "без AI" in submission.responses[0]["text"]
         assert translate_calls == []
-        assert fake_bot.messages[-3]["text"] == f"📄 LinkedIn / X · {len(source_text)} символов"
-        assert fake_bot.messages[-2]["text"] == source_text
-        assert fake_bot.messages[-1]["text"].startswith("🧵 Threads-версия появится")
+        assert fake_bot.messages[-5]["text"] == f"📄 LinkedIn / X · {len(source_text)} символов"
+        assert fake_bot.messages[-4]["text"] == source_text
+        assert fake_bot.messages[-3]["text"].startswith("🧵 Threads preview · 1 частей")
+        assert fake_bot.messages[-1]["text"] == source_text
         verify = db.connect()
         draft = verify.execute("SELECT * FROM draft ORDER BY id DESC LIMIT 1").fetchone()
         stored_post = db.get_post(verify, draft["post_id"])
@@ -900,7 +914,8 @@ async def test_anytime_owner_post() -> None:
         ]
         verify.close()
 
-        raw_publish = FakeQuery(f"pub:{draft['id']}")
+        assert json.loads(draft["threads_json"]) == [source_text]
+        raw_publish = FakeQuery(f"threadify:{draft['id']}")
         await bot.on_callback(
             SimpleNamespace(
                 callback_query=raw_publish,
@@ -917,7 +932,7 @@ async def test_anytime_owner_post() -> None:
         ]
         verify.close()
         assert any(
-            "нажми финальную кнопку ещё раз" in message["text"]
+            message["text"].startswith("🧵 Threads-план готов")
             for message in fake_bot.messages
         )
 
@@ -1000,7 +1015,7 @@ async def test_anytime_owner_post_with_photo_caption() -> None:
         assert bot._draft_has_photo(conn, draft)
         assert bot._photo_publish_error(conn, draft) is None
         conn.close()
-        assert submission.responses[0]["text"].startswith("✅ Текст принят")
+        assert submission.responses[0]["text"].startswith("✅ Пост принят")
 
         await bot._open_custom_post(fake_bot)
         second_prompt_id = len(fake_bot.messages)
@@ -1033,6 +1048,170 @@ async def test_anytime_owner_post_with_photo_caption() -> None:
         config.BOT_SEND_DELAY = old_delay
         config.PUBLIC_BASE_URL = old_public_url
         Path(tmp.name).unlink(missing_ok=True)
+
+
+async def test_inbox_messages_without_reply() -> None:
+    """Pasted or forwarded messages become posts; plain text answers an open prompt."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    old_db_path = config.DB_PATH
+    old_owner = config.OWNER_CHAT_ID
+    old_delay = config.BOT_SEND_DELAY
+    old_public_url = config.PUBLIC_BASE_URL
+    original_threadify = generator.threadify_post
+    threadify_calls: list[str] = []
+
+    def fake_threadify(text: str, **kwargs):
+        threadify_calls.append(text)
+        return original_threadify(text, **kwargs)
+
+    def update_for(message):
+        return SimpleNamespace(message=message, effective_chat=SimpleNamespace(id=123))
+
+    try:
+        config.DB_PATH = tmp.name
+        config.OWNER_CHAT_ID = 123
+        config.BOT_SEND_DELAY = 0
+        config.PUBLIC_BASE_URL = "https://content.example"
+        generator.threadify_post = fake_threadify
+        fake_bot = FakeBot()
+        context = SimpleNamespace(bot=fake_bot)
+
+        paragraphs = [f"Paragraph {index}: " + "insight " * 40 for index in range(1, 6)]
+        caption = "\n\n".join(paragraph.strip() for paragraph in paragraphs)
+        origin = SimpleNamespace(
+            chat=SimpleNamespace(username="aiprojects"),
+            message_id=4242,
+        )
+        forwarded = FakeIncomingMessage(
+            None,
+            None,
+            caption=caption,
+            photo=[SimpleNamespace(file_id="forwarded-photo", file_size=200_000)],
+            forward_origin=origin,
+            message_id=777,
+        )
+        await bot.on_owner_message(update_for(forwarded), context)
+        assert forwarded.responses[0]["text"].startswith("✅ Пост принят")
+        assert "+ фото" in forwarded.responses[0]["text"]
+        conn = db.connect()
+        draft = conn.execute("SELECT * FROM draft ORDER BY id DESC LIMIT 1").fetchone()
+        post = db.get_post(conn, draft["post_id"])
+        assert draft["linkedin_text"] == caption
+        assert post["url"] == "https://t.me/aiprojects/4242"
+        assert post["bot_media_file_id"] == "forwarded-photo"
+        items = json.loads(draft["threads_json"])
+        assert 1 < len(items) <= config.THREAD_MAX_ITEMS
+        assert all(len(item) <= config.THREAD_ITEM_CHARS for item in items)
+        assert "\n\n".join(items) == caption, "packing must split only at paragraph breaks"
+        assert threadify_calls == [], "paragraph packing must not call AI"
+        labels = [
+            button.text
+            for row in fake_bot.messages[-1]["reply_markup"].inline_keyboard
+            for button in row
+        ]
+        assert labels[:3] == [
+            "🖼 Опубликовать с фото",
+            "📝 Опубликовать без фото",
+            "📥 На полку",
+        ]
+        assert "✨ Короткий · EN ≤1500" in labels and "📖 Длинный · EN ≤3000" in labels
+        first_draft_id = draft["id"]
+        conn.close()
+
+        # Telegram retrying the same update must not create a second post.
+        before = len(fake_bot.messages)
+        await bot.on_owner_message(update_for(forwarded), context)
+        assert len(fake_bot.messages) == before
+
+        # Album parts without a caption are ignored.
+        album_part = FakeIncomingMessage(
+            None,
+            None,
+            photo=[SimpleNamespace(file_id="album-2", file_size=1)],
+            media_group_id="album",
+        )
+        await bot.on_owner_message(update_for(album_part), context)
+        assert album_part.responses == []
+
+        # Plain text sent right after "edit" (without reply) edits that draft.
+        await bot.on_callback(
+            SimpleNamespace(
+                callback_query=FakeQuery(f"edit:{first_draft_id}"),
+                effective_chat=SimpleNamespace(id=123),
+            ),
+            context,
+        )
+        edited = FakeIncomingMessage("Short edited version.", None)
+        await bot.on_owner_message(update_for(edited), context)
+        assert edited.responses[0]["text"].startswith("⏳ Текст принят")
+        conn = db.connect()
+        assert db.get_draft(conn, first_draft_id)["edited_text"] == "Short edited version."
+        assert conn.execute("SELECT COUNT(*) AS n FROM draft").fetchone()["n"] == 1
+        conn.close()
+
+        # The prompt is consumed: the next plain text is a brand-new post.
+        fresh = FakeIncomingMessage("A completely new thought.", None)
+        await bot.on_owner_message(update_for(fresh), context)
+        assert fresh.responses[0]["text"].startswith("✅ Пост принят")
+        conn = db.connect()
+        newest = conn.execute("SELECT * FROM draft ORDER BY id DESC LIMIT 1").fetchone()
+        assert newest["id"] != first_draft_id
+        assert newest["linkedin_text"] == "A completely new thought."
+        assert json.loads(newest["threads_json"]) == ["A completely new thought."]
+        labels = [
+            button.text
+            for row in fake_bot.messages[-1]["reply_markup"].inline_keyboard
+            for button in row
+        ]
+        assert labels[:2] == ["✅ Опубликовать сейчас", "📥 На полку"]
+        conn.close()
+
+        # After "Написать свой текст", a photo+caption without reply fills that prompt.
+        await bot._open_custom_post(fake_bot)
+        prompt_id = len(fake_bot.messages)
+        stuck = FakeIncomingMessage(
+            None,
+            None,
+            caption="Caption sent without reply.",
+            photo=[SimpleNamespace(file_id="stuck-photo", file_size=10)],
+        )
+        await bot.on_owner_message(update_for(stuck), context)
+        conn = db.connect()
+        prompt_post = db.post_by_manual_prompt(conn, prompt_id)
+        assert prompt_post is None or prompt_post["status"] != "awaiting_manual"
+        newest = conn.execute("SELECT * FROM draft ORDER BY id DESC LIMIT 1").fetchone()
+        assert newest["linkedin_text"] == "Caption sent without reply."
+        assert db.get_post(conn, newest["post_id"])["bot_media_file_id"] == "stuck-photo"
+        conn.close()
+
+        # An expired prompt no longer captures plain text.
+        conn = db.connect()
+        assert bot._open_prompt_id(conn) is None
+        conn.close()
+    finally:
+        generator.threadify_post = original_threadify
+        config.DB_PATH = old_db_path
+        config.OWNER_CHAT_ID = old_owner
+        config.BOT_SEND_DELAY = old_delay
+        config.PUBLIC_BASE_URL = old_public_url
+        Path(tmp.name).unlink(missing_ok=True)
+
+
+def test_thread_packing() -> None:
+    """Threads: whole paragraphs packed greedily, at most 5 parts, AI otherwise."""
+    assert generator.pack_threads("short") == ["short"]
+    paragraphs = ["a" * 300, "b" * 150, "c" * 400, "d" * 90, "e" * 90]
+    packed = generator.pack_threads("\n\n".join(paragraphs))
+    assert packed == [
+        "a" * 300 + "\n\n" + "b" * 150,
+        "c" * 400 + "\n\n" + "d" * 90,
+        "e" * 90,
+    ]
+    single_newlines = "\n".join(["x" * 240] * 6)
+    assert [len(item) for item in generator.pack_threads(single_newlines)] == [481, 481, 481]
+    assert generator.pack_threads("y" * 700) is None, "no paragraphs: semantic AI split"
+    assert generator.pack_threads("\n\n".join(["z" * 450] * 6)) is None, "too long: AI shortening"
 
 
 async def test_photo_choice_and_publication() -> None:
@@ -1584,12 +1763,14 @@ async def main() -> None:
         await bot.on_callback(text_update, SimpleNamespace(bot=fake))
         text_generation_messages = fake.messages[before_text_generation:]
         assert route_calls == {"translate": 0}
-        assert len(text_generation_messages) == 4
+        # A short raw post packs into one Threads part without any AI call.
+        assert len(text_generation_messages) == 6
         assert text_generation_messages[0]["text"].startswith("💜 Отлично, с этим постом")
         assert text_generation_messages[1]["text"].startswith("📄 LinkedIn / X ·")
         assert text_generation_messages[2]["text"].startswith("Сырой материал")
-        assert text_generation_messages[3]["text"].startswith("🧵 Threads-версия появится")
-        draft_keyboard = text_generation_messages[3]["reply_markup"].inline_keyboard
+        assert text_generation_messages[3]["text"].startswith("🧵 Threads preview · 1 частей")
+        assert text_generation_messages[5]["text"].startswith("Сырой материал")
+        draft_keyboard = text_generation_messages[5]["reply_markup"].inline_keyboard
         draft_labels = [button.text for row in draft_keyboard for button in row]
         assert draft_labels == [
             "✅ Опубликовать сейчас",
@@ -1611,7 +1792,9 @@ async def main() -> None:
             "SELECT id FROM draft WHERE post_id=?",
             (text_post_id,),
         ).fetchone()["id"]
-        assert db.get_draft(conn, draft_id)["threads_json"] is None
+        assert json.loads(db.get_draft(conn, draft_id)["threads_json"]) == [
+            db.get_draft(conn, draft_id)["linkedin_text"].strip()
+        ]
 
         transform_query = FakeQuery(f"transform1500:{draft_id}")
         before_transform = len(fake.messages)
@@ -1659,7 +1842,7 @@ async def main() -> None:
 
         threadify_calls: list[str] = []
 
-        def fake_threadify(text: str):
+        def fake_threadify(text: str, **_kwargs):
             threadify_calls.append(text)
             return generator.ThreadPlanOut(
                 thread_items=["A rebuilt Threads hook.", "A rebuilt Threads payoff."],
@@ -1769,6 +1952,8 @@ async def main() -> None:
         await test_edit_retry_loop()
         await test_anytime_owner_post()
         await test_anytime_owner_post_with_photo_caption()
+        await test_inbox_messages_without_reply()
+        test_thread_packing()
         await test_photo_choice_and_publication()
         await test_anytime_database_iteration()
         await test_direct_photo_delivery_captures_file_id()

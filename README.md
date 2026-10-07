@@ -290,6 +290,19 @@ Buffer treats that ordered array as the publication source of truth.
 Buffer requires a direct HTTPS image smaller than 10 MB. The media token and choice
 are durable, including across a restart between evening review and next-day publish.
 
+## Inbox: send or forward anything
+
+Any message the owner sends to the bot without Telegram's reply — pasted text, or a
+post forwarded from any channel, with or without a photo — becomes a post right away.
+The bot stores it as-is (no AI) and shows: publish now (with photo / without photo when
+there is one), put on the shelf, translate to English short (≤1500) or long (≤3000),
+edit by hand or with AI, and rebuild Threads. Album parts without a caption are ignored;
+the captioned part carries the post.
+
+A plain (non-forwarded) message sent within 30 minutes of an open prompt (edit, AI edit,
+"write your own text") still answers that prompt, so forgetting to press reply no longer
+loses input. Forwarded messages always start a new post.
+
 ## Publishing behavior
 
 [`repost/publisher.py`](repost/publisher.py) uses Buffer's GraphQL `createPost`
@@ -300,7 +313,7 @@ same per-platform mutation.
 | --- | --- |
 | LinkedIn | One post containing the full master text. |
 | X | One long post when `X_PREMIUM=true`; no Buffer thread metadata. |
-| Threads | Up to 10 AI-authored ordered cards of at most 500 characters, sent exactly as previewed through `metadata.threads.thread`. The first card is repeated as top-level `text`, as Buffer requires. |
+| Threads | Up to 5 ordered posts of at most 500 characters, sent exactly as previewed through `metadata.threads.thread`. Whole paragraphs are packed greedily so each post is filled before the next starts (no AI, wording unchanged). If the text has no usable paragraphs or needs more than 5 posts, Terra writes a shorter Threads version split between paragraphs or complete thoughts, and it is shown for review before publishing. The first post is repeated as top-level `text`, as Buffer requires. |
 
 After selection, the bot shows a service-only `📄 LinkedIn / X` label and then the
 master text as a separate copy-clean message. A numbered `🧵 Threads preview` is
@@ -412,7 +425,7 @@ Copy [`.env.example`](.env.example) to `.env` for local use. Never commit `.env`
 | `BUFFER_POST_MODE` | yes | `shareNow` or `addToQueue`. |
 | `MAX_POST_CHARS` | yes | Optional editorial compression target; clamped to `1500`. It is not a publish gate. |
 | `THREAD_ITEM_CHARS` | yes | Target and hard validation limit for each Threads card; `500`. |
-| `THREAD_MAX_ITEMS` | yes | Maximum ordered cards in one Threads thread; `10`. |
+| `THREAD_MAX_ITEMS` | no | Maximum ordered posts in one Threads thread; default `5`. |
 | `X_PREMIUM` | yes | Allows one X post up to 25,000 characters through supported Buffer plans. |
 | `PLANNING_TIME` | legacy | Ignored by production; retained only for old configuration compatibility. |
 | `PUBLISH_TIMES` | yes | Daily FIFO publication ticks: `09:00,14:00,19:00`. |

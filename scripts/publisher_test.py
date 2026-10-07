@@ -108,12 +108,7 @@ def main() -> None:
     )
     assert generated.thread_items == thread_items
     try:
-        generator._draft(
-            "Master text",
-            "",
-            ["x" * (config.THREAD_ITEM_CHARS + 1)],
-            max_chars=config.PLATFORM_SAFE_CHARS,
-        )
+        generator._validate_thread_items(["x" * (config.THREAD_ITEM_CHARS + 1)])
     except RuntimeError as exc:
         assert "превышают лимит" in str(exc)
     else:

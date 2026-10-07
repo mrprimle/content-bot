@@ -54,6 +54,11 @@ CURATION_BUTTON = "📚 Начать накидывать"
 LEGACY_CURATION_BUTTON = "📚 Наполнить полку"
 STATS_BUTTON = "📊 Статус"
 SOURCE_STATS_BUTTON = "📈 Источники"
+_OWNER_PROMPT_META_KEY = "owner_input_prompt"
+# A message sent without Telegram's "reply" still answers the latest open prompt
+# (edit / AI edit / custom post) for this long; forwarded posts never do.
+_OWNER_PROMPT_FALLBACK_SECONDS = 30 * 60
+_REVIEWABLE_DRAFT_STATUSES = ("awaiting_review", "approved", "delivery_failed")
 
 
 def _is_owner(update: Update) -> bool:
@@ -138,10 +143,20 @@ def _thread_items_for_draft(draft) -> list[str]:
             parsed = json.loads(raw)
             items = [str(item).strip() for item in parsed if str(item).strip()]
             if items:
+                if len(items) <= config.THREAD_MAX_ITEMS and all(
+                    len(item) <= config.THREAD_ITEM_CHARS for item in items
+                ):
+                    return items
+                # Older plans allowed up to 10 cards: re-pack the same cards into
+                # the current limit without changing any words.
+                repacked = generator.pack_threads("\n\n".join(items))
+                if repacked:
+                    return repacked
                 return items
         except (TypeError, ValueError):
             LOGGER.warning("invalid threads_json draft_id=%s", draft["id"])
-    return publisher.split_for_thread(_draft_body(draft), config.THREAD_ITEM_CHARS)
+    body = _draft_body(draft)
+    return generator.pack_threads(body) or publisher.split_for_thread(body, config.THREAD_ITEM_CHARS)
 
 
 def _threads_preview(draft) -> str:
@@ -276,10 +291,19 @@ def _draft_keyboard(conn, draft_id: int) -> InlineKeyboardMarkup:
                 callback_data=f"draftnext:{draft_id}",
             ),
         )
-    rows = [[
-        InlineKeyboardButton("✅ Опубликовать сейчас", callback_data=f"pub:{draft_id}"),
-        InlineKeyboardButton("📥 На полку", callback_data=f"shelf:{draft_id}"),
-    ]]
+    if draft is not None and _draft_has_photo(conn, draft):
+        rows = [
+            [
+                InlineKeyboardButton("🖼 Опубликовать с фото", callback_data=f"pubwith:{draft_id}"),
+                InlineKeyboardButton("📝 Опубликовать без фото", callback_data=f"pubwithout:{draft_id}"),
+            ],
+            [InlineKeyboardButton("📥 На полку", callback_data=f"shelf:{draft_id}")],
+        ]
+    else:
+        rows = [[
+            InlineKeyboardButton("✅ Опубликовать сейчас", callback_data=f"pub:{draft_id}"),
+            InlineKeyboardButton("📥 На полку", callback_data=f"shelf:{draft_id}"),
+        ]]
     rows.extend(ai_rows)
     rows.extend(
         [
@@ -463,7 +487,9 @@ async def _send_draft(bot, conn, draft_id: int) -> None:
         msg = await _send(
             bot.send_message,
             config.OWNER_CHAT_ID,
-            "🧵 Threads-версия появится после стандартной трансформации или редактирования.",
+            f"🧵 Threads: текст не раскладывается по абзацам в {config.THREAD_MAX_ITEMS} частей "
+            f"по {config.THREAD_ITEM_CHARS} — короткую Threads-версию Terra соберёт при "
+            "публикации (или сейчас кнопкой «🧵»), и я покажу её перед отправкой.",
             reply_markup=_draft_keyboard(conn, draft_id),
         )
     else:
@@ -492,6 +518,11 @@ async def _prepare_missing_threads(bot, conn, draft) -> bool:
     """Build a durable AI thread plan and require the owner to review it once."""
     if draft["threads_json"]:
         return True
+    packed = generator.pack_threads(_draft_body(draft))
+    if packed:
+        # Same words, only split at the author's paragraph breaks: no review needed.
+        db.set_draft_thread_items(conn, draft["id"], packed)
+        return True
     if not db.transition_draft(
         conn,
         draft["id"],
@@ -502,11 +533,16 @@ async def _prepare_missing_threads(bot, conn, draft) -> bool:
     await _send(
         bot.send_message,
         config.OWNER_CHAT_ID,
-        f"⏳ Я рядом 💜 Terra собирает Threads-план: каждый story/value point до "
-        f"{config.THREAD_ITEM_CHARS} символов. Ещё немного — и всё будет красиво.",
+        f"⏳ Я рядом 💜 Текст не помещается в Threads как есть — Terra делает короткую "
+        f"Threads-версию: до {config.THREAD_MAX_ITEMS} частей по {config.THREAD_ITEM_CHARS} "
+        "символов. Покажу её перед публикацией.",
     )
     try:
-        plan = await asyncio.to_thread(generator.threadify_post, _draft_body(draft))
+        plan = await asyncio.to_thread(
+            generator.threadify_post,
+            _draft_body(draft),
+            force_ai=True,
+        )
         db.set_draft_thread_items(conn, draft["id"], plan.thread_items)
         db.set_draft_status(conn, draft["id"], "awaiting_review")
         await _send(
@@ -1826,6 +1862,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     f"{config.MAX_POST_CHARS} остаётся добровольной опцией.",
                     reply_markup=ForceReply(selective=True),
                 )
+                _remember_prompt(conn, prompt.message_id)
             except Exception as exc:
                 db.set_post_status(conn, post["id"], "offered")
                 try:
@@ -1866,6 +1903,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     source_text,
                     source_text,
                     "",
+                    generator.pack_threads(source_text),
                 )
                 db.attach_planning_draft(conn, post["id"], draft_id)
                 db.attach_curation_draft(conn, post["id"], draft_id)
@@ -2201,6 +2239,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             ),
         )
         db.set_edit_msg(conn, object_id, prompt.message_id)
+        _remember_prompt(conn, prompt.message_id)
     elif action == "aiedit":
         prompt = await _send(
             context.bot.send_message,
@@ -2215,6 +2254,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             ),
         )
         db.set_ai_prompt(conn, object_id, prompt.message_id)
+        _remember_prompt(conn, prompt.message_id)
     elif action == "threadify":
         if not db.transition_draft(
             conn,
@@ -2226,12 +2266,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _send(
             context.bot.send_message,
             config.OWNER_CHAT_ID,
-            f"⏳ Terra пересобирает Threads-план для поста #{object_id}: цельный hook → "
-            f"story/value points → payoff, каждый до {config.THREAD_ITEM_CHARS} символов. "
-            "Уже навожу красоту, Нео 💜",
+            f"⏳ Terra пересобирает Threads-версию поста #{object_id}: до "
+            f"{config.THREAD_MAX_ITEMS} частей, каждая заполнена почти до "
+            f"{config.THREAD_ITEM_CHARS} символов, разрезы по абзацам или по смыслу 💜",
         )
         try:
-            plan = await asyncio.to_thread(generator.threadify_post, _draft_body(draft))
+            plan = await asyncio.to_thread(
+                generator.threadify_post,
+                _draft_body(draft),
+                force_ai=True,
+            )
             db.set_draft_thread_items(conn, object_id, plan.thread_items)
             db.set_draft_status(conn, object_id, "awaiting_review")
             await _send(
@@ -2487,12 +2531,160 @@ async def _apply_ai_instruction(update, context, conn, draft, instruction: str) 
         db.set_ai_prompt(conn, draft["id"], retry_prompt.message_id)
 
 
+def _remember_prompt(conn, message_id: int) -> None:
+    """Remember the latest prompt that expects owner text (for non-reply answers)."""
+    try:
+        db.set_meta(
+            conn,
+            _OWNER_PROMPT_META_KEY,
+            json.dumps({"id": int(message_id), "at": time.time()}),
+        )
+    except Exception:  # noqa: BLE001 — a convenience, never block the prompt
+        LOGGER.exception("failed to remember owner prompt id=%s", message_id)
+
+
+def _forget_prompt(conn, message_id: int) -> None:
+    try:
+        raw = db.get_meta(conn, _OWNER_PROMPT_META_KEY)
+        if raw and json.loads(raw).get("id") == message_id:
+            db.set_meta(conn, _OWNER_PROMPT_META_KEY, "")
+    except Exception:  # noqa: BLE001
+        LOGGER.exception("failed to clear owner prompt id=%s", message_id)
+
+
+def _open_prompt_id(conn, *, now: float | None = None) -> int | None:
+    """Return the latest still-open owner prompt issued within the fallback window."""
+    try:
+        raw = db.get_meta(conn, _OWNER_PROMPT_META_KEY)
+        data = json.loads(raw) if raw else None
+    except (TypeError, ValueError):
+        return None
+    if not data:
+        return None
+    prompt_id = int(data.get("id") or 0)
+    age = (now if now is not None else time.time()) - float(data.get("at") or 0)
+    if not prompt_id or age > _OWNER_PROMPT_FALLBACK_SECONDS:
+        return None
+    post = db.post_by_manual_prompt(conn, prompt_id)
+    if post is not None and post["status"] == "awaiting_manual":
+        return prompt_id
+    draft = db.draft_by_ai_prompt(conn, prompt_id)
+    if draft is not None and draft["status"] in _REVIEWABLE_DRAFT_STATUSES:
+        return prompt_id
+    draft = conn.execute(
+        "SELECT * FROM draft WHERE edit_msg_id=? ORDER BY id DESC LIMIT 1",
+        (prompt_id,),
+    ).fetchone()
+    if draft is not None and draft["status"] in _REVIEWABLE_DRAFT_STATUSES:
+        return prompt_id
+    return None
+
+
+def _is_forwarded(message) -> bool:
+    return (
+        getattr(message, "forward_origin", None) is not None
+        or getattr(message, "forward_date", None) is not None
+    )
+
+
+def _forward_link(message) -> str | None:
+    origin = getattr(message, "forward_origin", None)
+    chat = getattr(origin, "chat", None)
+    username = getattr(chat, "username", None)
+    message_id = getattr(origin, "message_id", None)
+    if username and message_id:
+        return f"https://t.me/{username}/{message_id}"
+    return None
+
+
+def _create_inbox_post(conn, message) -> int | None:
+    """Store a pasted/forwarded owner message as a manual post awaiting its draft."""
+    source_id = db.upsert_source(
+        conn,
+        f"manual:{config.OWNER_CHAT_ID}",
+        "Собственные посты",
+    )
+    inserted = db.insert_post(
+        conn,
+        source_id,
+        message.message_id,
+        datetime.now(timezone.utc).isoformat(),
+        "",
+        _forward_link(message),
+        author="Mike Doroshenko",
+        status="awaiting_manual",
+        media_kind="manual",
+    )
+    if not inserted:
+        # Telegram retried the same update: the first delivery already owns it.
+        LOGGER.info("inbox message already stored message_id=%s", message.message_id)
+        return None
+    row = conn.execute(
+        "SELECT id FROM post WHERE source_id=? AND tg_message_id=?",
+        (source_id, message.message_id),
+    ).fetchone()
+    db.set_manual_prompt(conn, row["id"], message.message_id)
+    return row["id"]
+
+
+async def on_owner_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Any non-reply owner message (pasted or forwarded, text or photo) becomes a post.
+
+    A non-forwarded message sent right after an edit/AI/custom-post prompt still
+    answers that prompt, so forgetting to press "reply" no longer loses input.
+    """
+    if not _is_owner(update) or update.message is None:
+        return
+    message = update.message
+    text = (message.text or message.caption or "").strip()
+    photo_sizes = getattr(message, "photo", None) or []
+    if not text and not photo_sizes:
+        return
+    forwarded = _is_forwarded(message)
+    conn = db.connect()
+    try:
+        if not forwarded:
+            prompt_id = _open_prompt_id(conn)
+            if prompt_id is not None:
+                LOGGER.info(
+                    "owner message without reply routed to open prompt=%s chars=%s",
+                    prompt_id,
+                    len(text),
+                )
+                conn.close()
+                conn = None
+                await _handle_owner_input(update, context, prompt_id)
+                return
+        if photo_sizes and not text and getattr(message, "media_group_id", None):
+            # Album parts without the caption: the captioned part carries the post.
+            LOGGER.info("album photo without caption ignored message_id=%s", message.message_id)
+            return
+        post_id = _create_inbox_post(conn, message)
+        LOGGER.info(
+            "inbox post created post_id=%s forwarded=%s chars=%s photo=%s",
+            post_id,
+            forwarded,
+            len(text),
+            bool(photo_sizes),
+        )
+        if post_id is None:
+            return
+    finally:
+        if conn is not None:
+            conn.close()
+    await _handle_owner_input(update, context, message.message_id)
+
+
 async def on_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_owner(update) or update.message.reply_to_message is None:
         return
+    await _handle_owner_input(update, context, update.message.reply_to_message.message_id)
+
+
+async def _handle_owner_input(update: Update, context: ContextTypes.DEFAULT_TYPE, reply_to: int) -> None:
     conn = db.connect()
     try:
-        reply_to = update.message.reply_to_message.message_id
+        _forget_prompt(conn, reply_to)
         post = db.post_by_manual_prompt(conn, reply_to)
         if post is not None and post["status"] != "awaiting_manual":
             post = None
@@ -2500,6 +2692,17 @@ async def on_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         draft = None if post is not None or ai_draft is not None else db.draft_by_message(conn, reply_to)
         text = (update.message.text or update.message.caption or "").strip()
         photo_sizes = getattr(update.message, "photo", None) or []
+        if (text or photo_sizes) and post is None and ai_draft is None and draft is None:
+            # A reply to something that no longer expects input: treat it as a new post.
+            new_post_id = _create_inbox_post(conn, update.message)
+            LOGGER.info("unmatched reply stored as new post post_id=%s", new_post_id)
+            if new_post_id is None:
+                return
+            conn.close()
+            conn = None
+            await _handle_owner_input(update, context, update.message.message_id)
+            return
+
         if post is not None and _is_owner_post(post) and photo_sizes:
             photo = photo_sizes[-1]
             access_token = post["media_access_token"] or secrets.token_urlsafe(32)
@@ -2525,6 +2728,7 @@ async def on_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     reply_markup=ForceReply(selective=True),
                 )
                 db.set_manual_prompt(conn, post["id"], retry_prompt.message_id)
+                _remember_prompt(conn, retry_prompt.message_id)
                 return
         if not text:
             return
@@ -2548,14 +2752,6 @@ async def on_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             else "none",
         )
 
-        if post is None and ai_draft is None and draft is None:
-            await update.message.reply_text(
-                "🤍 Я получила сообщение, но не нашла активное редактирование для этого reply. "
-                "Ничего страшного: нажми «✏️ Редактировать» под актуальным черновиком "
-                "и ответь на новый prompt 💗"
-            )
-            return
-
         if ai_draft is not None:
             await _apply_ai_instruction(update, context, conn, ai_draft, text)
             return
@@ -2577,6 +2773,7 @@ async def on_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 db.set_manual_prompt(conn, post["id"], retry_prompt.message_id)
             else:
                 db.set_edit_msg(conn, draft["id"], retry_prompt.message_id)
+            _remember_prompt(conn, retry_prompt.message_id)
             LOGGER.info(
                 "reply rejected over limit target=%s target_id=%s chars=%s retry_prompt=%s",
                 "manual" if post is not None else "draft",
@@ -2587,9 +2784,14 @@ async def on_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         if post is not None and _is_owner_post(post):
+            has_photo = bool(post["bot_media_file_id"])
             await update.message.reply_text(
-                f"✅ Текст принят: {len(text)} символов 💗 Сохраняю как есть, без AI. "
-                "Отличная работа, Нео."
+                f"✅ Пост принят: {len(text)} символов"
+                + (" + фото" if has_photo else "")
+                + " 💗 Сохраняю как есть, без AI. Ниже: перевести на английский "
+                "(коротко или длинно), опубликовать как есть"
+                + (" — с фото или без" if has_photo else "")
+                + " в LinkedIn, X и Threads."
             )
         else:
             await update.message.reply_text(
@@ -2632,6 +2834,7 @@ async def on_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                         text,
                         text,
                         "",
+                        generator.pack_threads(text),
                     )
                 else:
                     out = await asyncio.to_thread(generator.adapt, text)
@@ -2658,6 +2861,7 @@ async def on_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     reply_markup=ForceReply(selective=True),
                 )
                 db.set_manual_prompt(conn, post["id"], retry_prompt.message_id)
+                _remember_prompt(conn, retry_prompt.message_id)
                 return
             try:
                 await _send_draft(context.bot, conn, draft_id)
@@ -2717,7 +2921,8 @@ async def on_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "Текущий текст сохранён. Не переживай, Нео — попробуем ещё раз 💗"
             )
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2791,7 +2996,8 @@ async def _open_custom_post(bot) -> None:
         prompt = await _send(
             bot.send_message,
             config.OWNER_CHAT_ID,
-            "✍️ Пришли текст или фото с подписью ответом на это сообщение, Нео 💜 "
+            "✍️ Пришли текст или фото с подписью, Нео 💜 Можно просто отправить или "
+            "переслать сообщение из любого канала — reply не обязателен. "
             "Если сначала отправишь только фото, я сохраню его и отдельно попрошу текст. "
             "Я сначала бережно сохраню всё как есть — "
             "без AI и без автоматического перевода. Затем можно сразу опубликовать, "
@@ -2799,6 +3005,7 @@ async def _open_custom_post(bot) -> None:
             "или через AI. Пиши свободно — я рядом.",
             reply_markup=ForceReply(selective=True),
         )
+        _remember_prompt(conn, prompt.message_id)
         if existing is not None:
             db.set_manual_prompt(conn, existing["id"], prompt.message_id)
             LOGGER.info("owner post input reopened post_id=%s prompt=%s", existing["id"], prompt.message_id)
@@ -3593,6 +3800,17 @@ def create_application() -> Application:
             & (filters.TEXT | filters.PHOTO)
             & ~filters.COMMAND,
             on_reply,
+        )
+    )
+    # Anything else the owner sends or forwards (text, or photo with/without
+    # caption) becomes a new post with publishing controls.
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE
+            & ~filters.REPLY
+            & (filters.TEXT | filters.PHOTO | filters.CAPTION)
+            & ~filters.COMMAND,
+            on_owner_message,
         )
     )
     return app

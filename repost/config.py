@@ -52,14 +52,16 @@ THREAD_ITEM_CHARS = max(
     100,
     min(int(_get("THREAD_ITEM_CHARS") or THREAD_PLATFORM_CHARS), THREAD_PLATFORM_CHARS),
 )
-THREAD_MAX_ITEMS = max(1, min(int(_get("THREAD_MAX_ITEMS") or 10), 10))
+# Threads gets its own shorter version: at most 5 posts, each packed close to 500.
+THREAD_MAX_ITEMS = max(1, min(int(_get("THREAD_MAX_ITEMS") or 5), 10))
 LINKEDIN_POST_CHARS = 3_000
 X_PREMIUM_POST_CHARS = 25_000
 THREADS_TOTAL_CHARS = THREAD_PLATFORM_CHARS * THREAD_MAX_ITEMS
+# LinkedIn/X share the master text. Threads no longer constrains the master: when the
+# master does not pack into THREAD_MAX_ITEMS posts, a shorter Threads version is made.
 PLATFORM_SAFE_CHARS = min(
     LINKEDIN_POST_CHARS,
     X_PREMIUM_POST_CHARS,
-    THREADS_TOTAL_CHARS,
 )
 MANUAL_MAX_POST_CHARS = PLATFORM_SAFE_CHARS
 X_PREMIUM = _bool("X_PREMIUM", False)

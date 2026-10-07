@@ -1,4 +1,5 @@
 import logging
+import re
 import time
 
 import httpx
@@ -83,7 +84,9 @@ def _draft(
     max_chars: int,
 ) -> DraftOut:
     text = _validate_full_text(text, max_chars)
-    items = _validate_thread_items(thread_items or [])
+    # Raw model items; the caller resolves the final Threads plan outside the
+    # full-text retry loop so a Threads problem never re-runs the translation.
+    items = [item.strip() for item in (thread_items or []) if item and item.strip()]
     return DraftOut(
         linkedin_text=text,
         x_text=text,
@@ -125,15 +128,11 @@ def _openai_parse(system: str, user: str, max_chars: int) -> TranslationOut:
                 "maxLength": max_chars,
             },
             "notes": {"type": "string"},
+            # No maxItems/maxLength here: strict structured outputs cut strings at
+            # maxLength mid-sentence. Items are validated (and re-planned) in code.
             "thread_items": {
                 "type": "array",
-                "minItems": 1,
-                "maxItems": config.THREAD_MAX_ITEMS,
-                "items": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": config.THREAD_ITEM_CHARS,
-                },
+                "items": {"type": "string"},
             },
         },
         "required": ["full_text", "thread_items", "notes"],
@@ -239,14 +238,6 @@ def _parse_complete_with_retry(
         out = _parse(system, user, max_chars)
         try:
             draft = _draft(out.full_text, out.notes, out.thread_items, max_chars=max_chars)
-            LOGGER.info(
-                "llm_pipeline_success operation=%s attempt=%s output_chars=%s thread_items=%s",
-                operation,
-                attempt,
-                len(draft.linkedin_text),
-                len(draft.thread_items),
-            )
-            return draft
         except RuntimeError as exc:
             validation_error = exc
             LOGGER.warning(
@@ -259,6 +250,16 @@ def _parse_complete_with_retry(
                 max_chars,
                 str(exc),
             )
+            continue
+        draft.thread_items = resolve_thread_items(draft.linkedin_text, draft.thread_items)
+        LOGGER.info(
+            "llm_pipeline_success operation=%s attempt=%s output_chars=%s thread_items=%s",
+            operation,
+            attempt,
+            len(draft.linkedin_text),
+            len(draft.thread_items),
+        )
+        return draft
     raise RuntimeError(
         "Модель трижды вернула незавершённый текст; исходник сохранён, "
         "можно безопасно повторить трансформацию"
@@ -293,13 +294,7 @@ def _openai_thread_parse(system: str, user: str) -> ThreadPlanOut:
         "properties": {
             "thread_items": {
                 "type": "array",
-                "minItems": 1,
-                "maxItems": config.THREAD_MAX_ITEMS,
-                "items": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": config.THREAD_ITEM_CHARS,
-                },
+                "items": {"type": "string"},
             },
             "notes": {"type": "string"},
         },
@@ -329,18 +324,135 @@ def _openai_thread_parse(system: str, user: str) -> ThreadPlanOut:
     return ThreadPlanOut.model_validate_json(msg["content"])
 
 
-def threadify_post(text: str) -> ThreadPlanOut:
-    """Create a Threads-native sequence without changing the master post."""
+_PARAGRAPH_BREAK = re.compile(r"\n[ \t]*\n+")
+
+
+def _thread_units(text: str, limit: int) -> list[tuple[str, str]] | None:
+    """Return (unit, separator-before) pairs split on the author's own breaks.
+
+    Blank-line paragraphs are the primary units. A paragraph longer than one
+    Threads post may still be split on its single line breaks (lists, short
+    lines). Prose longer than the limit has no natural break, so it needs a
+    semantic AI split and the function returns None.
+    """
+    blocks = [b.strip() for b in _PARAGRAPH_BREAK.split(text.strip()) if b.strip()]
+    if len(blocks) == 1 and "\n" in blocks[0]:
+        # Telegram posts often separate paragraphs with a single newline.
+        lines = [line.strip() for line in blocks[0].split("\n") if line.strip()]
+        if any(len(line) > limit for line in lines):
+            return None
+        return [(line, "\n" if index else "") for index, line in enumerate(lines)]
+    units: list[tuple[str, str]] = []
+    for block in blocks:
+        separator = "\n\n" if units else ""
+        if len(block) <= limit:
+            units.append((block, separator))
+            continue
+        lines = [line.strip() for line in block.split("\n") if line.strip()]
+        if len(lines) < 2 or any(len(line) > limit for line in lines):
+            return None
+        units.append((lines[0], separator))
+        units.extend((line, "\n") for line in lines[1:])
+    return units
+
+
+def pack_threads(
+    text: str,
+    limit: int | None = None,
+    max_items: int | None = None,
+) -> list[str] | None:
+    """Pack whole paragraphs greedily into as few Threads posts as possible.
+
+    Each post is filled as close to the limit as the paragraph boundaries allow
+    before the next one starts. Returns None when the text has no usable
+    paragraph structure or needs more than max_items posts (then a shorter AI
+    version is required). The wording is never changed.
+    """
+    limit = limit or config.THREAD_ITEM_CHARS
+    max_items = max_items or config.THREAD_MAX_ITEMS
+    text = (text or "").strip()
+    if not text:
+        return None
+    if len(text) <= limit:
+        return [text]
+    units = _thread_units(text, limit)
+    if not units:
+        return None
+    items: list[str] = []
+    current = ""
+    for unit, separator in units:
+        candidate = f"{current}{separator}{unit}" if current else unit
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        items.append(current)
+        current = unit
+    if current:
+        items.append(current)
+    if len(items) > max_items:
+        return None
+    return items
+
+
+def resolve_thread_items(full_text: str, model_items: list[str] | None = None) -> list[str]:
+    """Paragraph packing first, then the model's plan, then a dedicated AI plan."""
+    packed = pack_threads(full_text)
+    if packed:
+        return packed
+    if model_items:
+        try:
+            return _validate_thread_items(model_items)
+        except RuntimeError as exc:
+            LOGGER.info("model thread plan rejected, replanning: %s", exc)
+    return threadify_post(full_text, force_ai=True).thread_items
+
+
+def threadify_post(text: str, *, force_ai: bool = False) -> ThreadPlanOut:
+    """Return the Threads version of a master post without changing the master.
+
+    Paragraph packing is used whenever the post already fits; otherwise Terra
+    writes a shorter version split at paragraph or semantic boundaries.
+    """
     text = text.strip()
     if not text:
         raise RuntimeError("Пустой текст нельзя разбить для Threads")
-    if config.llm_provider() == "openai":
-        out = _openai_thread_parse(prompts.THREAD_SYSTEM, prompts.thread_message(text))
-    else:
-        out = _anthropic_thread_parse(prompts.THREAD_SYSTEM, prompts.thread_message(text))
-    return ThreadPlanOut(
-        thread_items=_validate_thread_items(out.thread_items),
-        notes=out.notes.strip(),
+    if not force_ai:
+        packed = pack_threads(text)
+        if packed:
+            return ThreadPlanOut(
+                thread_items=packed,
+                notes="Threads: текст разбит по абзацам без AI и без изменений.",
+            )
+    user = prompts.thread_message(text)
+    last_error: RuntimeError | None = None
+    for attempt in range(1, 4):
+        message = user
+        if last_error is not None:
+            message += (
+                "\n\nPREVIOUS ATTEMPT WAS REJECTED: "
+                f"{last_error}. Return at most {config.THREAD_MAX_ITEMS} items, each "
+                f"at most {config.THREAD_ITEM_CHARS - 20} characters, shortening the text more."
+            )
+        if config.llm_provider() == "openai":
+            out = _openai_thread_parse(prompts.THREAD_SYSTEM, message)
+        else:
+            out = _anthropic_thread_parse(prompts.THREAD_SYSTEM, message)
+        try:
+            items = _validate_thread_items(out.thread_items)
+        except RuntimeError as exc:
+            last_error = exc
+            LOGGER.warning("threads_plan_rejected attempt=%s reason=%s", attempt, exc)
+            continue
+        LOGGER.info(
+            "threads_plan_success attempt=%s items=%s sizes=%s",
+            attempt,
+            len(items),
+            ",".join(str(len(item)) for item in items),
+        )
+        return ThreadPlanOut(thread_items=items, notes=out.notes.strip())
+    raise RuntimeError(
+        f"Terra трижды не уложила Threads в {config.THREAD_MAX_ITEMS} частей по "
+        f"{config.THREAD_ITEM_CHARS} символов: {last_error}"
     )
 
 

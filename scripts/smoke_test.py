@@ -786,8 +786,8 @@ def main() -> None:
     assert config.MANUAL_MAX_POST_CHARS == 3000
     assert config.PLATFORM_SAFE_CHARS == 3000
     assert config.THREAD_ITEM_CHARS == 500
-    assert config.THREAD_MAX_ITEMS == 10
-    assert config.THREADS_TOTAL_CHARS == 5000
+    assert config.THREAD_MAX_ITEMS == 5
+    assert config.THREADS_TOTAL_CHARS == 2500
     assert config.LIMITS == {"linkedin": 3000, "twitter": 25000, "threads": 500}
     assert config.X_PREMIUM is True
     sources = config.read_sources()

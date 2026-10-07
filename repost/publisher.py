@@ -165,10 +165,12 @@ def check_image_url(image_url: str, attempts: int = 3) -> None:
     last = "no response"
     for attempt in range(attempts):
         try:
+            # Buffer checks the URL with HEAD and then downloads it with GET.
+            head = httpx.head(image_url, timeout=30, follow_redirects=True)
             response = httpx.get(image_url, timeout=30, follow_redirects=True)
-            if response.status_code == 200 and response.content:
+            if head.status_code == 200 and response.status_code == 200 and response.content:
                 return
-            last = f"HTTP {response.status_code}"
+            last = f"HTTP HEAD {head.status_code} / GET {response.status_code}"
         except httpx.HTTPError as exc:
             last = type(exc).__name__
         time.sleep(1 + attempt)

@@ -116,6 +116,8 @@ def main() -> None:
         raise AssertionError("oversized AI Threads card was accepted")
 
     original_get = publisher.httpx.get
+    original_head = publisher.httpx.head
+    publisher.httpx.head = lambda *_args, **_kwargs: SimpleNamespace(status_code=200, content=b"")
     original_sleep = publisher.time.sleep
     responses = [SimpleNamespace(status_code=502, content=b""), SimpleNamespace(status_code=200, content=b"jpg")]
     publisher.httpx.get = lambda *_args, **_kwargs: responses.pop(0)
@@ -126,10 +128,11 @@ def main() -> None:
     try:
         publisher.check_image_url("https://content.example/api/media/x", attempts=2)
     except RuntimeError as exc:
-        assert "HTTP 502" in str(exc)
+        assert "GET 502" in str(exc)
     else:
         raise AssertionError("unreadable image must stop publication")
     publisher.httpx.get = original_get
+    publisher.httpx.head = original_head
     publisher.time.sleep = original_sleep
 
     original_gql = publisher._gql

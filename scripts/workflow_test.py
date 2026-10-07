@@ -1293,7 +1293,7 @@ async def test_photo_choice_and_publication() -> None:
                     "twitter": "Ready image post",
                     "threads": ["Ready image hook.", "Ready image payoff."],
                 },
-                "https://content.example/api/media/media-token",
+                "https://content.example/api/media/media-token.jpg",
             )
         ]
         assert db.get_draft(conn, draft_id)["include_media"] == 1
@@ -1349,7 +1349,7 @@ async def test_photo_choice_and_publication() -> None:
             now=datetime(2026, 8, 6, 9, 0, tzinfo=ZoneInfo(config.TIMEZONE)),
         )
         assert scheduled_result["published"] == 1
-        assert published[-1][1] == "https://content.example/api/media/planning-token"
+        assert published[-1][1] == "https://content.example/api/media/planning-token.jpg"
         conn.close()
     finally:
         publisher.publish_all = original_publish

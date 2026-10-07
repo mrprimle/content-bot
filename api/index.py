@@ -96,9 +96,16 @@ async def _download_bot_file(file_id: str) -> bytes:
     raise RuntimeError(f"Telegram file download failed: {type(last_error).__name__}")
 
 
-@app.get("/api/media/{access_token}")
-async def public_media(access_token: str) -> Response:
-    """Serve a stable public image URL to Buffer without exposing BOT_TOKEN."""
+@app.api_route("/api/media/{access_token}", methods=["GET", "HEAD"])
+async def public_media(access_token: str, request: Request) -> Response:
+    """Serve a stable public image URL to Buffer without exposing BOT_TOKEN.
+
+    Buffer validates the image with HEAD before sending the post to the
+    networks, so HEAD must succeed too (it returned 405 and the scheduled
+    posts failed silently on Buffer's side). A ".jpg" suffix is accepted for
+    networks that infer the type from the URL.
+    """
+    access_token = access_token.removesuffix(".jpg")
     conn = db.connect()
     try:
         post = db.post_by_media_token(conn, access_token)
@@ -115,11 +122,14 @@ async def public_media(access_token: str) -> Response:
             type(exc).__name__,
         )
         raise HTTPException(502, "Media temporarily unavailable") from exc
-    return Response(
-        content=bytes(payload),
-        media_type=post["media_mime"] or "image/jpeg",
-        headers={"Cache-Control": "public, max-age=86400"},
-    )
+    headers = {
+        "Cache-Control": "public, max-age=86400",
+        "Content-Length": str(len(payload)),
+    }
+    media_type = post["media_mime"] or "image/jpeg"
+    if request.method == "HEAD":
+        return Response(status_code=200, media_type=media_type, headers=headers)
+    return Response(content=bytes(payload), media_type=media_type, headers=headers)
 
 
 @app.post("/api/telegram")

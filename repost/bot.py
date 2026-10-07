@@ -1283,7 +1283,7 @@ def _image_url_for_draft(conn, draft) -> str | None:
         raise RuntimeError("Фото не удалось сохранить в Telegram Bot API; выбери публикацию без картинки")
     if not config.PUBLIC_BASE_URL:
         raise RuntimeError("PUBLIC_BASE_URL не настроен — Buffer не сможет получить картинку")
-    return f"{config.PUBLIC_BASE_URL.rstrip('/')}/api/media/{post['media_access_token']}"
+    return f"{config.PUBLIC_BASE_URL.rstrip('/')}/api/media/{post['media_access_token']}.jpg"
 
 
 def _ok_platforms(conn, draft_id: int) -> set[str]:

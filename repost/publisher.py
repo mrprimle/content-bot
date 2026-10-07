@@ -7,6 +7,8 @@ shareNow публикует сразу, addToQueue кладёт пост в оч
 import argparse
 import json
 
+import time
+
 import httpx
 
 from . import config
@@ -156,6 +158,21 @@ def _publication_payload(
             "публикация остановлена без обрезания"
         )
     return text, None, None
+
+
+def check_image_url(image_url: str, attempts: int = 3) -> None:
+    """Make sure Buffer will be able to read the image before creating posts."""
+    last = "no response"
+    for attempt in range(attempts):
+        try:
+            response = httpx.get(image_url, timeout=30, follow_redirects=True)
+            if response.status_code == 200 and response.content:
+                return
+            last = f"HTTP {response.status_code}"
+        except httpx.HTTPError as exc:
+            last = type(exc).__name__
+        time.sleep(1 + attempt)
+    raise RuntimeError(f"картинка недоступна по публичной ссылке ({last})")
 
 
 def publish_all(

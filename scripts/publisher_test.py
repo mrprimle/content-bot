@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -113,6 +114,23 @@ def main() -> None:
         assert "превышают лимит" in str(exc)
     else:
         raise AssertionError("oversized AI Threads card was accepted")
+
+    original_get = publisher.httpx.get
+    original_sleep = publisher.time.sleep
+    responses = [SimpleNamespace(status_code=502, content=b""), SimpleNamespace(status_code=200, content=b"jpg")]
+    publisher.httpx.get = lambda *_args, **_kwargs: responses.pop(0)
+    publisher.time.sleep = lambda _seconds: None
+    publisher.check_image_url("https://content.example/api/media/x")
+    assert responses == [], "preflight must retry until the image is readable"
+    publisher.httpx.get = lambda *_args, **_kwargs: SimpleNamespace(status_code=502, content=b"")
+    try:
+        publisher.check_image_url("https://content.example/api/media/x", attempts=2)
+    except RuntimeError as exc:
+        assert "HTTP 502" in str(exc)
+    else:
+        raise AssertionError("unreadable image must stop publication")
+    publisher.httpx.get = original_get
+    publisher.time.sleep = original_sleep
 
     original_gql = publisher._gql
     gql_queries: list[str] = []

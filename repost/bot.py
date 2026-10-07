@@ -1313,6 +1313,10 @@ async def _publish(bot, conn, draft_id: int, *, notify: bool = True) -> None:
     texts = _texts_for_publish(draft)
     try:
         image_url = _image_url_for_draft(conn, draft)
+        if image_url:
+            # Buffer rejects the whole post when it cannot read the image, so
+            # verify (and warm) the public URL first.
+            await asyncio.to_thread(publisher.check_image_url, image_url)
     except Exception as exc:
         db.set_draft_status(conn, draft_id, "approved")
         await _send(

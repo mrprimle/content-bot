@@ -3,6 +3,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+import httpx
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from telegram import Update
 
@@ -68,6 +69,33 @@ async def health() -> dict:
         conn.close()
 
 
+async def _download_bot_file(file_id: str) -> bytes:
+    """Fetch a Bot API file with a request-scoped HTTP client.
+
+    Buffer downloads the image while the webhook that asked Buffer to publish is
+    still running. On Vercel both requests can share one instance but run on
+    different event loops, and the shared python-telegram-bot client is bound to
+    the webhook's loop, so reusing it here timed out and Buffer got a 502.
+    """
+    base = f"https://api.telegram.org/bot{config.BOT_TOKEN}"
+    last_error: Exception | None = None
+    async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=10.0)) as client:
+        for attempt in range(3):
+            try:
+                meta = await client.get(f"{base}/getFile", params={"file_id": file_id})
+                meta.raise_for_status()
+                file_path = meta.json()["result"]["file_path"]
+                response = await client.get(
+                    f"https://api.telegram.org/file/bot{config.BOT_TOKEN}/{file_path}"
+                )
+                response.raise_for_status()
+                return response.content
+            except (httpx.HTTPError, KeyError, ValueError) as exc:
+                last_error = exc
+                await asyncio.sleep(0.5 * (attempt + 1))
+    raise RuntimeError(f"Telegram file download failed: {type(last_error).__name__}")
+
+
 @app.get("/api/media/{access_token}")
 async def public_media(access_token: str) -> Response:
     """Serve a stable public image URL to Buffer without exposing BOT_TOKEN."""
@@ -78,12 +106,14 @@ async def public_media(access_token: str) -> Response:
         conn.close()
     if post is None or post["media_kind"] not in {"photo", "manual"}:
         raise HTTPException(404, "Media not found")
-    await _ensure_initialized()
     try:
-        telegram_file = await _telegram_app.bot.get_file(post["bot_media_file_id"])
-        payload = await telegram_file.download_as_bytearray()
+        payload = await _download_bot_file(post["bot_media_file_id"])
     except Exception as exc:  # noqa: BLE001
-        LOGGER.exception("public media fetch failed post_id=%s", post["id"])
+        LOGGER.error(
+            "public media fetch failed post_id=%s error=%s",
+            post["id"],
+            type(exc).__name__,
+        )
         raise HTTPException(502, "Media temporarily unavailable") from exc
     return Response(
         content=bytes(payload),

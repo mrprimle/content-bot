@@ -12,6 +12,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from repost import bot, config, db, generator, ingest, publisher  # noqa: E402
 
+# Offline tests never reach the public media URL; the reachability preflight is
+# covered by publisher_test.
+publisher.check_image_url = lambda image_url, attempts=3: None
+
 
 class FakeMessage:
     def __init__(self, message_id: int):
